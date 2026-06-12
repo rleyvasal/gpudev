@@ -1,0 +1,9 @@
+# Local config (contains API tokens, SSH keys, domain names)
+*.json
+*.log
+
+# OS
+.DS_Store
+
+# Local operator notes (not for the repo)
+TROUBLESHOOTING.md

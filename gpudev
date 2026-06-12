@@ -1,0 +1,1089 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gpudev — host management CLI
+# Manages Docker-based GPU client containers on WSL2 or bare Linux.
+
+CONFIG_DIR="${HOME}/.config/gpudev"
+HOST_CONFIG="${CONFIG_DIR}/host.json"
+CLIENTS_CONFIG="${CONFIG_DIR}/clients.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Source of truth for the management scripts (client-setup.sh, kernel-manager.sh).
+# When invoked from the installed ~/bin copy, prefer the git checkout (~/gpudev),
+# which is what `git pull` updates — otherwise `add`/`rebuild` would deploy the
+# stale ~/bin copies (only `self-update` refreshes those) into containers.
+REPO_DIR="$SCRIPT_DIR"
+if [ "$REPO_DIR" = "${HOME}/bin" ] && [ -f "${HOME}/gpudev/gpudev" ]; then
+    REPO_DIR="${HOME}/gpudev"
+fi
+CLIENT_SETUP="${REPO_DIR}/client-setup.sh"
+BASE_IMAGE="gpudev-base:latest"
+
+log()  { echo "$*"; }
+warn() { echo "Warning: $*" >&2; }
+fail() { echo "Error: $*" >&2; exit 1; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# Resolve a usable nvidia-smi. On WSL2 the NVIDIA driver lives on Windows and
+# its Linux-side stub is at /usr/lib/wsl/lib/nvidia-smi — which isn't always on
+# PATH (Ubuntu only adds it via libnvidia-container packaging). Try PATH first,
+# then the WSL stub. Prints the resolved path; returns 1 if neither exists.
+find_nvidia_smi() {
+    if command_exists nvidia-smi; then
+        command -v nvidia-smi
+        return 0
+    fi
+    if [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+        echo /usr/lib/wsl/lib/nvidia-smi
+        return 0
+    fi
+    return 1
+}
+
+# ── Docker wrapper (sudo fallback) ────────────────────────────────────────────
+
+docker_cmd() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    else
+        sudo docker "$@"
+    fi
+}
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+require_host_setup() {
+    [ -f "$HOST_CONFIG" ]   || fail "Host not set up. Run linux-setup.sh first."
+    [ -f "$CLIENTS_CONFIG" ] || fail "clients.json missing. Run linux-setup.sh first."
+}
+
+host_get() {
+    local field="$1"
+    python3 -c "
+import json, pathlib
+d = json.loads(pathlib.Path('${HOST_CONFIG}').read_text())
+print(d.get('${field}', ''))
+"
+}
+
+client_get() {
+    local name="$1" field="$2"
+    python3 - "$CLIENTS_CONFIG" "$name" "$field" <<'PY'
+import json, sys
+data = json.loads(open(sys.argv[1]).read())
+client = next((c for c in data["clients"] if c["name"] == sys.argv[2]), None)
+print(client.get(sys.argv[3], "") if client else "")
+PY
+}
+
+client_exists() {
+    local name="$1"
+    python3 -c "
+import json, sys
+data = json.loads(open('${CLIENTS_CONFIG}').read())
+sys.exit(0 if any(c['name'] == '${name}' for c in data['clients']) else 1)
+"
+}
+
+all_client_names() {
+    python3 - "$CLIENTS_CONFIG" <<'PY'
+import json, sys
+data = json.loads(open(sys.argv[1]).read())
+for c in data["clients"]:
+    print(c["name"])
+PY
+}
+
+remove_client_from_registry() {
+    local name="$1"
+    python3 - "$CLIENTS_CONFIG" "$name" <<'PY'
+import json, sys
+path, name = sys.argv[1], sys.argv[2]
+data = json.loads(open(path).read())
+data["clients"] = [c for c in data["clients"] if c["name"] != name]
+open(path, "w").write(json.dumps(data, indent=2))
+PY
+    chmod 600 "$CLIENTS_CONFIG"
+}
+
+container_status() {
+    local name="$1"
+    docker_cmd ps -a --filter "name=^${name}$" --format '{{.Status}}' 2>/dev/null | head -1
+}
+
+# ── gpudev host ───────────────────────────────────────────────────────────────
+
+cmd_host_status() {
+    require_host_setup
+
+    local cf_domain linux_user host_env port_base host_ssh_port host_cf_hostname
+    cf_domain="$(host_get cf_domain)"
+    linux_user="$(host_get linux_user)"
+    host_env="$(host_get host_env)"
+    port_base="$(host_get port_base)"
+    host_ssh_port="$(host_get host_ssh_port)"
+    host_cf_hostname="$(host_get host_cf_hostname)"
+
+    echo "gpudev Host Status"
+    echo ""
+    echo "  Environment:    $host_env"
+    echo "  Linux user:     $linux_user"
+    echo "  CF domain:      $cf_domain"
+    echo "  Client port base: $port_base"
+    echo ""
+    echo "  Host SSH port:  $host_ssh_port"
+    echo "  Host tunnel:    $host_cf_hostname"
+    echo ""
+
+    docker_cmd info >/dev/null 2>&1 \
+        && echo "  Docker:         OK" \
+        || echo "  Docker:         NOT RUNNING"
+
+    command_exists cloudflared \
+        && echo "  cloudflared:    OK" \
+        || echo "  cloudflared:    MISSING"
+
+    docker_cmd image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
+        && echo "  Base image:     OK ($BASE_IMAGE)" \
+        || echo "  Base image:     NOT BUILT — run linux-setup.sh"
+
+    echo ""
+    local count
+    count="$(python3 -c "import json; d=json.loads(open('$CLIENTS_CONFIG').read()); print(len(d['clients']))")"
+    echo "  Clients registered: $count"
+    echo ""
+
+    if [ -n "$host_cf_hostname" ] && [ -n "$host_ssh_port" ]; then
+        echo "── Connect to host ──"
+        echo ""
+        echo "  ssh -p $host_ssh_port ${linux_user}@${host_cf_hostname}"
+        echo ""
+    fi
+
+    echo "Run 'gpudev client list' to see client details."
+}
+
+# ── gpudev client list ────────────────────────────────────────────────────────
+
+cmd_client_list() {
+    require_host_setup
+
+    local count
+    count="$(python3 -c "import json; d=json.loads(open('$CLIENTS_CONFIG').read()); print(len(d['clients']))")"
+
+    if [ "$count" -eq 0 ]; then
+        echo "No clients registered. Run 'gpudev client add <name>' to add one."
+        return 0
+    fi
+
+    printf "%-16s %-10s %-16s %s\n" "NAME" "PORT" "STATUS" "HOSTNAME"
+    echo "──────────────────────────────────────────────────────────────────"
+
+    local cf_domain
+    cf_domain="$(host_get cf_domain)"
+
+    local client_rows
+    client_rows="$(python3 - "$CLIENTS_CONFIG" <<'PY'
+import json, sys
+data = json.loads(open(sys.argv[1]).read())
+for c in data["clients"]:
+    print(f"{c['name']}|{c.get('ssh_port','?')}")
+PY
+)"
+
+    while IFS='|' read -r name port; do
+        local status hostname
+        status="$(container_status "$name")"
+        [ -z "$status" ] && status="not created"
+        hostname="${name}.${cf_domain}"
+        printf "%-16s %-10s %-16s %s\n" "$name" "$port" "$status" "$hostname"
+    done <<< "$client_rows"
+}
+
+# ── gpudev client add ─────────────────────────────────────────────────────────
+
+cmd_client_add() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client add <name>"
+    [ -f "$CLIENT_SETUP" ] || fail "client-setup.sh not found at $CLIENT_SETUP"
+
+    echo ""
+    echo "Paste the SSH public key for client '${name}':"
+    local ssh_key
+    IFS= read -r ssh_key
+    [ -n "$ssh_key" ] || fail "SSH public key is required."
+
+    bash "$CLIENT_SETUP" "$name" "$ssh_key"
+}
+
+# ── gpudev client remove ──────────────────────────────────────────────────────
+
+cmd_client_remove() {
+    local name="${1:-}" confirm="${2:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client remove <name> [--yes]"
+
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+
+    local ssh_port cf_domain tunnel_name
+    ssh_port="$(client_get "$name" ssh_port)"
+    cf_domain="$(host_get cf_domain)"
+    tunnel_name="$(host_get linux_user)"
+    local cf_hostname="${name}.${cf_domain}"
+
+    echo "This will permanently remove:"
+    echo "  Container:  $name"
+    echo "  Volume:     ${name}-data  (ALL CLIENT DATA WILL BE LOST)"
+    echo "  Tunnel:     ingress rule for $cf_hostname removed from host tunnel"
+    echo "  Registry:   clients.json entry"
+    echo ""
+
+    if [ "$confirm" != "--yes" ]; then
+        read -r -p "Type the client name to confirm: " confirm_name
+        [ "$confirm_name" = "$name" ] || { echo "Aborted."; return 0; }
+    fi
+
+    # Stop and remove container
+    if docker_cmd ps -a --format '{{.Names}}' | grep -qx "$name"; then
+        docker_cmd rm -f "$name"
+        log "Container '$name' removed."
+    fi
+
+    # Remove volume
+    if docker_cmd volume ls --format '{{.Name}}' | grep -qx "${name}-data"; then
+        docker_cmd volume rm "${name}-data"
+        log "Volume '${name}-data' removed."
+    fi
+
+    # Remove ingress rule from host config.yml and reload tunnel
+    local config_yml="${HOME}/.cloudflared/config.yml"
+    if [ -f "$config_yml" ] && grep -qF "hostname: ${cf_hostname}" "$config_yml"; then
+        python3 -c "
+import pathlib
+p = pathlib.Path('${config_yml}')
+lines = p.read_text().splitlines(keepends=True)
+out = []
+skip_next = False
+for line in lines:
+    if 'hostname: ${cf_hostname}' in line:
+        skip_next = True
+        continue
+    if skip_next:
+        skip_next = False
+        continue
+    out.append(line)
+p.write_text(''.join(out))
+"
+        log "Ingress rule for $cf_hostname removed from config.yml."
+
+        if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+            sudo systemctl restart gpudev-tunnel
+        else
+            pkill -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
+            sleep 1
+            nohup cloudflared tunnel run "${tunnel_name}" \
+                >"${HOME}/.cloudflared/tunnel.log" 2>&1 &
+            log "Host tunnel restarted."
+        fi
+    fi
+
+    # Remove Cloudflare DNS record via API
+    local cf_api_token cf_zone_id
+    cf_api_token="$(host_get cf_api_token)"
+    if [ -n "$cf_api_token" ]; then
+        cf_zone_id="$(curl -sf \
+            -H "Authorization: Bearer ${cf_api_token}" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/zones?name=${cf_domain}&status=active" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+
+        if [ -n "$cf_zone_id" ]; then
+            local record_id
+            record_id="$(curl -sf \
+                -H "Authorization: Bearer ${cf_api_token}" \
+                "https://api.cloudflare.com/client/v4/zones/${cf_zone_id}/dns_records?name=${cf_hostname}&type=CNAME" \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+
+            if [ -n "$record_id" ]; then
+                curl -sf -X DELETE \
+                    -H "Authorization: Bearer ${cf_api_token}" \
+                    "https://api.cloudflare.com/client/v4/zones/${cf_zone_id}/dns_records/${record_id}" \
+                    >/dev/null
+                log "DNS record for $cf_hostname deleted."
+            else
+                warn "DNS record for $cf_hostname not found — may already be removed."
+            fi
+        else
+            warn "Could not resolve zone ID for $cf_domain — delete DNS record manually."
+        fi
+    else
+        warn "No CF API token in host.json — delete DNS record for $cf_hostname manually."
+        warn "Re-run linux-setup.sh to store the token."
+    fi
+
+    remove_client_from_registry "$name"
+    log "Client '$name' removed from registry."
+    echo ""
+    echo "Client '$name' fully removed."
+}
+
+# ── gpudev client start/stop/restart ─────────────────────────────────────────
+
+cmd_client_start() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client start <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+    docker_cmd start "$name"
+    log "Container '$name' started."
+}
+
+cmd_client_stop() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client stop <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+    docker_cmd stop "$name"
+    log "Container '$name' stopped."
+}
+
+cmd_client_restart() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client restart <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+    docker_cmd restart "$name"
+    log "Container '$name' restarted."
+}
+
+# ── gpudev client rebuild ─────────────────────────────────────────────────────
+
+rebuild_one() {
+    local name="$1"
+    local ssh_port
+    ssh_port="$(client_get "$name" ssh_port)"
+
+    log "Rebuilding '$name' (volume data preserved)..."
+
+    if docker_cmd ps -a --format '{{.Names}}' | grep -qx "$name"; then
+        docker_cmd rm -f "$name"
+    fi
+
+    # Refresh the in-volume management script so rebuild picks up repo changes
+    # (sourced from REPO_DIR — not the deployed ~/bin copy).
+    local km_src="${REPO_DIR}/kernel-manager.sh"
+    if [ -f "$km_src" ]; then
+        docker_cmd run --rm \
+            -v "${name}-data:/home/gpudev" \
+            -v "${km_src}:/tmp/kernel-manager.sh:ro" \
+            "$BASE_IMAGE" bash -c "
+mkdir -p /home/gpudev/bin
+cp /tmp/kernel-manager.sh /home/gpudev/bin/kernel-manager.sh
+chmod +x /home/gpudev/bin/kernel-manager.sh
+"
+        log "  Refreshed kernel-manager.sh from repo."
+    fi
+
+    # --hostname gpudev-<name>: prompt becomes gpudev@gpudev-<name>:~$ after SSH.
+    docker_cmd run -d \
+        --name "$name" \
+        --hostname "gpudev-${name}" \
+        --gpus all \
+        --restart unless-stopped \
+        -v "${name}-data:/home/gpudev" \
+        -p "127.0.0.1:${ssh_port}:22" \
+        -e "GPUDEV_CLIENT=${name}" \
+        "$BASE_IMAGE" \
+        "/home/gpudev/start.sh"
+
+    local tries=15
+    while [ $tries -gt 0 ]; do
+        docker_cmd exec "$name" pgrep sshd >/dev/null 2>&1 && { log "  '$name' ready."; return 0; }
+        sleep 2
+        tries=$((tries - 1))
+    done
+    warn "  '$name' may not be fully ready. Check: gpudev client logs $name"
+}
+
+cmd_client_rebuild() {
+    local target="${1:-}"
+    [ -n "$target" ] || fail "Usage: gpudev client rebuild <name|--all>"
+    require_host_setup
+
+    if [ "$target" = "--all" ]; then
+        local names
+        names="$(all_client_names)"
+        [ -n "$names" ] || { log "No clients registered."; return 0; }
+        log "Rebuilding all clients..."
+
+        local failures=()
+        local name logf reason
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            logf="$(mktemp)"
+            # Run in a pipeline so a hard failure (rebuild_one calls `fail`,
+            # which exits) is contained to the subshell and doesn't abort the
+            # whole batch. Output still streams live via tee; we keep a copy to
+            # extract the failure reason for the summary.
+            if rebuild_one "$name" 2>&1 | tee "$logf"; then
+                :
+            else
+                reason="$(grep -aE '^(Error|Warning):' "$logf" | tail -n 1)"
+                [ -n "$reason" ] || reason="$(tail -n 1 "$logf")"
+                [ -n "$reason" ] || reason="unknown error (no output)"
+                failures+=("${name} — ${reason}")
+                warn "Skipping '${name}' and continuing with the rest: ${reason}"
+            fi
+            rm -f "$logf"
+        done <<< "$names"
+
+        if [ ${#failures[@]} -gt 0 ]; then
+            echo ""
+            warn "Rebuild finished with ${#failures[@]} failure(s):"
+            local f
+            for f in "${failures[@]}"; do
+                warn "  - ${f}"
+            done
+            return 1
+        fi
+        log "All clients rebuilt."
+    else
+        client_exists "$target" || fail "Client '$target' not found."
+        rebuild_one "$target"
+    fi
+}
+
+# ── gpudev client logs ────────────────────────────────────────────────────────
+
+cmd_client_logs() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client logs <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+    docker_cmd logs --tail 50 -f "$name"
+}
+
+# ── gpudev client info ────────────────────────────────────────────────────────
+
+cmd_client_info() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "Usage: gpudev client info <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+
+    local ssh_port cf_domain added_at
+    ssh_port="$(client_get "$name" ssh_port)"
+    cf_domain="$(host_get cf_domain)"
+    added_at="$(client_get "$name" added_at)"
+    local hostname="${name}.${cf_domain}"
+    local status
+    status="$(container_status "$name")"
+    [ -z "$status" ] && status="not created"
+
+    echo ""
+    echo "Client: $name"
+    echo "  Status:    $status"
+    echo "  Hostname:  $hostname"
+    echo "  SSH port:  $ssh_port (host-local)"
+    echo "  Added:     $added_at"
+    echo ""
+    echo "── SSH config (add to ~/.ssh/config on the client/notebook machine) ──"
+    echo ""
+    cat <<EOF
+Host gpudev-${name}
+  HostName ${hostname}
+  User gpudev
+  IdentityFile ~/.ssh/gpudev-${name}
+  IdentitiesOnly yes
+  ProxyCommand bash -c 'p=\$(command -v cloudflared 2>/dev/null || echo "\$HOME/.local/bin/cloudflared"); exec "\$p" access tcp --hostname ${hostname}'
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+EOF
+    echo ""
+    echo "  cloudflared is auto-installed by CRAFT.py (%run CRAFT.py installs it to ~/.local/bin)."
+    echo "  If you need it manually: https://developers.cloudflare.com/cloudflared/install/"
+    echo ""
+    echo "── craft.json (notebook side) ──"
+    echo ""
+    cat <<EOF
+{
+  "client_name": "${name}"
+}
+EOF
+    echo "  (CRAFT derives the SSH alias as gpudev-${name} automatically)"
+    echo ""
+    echo "── Connect ──"
+    echo ""
+    echo "  ssh gpudev-${name}"
+    echo "  # prompt becomes: gpudev@gpudev-${name}:~\$"
+    echo ""
+    echo "── Kernel (admin, on this host) ──"
+    echo ""
+    echo "  gpudev kernel status ${name}"
+    echo "  gpudev kernel restart ${name}"
+    echo ""
+}
+
+# ── gpudev kernel ─────────────────────────────────────────────────────────────
+
+cmd_kernel() {
+    local subcmd="${1:-}" name="${2:-}"
+    [ -n "$subcmd" ] && [ -n "$name" ] || fail "Usage: gpudev kernel <status|restart|doctor> <name>"
+    require_host_setup
+    client_exists "$name" || fail "Client '$name' not found."
+
+    case "$subcmd" in
+        status|restart|doctor)
+            # Run as the gpudev user (NOT root) so the kernel and its connection
+            # file have the same owner as the kernel started over SSH. A
+            # root-owned kernel here is what caused the HMAC signature mismatch.
+            docker_cmd exec -u gpudev -e "GPUDEV_CLIENT=$name" "$name" \
+                "/home/gpudev/bin/kernel-manager.sh" "$subcmd"
+            ;;
+        *)
+            fail "Unknown kernel command '$subcmd'. Use: status, restart, doctor"
+            ;;
+    esac
+}
+
+# ── gpudev status ─────────────────────────────────────────────────────────────
+
+# Single-screen dashboard: platform, GPU, clients, tunnel, command cheat sheet.
+# Designed to auto-run on interactive SSH login so the admin never has to recall
+# which subcommand shows what. All read-only; safe to run anytime.
+cmd_status() {
+    require_host_setup
+
+    local host_env cf_domain client_count uptime_str disk_line
+    host_env="$(host_get host_env)"
+    cf_domain="$(host_get cf_domain)"
+    uptime_str="$(uptime -p 2>/dev/null | sed 's/^up //')"
+    disk_line="$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s / %s (%s used)", $3, $2, $5}')"
+    client_count="$(python3 -c "import json; d=json.loads(open('$CLIENTS_CONFIG').read()); print(len(d['clients']))" 2>/dev/null || echo 0)"
+
+    local platform_label
+    case "$host_env" in
+        wsl2)  platform_label="WSL2 (Windows host)" ;;
+        linux) platform_label="Linux (bare metal)"  ;;
+        *)     platform_label="${host_env:-unknown}" ;;
+    esac
+
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo " GPUDEV HOST STATUS"
+    echo "═══════════════════════════════════════════════════════════════════"
+    printf " Platform:  %s\n"  "$platform_label"
+    printf " Uptime:    %s\n"  "${uptime_str:-unknown}"
+    printf " Disk:      %s\n"  "${disk_line:-unknown}"
+    echo "───────────────────────────────────────────────────────────────────"
+    echo " GPU"
+    local smi
+    if smi="$(find_nvidia_smi)"; then
+        "$smi" 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  nvidia-smi unavailable (NVIDIA driver missing on host)"
+    fi
+    echo "───────────────────────────────────────────────────────────────────"
+    echo " CLIENTS"
+    if [ "$client_count" -eq 0 ]; then
+        echo "  (none registered — gpudev client add <name>)"
+    else
+        printf "  %-16s %-10s %-18s %s\n" "NAME" "STATUS" "UPTIME" "MEM"
+        # One docker_cmd stats call for everything — much faster than per-client.
+        local stats
+        stats="$(docker_cmd stats --no-stream --format '{{.Name}}|{{.MemUsage}}' 2>/dev/null || true)"
+        local names name
+        names="$(all_client_names)"
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            local ps_status ps_short mem
+            ps_status="$(container_status "$name")"
+            if [ -z "$ps_status" ]; then
+                ps_short="not created"; ps_uptime="-"
+            elif [[ "$ps_status" == Up* ]]; then
+                ps_short="running"
+                ps_uptime="${ps_status#Up }"
+                ps_uptime="${ps_uptime%%,*}"   # "3 days" from "Up 3 days, 14 hours"
+            elif [[ "$ps_status" == Exited* ]]; then
+                ps_short="stopped"; ps_uptime="-"
+            else
+                ps_short="$ps_status"; ps_uptime="-"
+            fi
+            mem="$(printf '%s\n' "$stats" | awk -F'|' -v n="$name" '$1==n {print $2; exit}')"
+            mem="${mem:--}"
+            printf "  %-16s %-10s %-18s %s\n" "$name" "$ps_short" "$ps_uptime" "$mem"
+        done <<< "$names"
+    fi
+    echo "───────────────────────────────────────────────────────────────────"
+    # Tunnel one-liner: prefer systemd, fall back to nohup'd background process.
+    local cf_state="down"
+    if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+        cf_state="active (systemd)"
+    elif pgrep -f 'cloudflared tunnel run' >/dev/null 2>&1; then
+        cf_state="active (background)"
+    fi
+    local cf_mark="✓"
+    [ "$cf_state" = "down" ] && cf_mark="✗"
+    printf " CLOUDFLARE  %s tunnel %s" "$cf_mark" "$cf_state"
+    [ -n "$cf_domain" ] && printf "   (%s.%s)" "$(host_get linux_user 2>/dev/null || echo host-gpudev)" "$cf_domain"
+    echo ""
+    echo "───────────────────────────────────────────────────────────────────"
+    echo " COMMANDS"
+    echo "  gpudev client list           list all client containers"
+    echo "  gpudev client add <name>     add a new client container"
+    echo "  gpudev client info <name>    print SSH config stanza for a client"
+    echo "  gpudev client restart <name> restart a client container"
+    echo "  gpudev client logs <name>    tail a client's container logs"
+    echo "  gpudev kernel doctor <name>  diagnose a stuck/silent kernel"
+    echo "  gpudev gpu                   full nvidia-smi"
+    echo "  gpudev cloudflare            tunnel + ingress + edge check"
+    echo "  gpudev disk                  disk usage breakdown"
+    echo "  gpudev power reboot|sleep    reboot or sleep the host"
+    echo "  gpudev self-update           pull latest CLI into ~/bin"
+    echo "  gpudev help                  full command reference"
+    echo "═══════════════════════════════════════════════════════════════════"
+}
+
+# ── gpudev gpu ────────────────────────────────────────────────────────────────
+
+cmd_gpu() {
+    local smi
+    smi="$(find_nvidia_smi)" \
+        || fail "nvidia-smi not found (looked on PATH and /usr/lib/wsl/lib/). Install the NVIDIA driver — on Windows for WSL2 hosts, or the Linux driver for bare-metal."
+    "$smi"
+}
+
+# ── gpudev cloudflare ─────────────────────────────────────────────────────────
+
+cmd_cloudflare() {
+    require_host_setup
+
+    local config_yml="${HOME}/.cloudflared/config.yml"
+    local tunnel_log="${HOME}/.cloudflared/tunnel.log"
+    local host_cf_hostname tunnel_name
+    host_cf_hostname="$(host_get host_cf_hostname)"
+    tunnel_name="$(host_get linux_user)"
+
+    echo "gpudev Cloudflare Tunnel Status"
+    echo ""
+    echo "  Host tunnel hostname:  ${host_cf_hostname:-<unset>}"
+    command_exists cloudflared \
+        && echo "  cloudflared:           OK ($(cloudflared --version 2>&1 | head -1))" \
+        || echo "  cloudflared:           MISSING"
+    echo ""
+
+    # Connector process: prefer systemd unit when present, otherwise look for the
+    # nohup'd background process started by linux-setup.sh on WSL2 hosts.
+    echo "── Connector ──"
+    echo ""
+    if [ -f /etc/systemd/system/gpudev-tunnel.service ] && command_exists systemctl; then
+        local active
+        active="$(systemctl is-active gpudev-tunnel 2>/dev/null || true)"
+        echo "  Mode:     systemd (gpudev-tunnel.service)"
+        echo "  Active:   ${active:-unknown}"
+        systemctl status gpudev-tunnel --no-pager -n 0 2>/dev/null \
+            | grep -E '^\s*(Active|Main PID):' | sed 's/^/  /'
+    else
+        local pids
+        pids="$(pgrep -af 'cloudflared tunnel run' 2>/dev/null || true)"
+        if [ -n "$pids" ]; then
+            echo "  Mode:     background process (no systemd)"
+            echo "  Running:"
+            echo "$pids" | sed 's/^/    /'
+        else
+            echo "  Mode:     background process (no systemd)"
+            echo "  Running:  NOT RUNNING"
+        fi
+    fi
+    echo ""
+
+    # Ingress: parse the lines we wrote in linux-setup.sh / client-setup.sh.
+    if [ -f "$config_yml" ]; then
+        echo "── Ingress (${config_yml}) ──"
+        echo ""
+        # Pair each "hostname:" with the following "service:" line.
+        awk '
+            /^\s*-\s*hostname:/ { host=$0; sub(/^\s*-\s*hostname:\s*/, "", host); next }
+            /^\s*service:/      { svc=$0; sub(/^\s*service:\s*/, "", svc);
+                                  if (host != "") { printf "  %-40s → %s\n", host, svc; host=""; next }
+                                  printf "  %-40s   %s\n", "<catch-all>", svc
+                                }
+        ' "$config_yml"
+        echo ""
+    else
+        echo "  No tunnel config at $config_yml"
+        echo ""
+    fi
+
+    # DNS route check: does the hostname's CNAME actually point at the tunnel
+    # this connector runs? A mismatch is invisible in `systemctl status` (the
+    # connector looks healthy) yet yields HTTP 530 for the hostname — the exact
+    # failure we hit after renaming the tunnel. The CNAME target is proxied, so
+    # `dig` can't see it; read it from the Cloudflare API (token from host.json)
+    # and compare its UUID against config.yml's `tunnel:` UUID.
+    if [ -f "$config_yml" ] && [ -n "$host_cf_hostname" ]; then
+        echo "── DNS route ──"
+        echo ""
+        local cfg_uuid cf_domain cf_api_token
+        cfg_uuid="$(awk '/^tunnel:/ {print $2; exit}' "$config_yml")"
+        cf_domain="$(host_get cf_domain)"
+        cf_api_token="$(host_get cf_api_token)"
+
+        if [ -z "$cfg_uuid" ]; then
+            echo "  config.yml has no 'tunnel:' UUID — cannot check."
+        elif [ -z "$cf_api_token" ] || [ -z "$cf_domain" ] || ! command_exists curl; then
+            echo "  Connector runs tunnel:  $cfg_uuid"
+            echo "  (target check skipped — needs cf_api_token + cf_domain in host.json + curl)"
+        else
+            local zone_id cname_target dns_uuid
+            zone_id="$(curl -sf \
+                -H "Authorization: Bearer ${cf_api_token}" \
+                "https://api.cloudflare.com/client/v4/zones?name=${cf_domain}&status=active" \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+            if [ -z "$zone_id" ]; then
+                echo "  Connector runs tunnel:  $cfg_uuid"
+                echo "  (could not resolve zone '$cf_domain' via API — check cf_api_token)"
+            else
+                cname_target="$(curl -sf \
+                    -H "Authorization: Bearer ${cf_api_token}" \
+                    "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${host_cf_hostname}&type=CNAME" \
+                    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['content'] if d.get('result') else '')" 2>/dev/null || true)"
+                dns_uuid="${cname_target%.cfargotunnel.com}"
+                echo "  Connector runs tunnel:  $cfg_uuid"
+                if [ -z "$cname_target" ]; then
+                    echo "  Hostname CNAME:         <not readable>"
+                    echo "  Could not read a CNAME for $host_cf_hostname — it is either"
+                    echo "  missing, or cf_api_token lacks DNS read. If 530 persists, run:"
+                    echo "    cloudflared tunnel route dns --overwrite-dns ${tunnel_name:-<tunnel>} ${host_cf_hostname}"
+                elif [ "$dns_uuid" = "$cfg_uuid" ]; then
+                    echo "  Hostname CNAME:         $cname_target"
+                    echo "  OK — DNS points at the running tunnel."
+                else
+                    echo "  Hostname CNAME:         $cname_target"
+                    echo "  MISMATCH — DNS points at tunnel $dns_uuid, not the running $cfg_uuid."
+                    echo "  This is the HTTP 530 cause. Re-point it:"
+                    echo "    cloudflared tunnel route dns --overwrite-dns ${tunnel_name:-<tunnel>} ${host_cf_hostname}"
+                fi
+            fi
+        fi
+        echo ""
+    fi
+
+    # Edge check: the 502 vs 200 distinction we hit during debugging — useful
+    # enough to surface up-front. Times out fast.
+    if [ -n "$host_cf_hostname" ] && command_exists curl; then
+        echo "── Edge reachability ──"
+        echo ""
+        local code
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                "https://${host_cf_hostname}" 2>/dev/null || echo '---')"
+        case "$code" in
+            200|301|302|400|401|403|404)
+                echo "  https://${host_cf_hostname} → HTTP $code (tunnel reachable)" ;;
+            502|503|504)
+                echo "  https://${host_cf_hostname} → HTTP $code (tunnel up, ORIGIN DOWN — check host sshd:52100)" ;;
+            530|1033)
+                echo "  https://${host_cf_hostname} → HTTP $code (TUNNEL NOT CONNECTED to Cloudflare)"
+                # 530 for ONE hostname while the connector is up means stale DNS —
+                # see the "DNS route" section above, which names the exact fix.
+                echo "      → see the DNS route section above (likely a stale CNAME)."
+                ;;
+            ---|000)
+                echo "  https://${host_cf_hostname} → unreachable / timeout" ;;
+            *)
+                echo "  https://${host_cf_hostname} → HTTP $code" ;;
+        esac
+        echo ""
+    fi
+
+    # Recent log tail — usually has the real reason when something is wrong.
+    # Under systemd the connector logs to journald, NOT to tunnel.log (that file
+    # is only written by the nohup fallback path), so prefer journalctl when the
+    # unit is present and fall back to the file otherwise.
+    if [ -f /etc/systemd/system/gpudev-tunnel.service ] && command_exists journalctl; then
+        echo "── Last 10 log lines (journalctl -u gpudev-tunnel) ──"
+        echo ""
+        journalctl -u gpudev-tunnel -n 10 --no-pager 2>/dev/null | sed 's/^/  /' \
+            || echo "  (run with sudo to read the journal: sudo journalctl -u gpudev-tunnel -n 50)"
+    elif [ -f "$tunnel_log" ]; then
+        echo "── Last 10 lines of tunnel.log ──"
+        echo ""
+        tail -10 "$tunnel_log" | sed 's/^/  /'
+    fi
+}
+
+# ── gpudev disk ───────────────────────────────────────────────────────────────
+
+cmd_disk() {
+    require_host_setup
+
+    echo "gpudev Disk Usage"
+    echo ""
+
+    echo "── Host root filesystem ──"
+    echo ""
+    df -h / 2>/dev/null | sed 's/^/  /'
+    echo ""
+
+    # If Docker's data root is on a separate filesystem (common on bare Linux),
+    # show that too.
+    local docker_root
+    docker_root="$(docker_cmd info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+    if [ -n "$docker_root" ] && [ "$docker_root" != "/var/lib/docker" ]; then
+        echo "── Docker data root (${docker_root}) ──"
+        echo ""
+        df -h "$docker_root" 2>/dev/null | sed 's/^/  /'
+        echo ""
+    fi
+
+    if docker_cmd info >/dev/null 2>&1; then
+        echo "── Docker (images / containers / volumes) ──"
+        echo ""
+        docker_cmd system df 2>/dev/null | sed 's/^/  /'
+        echo ""
+
+        echo "── Per-client volumes ──"
+        echo ""
+        # `system df -v` includes a "Local Volumes space usage" section with
+        # per-volume sizes. Print just that block.
+        docker_cmd system df -v 2>/dev/null | awk '
+            /^Local Volumes space usage:/ { p=1; next }
+            p && NF==0 { p=0 }
+            p
+        ' | sed 's/^/  /'
+        echo ""
+    else
+        echo "  Docker not reachable — skipping container/volume usage."
+        echo ""
+    fi
+}
+
+# ── gpudev power ──────────────────────────────────────────────────────────────
+
+# Resolve the WSL interop socket so Windows .exe calls work from a non-login
+# session (e.g. a command run over SSH). sshd does not inherit WSL_INTEROP, and
+# without it the binfmt handler that launches Windows executables has no socket
+# to talk to — shutdown.exe/rundll32.exe would fail silently. Pick the most
+# recent live socket under /run/WSL (named <pid>_interop).
+ensure_wsl_interop() {
+    if [ -z "${WSL_INTEROP:-}" ] || [ ! -S "${WSL_INTEROP:-}" ]; then
+        local sock
+        sock="$(ls -t /run/WSL/*_interop 2>/dev/null | head -1 || true)"
+        if [ -n "$sock" ]; then
+            export WSL_INTEROP="$sock"
+        fi
+    fi
+    return 0
+}
+
+cmd_power() {
+    local action="${1:-}"
+    case "$action" in
+        reboot|sleep) ;;
+        *) fail "Usage: gpudev power <reboot|sleep>" ;;
+    esac
+
+    require_host_setup
+    local host_env
+    host_env="$(host_get host_env)"
+
+    case "$host_env" in
+        wsl2)
+            # WSL2 can't suspend/reboot Windows itself — drive the Windows host
+            # via interop. GPUDEV_POWER_DRYRUN lets tests exercise the routing
+            # without actually cycling the machine.
+            ensure_wsl_interop
+            local sys32="/mnt/c/Windows/System32"
+            if [ "$action" = "reboot" ]; then
+                local sd="${sys32}/shutdown.exe"
+                [ -x "$sd" ] || sd="shutdown.exe"
+                log "Rebooting Windows host..."
+                [ -n "${GPUDEV_POWER_DRYRUN:-}" ] && { echo "[dry-run] $sd /r /t 0"; return 0; }
+                "$sd" /r /t 0
+            else
+                local rd="${sys32}/rundll32.exe"
+                [ -x "$rd" ] || rd="rundll32.exe"
+                log "Sleeping Windows host..."
+                # SetSuspendState <Hibernate=0> <Force=1> <WakeupEventsDisabled=0>
+                [ -n "${GPUDEV_POWER_DRYRUN:-}" ] && { echo "[dry-run] $rd powrprof.dll,SetSuspendState 0,1,0"; return 0; }
+                "$rd" powrprof.dll,SetSuspendState 0,1,0
+            fi
+            ;;
+        linux|"")
+            # Bare Linux host. An SSH session is not a polkit "active" session,
+            # so suspend/reboot go through sudo (linux-setup.sh adds a NOPASSWD
+            # rule for exactly these two commands).
+            local sysctl_action
+            sysctl_action="$([ "$action" = "reboot" ] && echo reboot || echo suspend)"
+            log "Running: systemctl $sysctl_action"
+            [ -n "${GPUDEV_POWER_DRYRUN:-}" ] && { echo "[dry-run] sudo systemctl $sysctl_action"; return 0; }
+            sudo systemctl "$sysctl_action"
+            ;;
+        *)
+            fail "Unknown host_env '$host_env' in host.json — expected 'wsl2' or 'linux'."
+            ;;
+    esac
+}
+
+# ── gpudev self-update ────────────────────────────────────────────────────────
+
+cmd_self_update() {
+    local repo_dir="${HOME}/gpudev"
+    mkdir -p "$repo_dir"
+
+    # Two modes:
+    #   - Git checkout (~/gpudev/.git exists): operator dev workflow → `git pull`.
+    #   - Curl-bootstrapped (no .git): production host → download fresh copies
+    #     from GitHub raw URLs. Same files linux-setup.sh's fetch_companions
+    #     downloads on install; CRAFT.py / windows-setup.ps1 deliberately
+    #     excluded — host doesn't need them.
+    if [ -d "${repo_dir}/.git" ]; then
+        log "Updating ${repo_dir} via git pull..."
+        ( cd "$repo_dir" && git pull --ff-only ) || fail "git pull failed in ${repo_dir}."
+    else
+        local repo_raw="${GPUDEV_REPO_RAW:-https://raw.githubusercontent.com/rleyvasal/gpudev/main}"
+        log "Downloading latest host scripts from ${repo_raw}..."
+        command_exists curl || fail "curl is required for self-update on non-git installs."
+        local f tmp
+        for f in linux-setup.sh gpudev client-setup.sh kernel-manager.sh; do
+            tmp="$(mktemp)"
+            if curl -fsSL "${repo_raw}/${f}" -o "$tmp"; then
+                chmod +x "$tmp"
+                mv -f "$tmp" "${repo_dir}/${f}"
+                log "  Updated: ${repo_dir}/${f}"
+            else
+                rm -f "$tmp"
+                fail "Failed to download ${f}."
+            fi
+        done
+    fi
+
+    # Deploy CLI scripts from REPO_DIR into ~/bin using atomic mv. Never cp
+    # over the running script: bash reads by byte offset, so truncating the
+    # same inode mid-run corrupts execution ("unexpected EOF"). rename(2)
+    # swaps the directory entry while the old inode stays open for any
+    # process still reading it (including this one).
+    local script tmp
+    for script in gpudev client-setup.sh kernel-manager.sh; do
+        if [ -f "${repo_dir}/${script}" ]; then
+            tmp="$(mktemp "${HOME}/bin/.${script}.XXXXXX")"
+            cp "${repo_dir}/${script}" "$tmp"
+            chmod +x "$tmp"
+            mv -f "$tmp" "${HOME}/bin/${script}"
+            log "Updated: ${HOME}/bin/${script}"
+        else
+            warn "${script} not found in ${repo_dir} — skipped."
+        fi
+    done
+
+    # Ensure the interactive-login dashboard hook is in ~/.bashrc so existing
+    # hosts get it on `gpudev self-update` (not just fresh linux-setup.sh runs).
+    local hook='if [ -n "$PS1" ] && command -v gpudev >/dev/null 2>&1; then gpudev status 2>/dev/null; fi'
+    local bashrc="${HOME}/.bashrc"
+    touch "$bashrc"
+    if ! grep -Fqx "$hook" "$bashrc"; then
+        echo "$hook" >> "$bashrc"
+        log "Installed dashboard hook into ~/.bashrc (shows on interactive SSH login)."
+    fi
+
+    echo ""
+    echo "gpudev scripts updated."
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+gpudev — GPU workspace manager
+
+Dashboard:
+  gpudev status                (auto-runs on interactive SSH login)
+
+Host:
+  gpudev host status
+
+Clients:
+  gpudev client list
+  gpudev client add <name>
+  gpudev client remove <name> [--yes]
+  gpudev client start <name>
+  gpudev client stop <name>
+  gpudev client restart <name>
+  gpudev client rebuild <name|--all>
+  gpudev client logs <name>
+  gpudev client info <name>
+
+Kernel:
+  gpudev kernel status <name>
+  gpudev kernel restart <name>
+  gpudev kernel doctor <name>
+
+Status:
+  gpudev gpu
+  gpudev cloudflare
+  gpudev disk
+
+Power:
+  gpudev power reboot
+  gpudev power sleep
+
+Other:
+  gpudev self-update
+EOF
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    case "${1:-}" in
+        status)
+            cmd_status
+            ;;
+        host)
+            case "${2:-}" in
+                status) cmd_host_status ;;
+                *)      usage; exit 1 ;;
+            esac
+            ;;
+        client)
+            case "${2:-}" in
+                list)    cmd_client_list ;;
+                add)     cmd_client_add "${3:-}" ;;
+                remove)  cmd_client_remove "${3:-}" "${4:-}" ;;
+                start)   cmd_client_start "${3:-}" ;;
+                stop)    cmd_client_stop "${3:-}" ;;
+                restart) cmd_client_restart "${3:-}" ;;
+                rebuild) cmd_client_rebuild "${3:-}" ;;
+                logs)    cmd_client_logs "${3:-}" ;;
+                info)    cmd_client_info "${3:-}" ;;
+                *)       usage; exit 1 ;;
+            esac
+            ;;
+        kernel)
+            cmd_kernel "${2:-}" "${3:-}"
+            ;;
+        gpu)
+            cmd_gpu
+            ;;
+        cloudflare)
+            cmd_cloudflare
+            ;;
+        disk)
+            cmd_disk
+            ;;
+        power)
+            cmd_power "${2:-}"
+            ;;
+        self-update)
+            cmd_self_update
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            usage; exit 1
+            ;;
+    esac
+}
+
+main "$@"
