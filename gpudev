@@ -154,10 +154,17 @@ cmd_host_status() {
     echo "  Clients registered: $count"
     echo ""
 
-    if [ -n "$host_cf_hostname" ] && [ -n "$host_ssh_port" ]; then
-        echo "── Connect to host ──"
+    if [ -n "$host_cf_hostname" ]; then
+        echo "── Connect to host (via the Cloudflare tunnel) ──"
         echo ""
-        echo "  ssh -p $host_ssh_port ${linux_user}@${host_cf_hostname}"
+        echo "  On your admin machine, add to ~/.ssh/config:"
+        echo "    Host ${linux_user}"
+        echo "      HostName ${host_cf_hostname}"
+        echo "      User ${linux_user}"
+        echo "      IdentityFile ~/.ssh/<your-admin-key>"
+        echo "      ProxyCommand cloudflared access ssh --hostname %h"
+        echo "  then:  ssh ${linux_user}"
+        echo "  (port ${host_ssh_port:-52100} is internal to WSL — never 'ssh -p' it directly)"
         echo ""
     fi
 
