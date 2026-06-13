@@ -28,9 +28,13 @@
          once only if the feature was just turned on), then `wsl --import` the
          distro from an Ubuntu rootfs tarball (no OOBE) and provision the Linux
          user + /etc/wsl.conf.
-      7. Register a Windows boot scheduled task that wakes the distro at startup.
-      8. Register a periodic keepalive task (Layer 3) that re-wakes the distro
-         if it exits between Windows boots (WSL crash, background update, etc.).
+      7. Register a boot scheduled task that wakes the distro at logon — running
+         as the OPERATOR, not SYSTEM (WSL distros are per-user; a SYSTEM task
+         can't see/start them — that was the "nothing comes back after reboot"
+         bug). Needs no stored password (LogonType Interactive).
+      8. Register a periodic keepalive task (Layer 3, also as the operator) that
+         re-wakes the distro if it exits between Windows boots (WSL crash,
+         background update, etc.).
 
     Done by Phase A (new — previously deferred to Ubuntu's hung OOBE):
       - Linux user creation — -LinuxUser (default 'gpudev') is created with
@@ -38,6 +42,13 @@
       - /etc/wsl.conf — [user] default=<user> + [boot] systemd=true, so the very
         first `wsl -d <distro>` lands as that user with systemd already PID 1.
         Phase B's wsl.conf writer is section-aware and preserves both.
+
+    Manual step Phase A canNOT do (it detects + prints instructions instead):
+      - Windows AUTOLOGIN. The boot/keepalive tasks fire at LOGON, so for WSL to
+        come back after an UNATTENDED reboot, Windows must auto-log-in the
+        operator. That needs the account password (and, if it's a Microsoft
+        account, an MSA->local conversion first), which the script won't handle.
+        Enable it once with Sysinternals Autologon — see the printed handoff.
 
     Still Phase B (deliberately):
       - Docker, NVIDIA toolkit, cloudflared, gpudev CLI, base image, tunnel.
@@ -491,24 +502,31 @@ function Unregister-ResumeTask {
     }
 }
 
-# ── Boot task (Layer 2: wake WSL at every Windows startup) ─────────────────────
+# ── Boot task (Layer 2: wake WSL at logon) ─────────────────────────────────────
 function Register-BootTask {
-    # Phase B's systemd (enabled via /etc/wsl.conf [boot] systemd=true that
-    # Phase B writes) auto-starts docker / ssh / gpudev-tunnel as soon as the
-    # WSL VM is up. This task just makes sure the VM is up at Windows boot.
-    # `wsl --exec /bin/true` is the cheapest possible "wake it" command.
-    $arg = "-d $script:Distro --exec /bin/true"
-    $action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument $arg
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+    # CRITICAL: this task runs as the OPERATOR, not SYSTEM. WSL distros are
+    # registered per Windows user (in HKCU), so a SYSTEM task has its own empty
+    # WSL registry and literally cannot start the operator's distro — that was the
+    # "nothing comes back after a reboot" bug (the SYSTEM task returned exit -1).
+    # Running as the operator with LogonType Interactive is the same context in
+    # which `wsl` works by hand, and needs NO stored password to register.
+    #
+    # It triggers AtLogon, so for unattended reboot recovery Windows must be set to
+    # AUTOLOGIN this operator (a manual step Phase A can't do — it needs the
+    # password; see the handoff + Test-Autologon). Once the VM is up, Phase B's
+    # systemd ([boot] systemd=true) auto-starts docker / ssh / gpudev-tunnel.
+    $user = $env:USERNAME
+    $action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d $script:Distro --exec /bin/true"
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 3
     try {
         Register-ScheduledTask -TaskName $BootTaskName -Action $action -Trigger $trigger `
             -Principal $principal -Settings $settings -Force | Out-Null
-        Log "Registered boot task '$BootTaskName' (wakes WSL at Windows startup)."
+        Log "Registered boot task '$BootTaskName' (wakes WSL as '$user' at logon)."
     } catch {
-        Warn "Could not register boot task as SYSTEM: $_"
+        Warn "Could not register boot task: $_"
         Warn "WSL won't auto-start on reboot; bring it up manually with: wsl -d $script:Distro"
     }
 }
@@ -521,6 +539,10 @@ function Register-KeepaliveTask {
     #   - Memory pressure killing the WSL VM
     # Runs every 5 min, checks if the distro is in `wsl -l --running --quiet`,
     # and wakes it if not. No-op when WSL is healthy; cheap (~ms) when it is.
+    # Runs as the OPERATOR (LogonType Interactive) for the same per-user reason as
+    # the boot task — a SYSTEM instance can't see or wake the operator's distro.
+    # With autologin the operator is logged on after boot, so this fires; the
+    # AtLogon boot task covers the brief pre-logon window.
     $cmd = @"
 `$running = & wsl.exe -l --running --quiet 2>`$null
 `$names = (`$running -join "``n") -replace "``0", "" -split "``r?``n" | ForEach-Object { `$_.Trim() }
@@ -532,7 +554,7 @@ if (-not (`$names -contains '$script:Distro')) {
         -Argument "-NoProfile -WindowStyle Hidden -Command `"$cmd`""
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
         -RepetitionInterval (New-TimeSpan -Minutes 5)
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
     try {
@@ -540,9 +562,42 @@ if (-not (`$names -contains '$script:Distro')) {
             -Principal $principal -Settings $settings -Force | Out-Null
         Log "Registered keepalive task '$KeepaliveTaskName' (re-wakes WSL every 5 min if it exits)."
     } catch {
-        Warn "Could not register keepalive task as SYSTEM: $_"
+        Warn "Could not register keepalive task: $_"
         Warn "WSL won't be auto-re-woken on mid-session crash; impact is the gpudev tunnel goes down until next Windows reboot."
     }
+}
+
+# ── Autologin (manual prerequisite for unattended reboot recovery) ─────────────
+function Test-Autologon {
+    # The boot/keepalive tasks run as the operator and trigger at LOGON, so WSL
+    # only auto-starts after a reboot if Windows auto-logs-in the operator. Phase A
+    # can't configure that safely (it needs the account password / an MSA->local
+    # conversion), so it DETECTS it and prints instructions if missing.
+    try {
+        $w = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction Stop
+        return ("$($w.AutoAdminLogon)" -eq '1')
+    } catch {
+        return $false
+    }
+}
+
+function Show-AutologinHelp {
+    $u = $env:USERNAME
+    Write-Host ""
+    Write-Host "IMPORTANT — enable Windows AUTOLOGIN so WSL comes back after an unattended reboot:" -ForegroundColor Yellow
+    Write-Host "  The boot/keepalive tasks run as '$u' (SYSTEM can't see your WSL distro) and"
+    Write-Host "  fire at LOGON. Without autologin, nothing starts until someone signs in."
+    Write-Host ""
+    Write-Host "    1. If '$u' is a Microsoft account, convert it to a LOCAL account first"
+    Write-Host "       (so you're not storing your Microsoft password):"
+    Write-Host "         Settings > Accounts > Your info > 'Sign in with a local account instead'"
+    Write-Host "         Keep the same username; set a simple local password."
+    Write-Host "    2. Enable autologin with Sysinternals Autologon (stores the password as an"
+    Write-Host "       encrypted LSA secret, not plaintext):"
+    Write-Host "         https://learn.microsoft.com/sysinternals/downloads/autologon"
+    Write-Host "         Autologon.exe -accepteula $u . <local-password>"
+    Write-Host ""
+    Write-Host "  Verify:  (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoAdminLogon  → 1"
 }
 
 # ── Health check ───────────────────────────────────────────────────────────────
@@ -576,10 +631,17 @@ function Invoke-HealthCheck {
         Log "  Keepalive task (5 min):    OK ($KeepaliveTaskName)"
     } else { Warn "  Keepalive task (5 min):    not registered" }
 
+    $autologin = Test-Autologon
+    if ($autologin) {
+        Log "  Autologin (unattended boot): OK"
+    } else { Warn "  Autologin (unattended boot): NOT set — WSL won't auto-start after a reboot (manual step below)" }
+
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
     if ((Test-Path $wslconfig) -and ((Get-Content $wslconfig -Raw) -match 'gpudev')) {
         Log "  .wslconfig (idle=disabled): OK"
     } else { Warn "  .wslconfig (idle=disabled): MISSING" }
+
+    if (-not $autologin) { Show-AutologinHelp }
 
     Write-Host ""
     Write-Host "Phase A complete — Windows is ready for gpudev." -ForegroundColor Green

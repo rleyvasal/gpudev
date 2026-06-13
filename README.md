@@ -177,12 +177,27 @@ What the script does, in order:
    tarball (`wsl --import` — no OOBE, so nothing to hang on), creates the
    `gpudev` user with passwordless sudo, and writes `/etc/wsl.conf`
    (`[user] default=gpudev`, `[boot] systemd=true`).
-7. Registers a **boot task** (`gpudev-wsl-boot`): runs at Windows startup
-   and wakes the WSL VM (`wsl -d <distro> --exec /bin/true`). Phase B's
+7. Registers a **boot task** (`gpudev-wsl-boot`) that wakes the WSL VM at logon
+   (`wsl -d <distro> --exec /bin/true`). It runs **as your Windows user, not
+   SYSTEM** — WSL distros are per-user, so a SYSTEM task can't see or start them
+   (that's the classic "nothing comes back after a reboot" failure). Phase B's
    systemd inside WSL then auto-starts ssh, docker, and the tunnel.
-8. Registers a **keepalive task** (`gpudev-wsl-keepalive`): runs every 5 min,
-   checks if the distro is running, wakes it if not. Belt-and-suspenders
-   against WSL crashes / background Windows updates that kill the VM.
+8. Registers a **keepalive task** (`gpudev-wsl-keepalive`, also as your user):
+   every 5 min, checks if the distro is running and wakes it if not.
+   Belt-and-suspenders against WSL crashes / background Windows updates.
+
+> **Manual step — enable autologin (required for unattended reboot recovery).**
+> Both tasks fire at **logon**, so for WSL to come back after a reboot *with
+> nobody signing in*, Windows must auto-log-in your user. Phase A can't do this
+> (it needs your password) — it detects it and prints instructions. One-time:
+> if your account is a **Microsoft account**, first convert it to a **local
+> account** (Settings → Accounts → Your info → *Sign in with a local account
+> instead*; keep the username, set a simple local password) so you're not storing
+> your Microsoft password — then enable autologin with
+> [Sysinternals Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon)
+> (`Autologon.exe -accepteula <user> . <local-password>`), which stores it as an
+> encrypted LSA secret. Without this, the stack only comes up when you manually
+> sign in or run `wsl`.
 
 The script ends with a health check; everything should be `OK`:
 
@@ -191,9 +206,10 @@ Distro:                    gpudev
 Linux user:                gpudev
 NVIDIA driver (Windows):   OK
 WSL2 distro installed:     OK (gpudev)
-Linux user (gpudev):  OK (default user, sudo)
+Linux user (gpudev):       OK (default user, sudo)
 Boot task (wake on boot):  OK (gpudev-wsl-boot)
 Keepalive task (5 min):    OK (gpudev-wsl-keepalive)
+Autologin (unattended boot): OK
 .wslconfig (idle=disabled): OK
 ```
 
@@ -540,7 +556,7 @@ What comes back on its own, and what needs a hand:
 
 | Event | Auto-recovers | Why |
 | --- | --- | --- |
-| **Windows restart** | ✅ everything | `gpudev-wsl-boot` task wakes WSL at startup; systemd auto-starts `ssh` + `gpudev-tunnel`; DNS is unchanged. |
+| **Windows restart** | ✅ everything *(if autologin is on)* | At logon the `gpudev-wsl-boot` task (runs as your user) wakes WSL; systemd auto-starts `ssh` + `gpudev-tunnel`; DNS is unchanged. **Requires Windows autologin** (above) so the logon happens unattended — without it, WSL stays down until you sign in or run `wsl`. |
 | **WSL `--shutdown`** | ✅ everything | `gpudev-wsl-keepalive` re-wakes WSL within 5 min (or next access); systemd restarts the services. |
 | **Distro reinstall** | ⚠️ mostly | Re-run `linux-setup.sh`: it re-creates the tunnel + credentials, re-points DNS with `--overwrite-dns`, and re-adds your admin key. The **one** manual step is the host-key trust on the admin side (`ssh-keygen -R`, above). |
 
