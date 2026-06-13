@@ -4,10 +4,17 @@
     gpudev windows-setup.ps1 — Phase A: Windows-side host preparation only.
 
 .DESCRIPTION
-    This script makes the Windows machine a reliable WSL host. It does NOT
-    create the Linux user, does NOT configure /etc/wsl.conf inside the distro,
-    and does NOT install gpudev components inside WSL. All of that is Phase B
-    (linux-setup.sh, run from inside WSL by the operator).
+    This script makes the Windows machine a reliable WSL host and registers the
+    distro WITHOUT Ubuntu's interactive first-run (OOBE). It does NOT install
+    gpudev components inside WSL — that's Phase B (linux-setup.sh, run from
+    inside WSL by the operator).
+
+    Why OOBE-free: the rolling `Ubuntu` image's first-run OOBE hangs
+    ("Waiting for OOBE command to complete for distribution...") and never
+    reaches the username prompt, which blocked clean reinstalls. The OOBE is
+    triggered by `wsl --install` / .wsl registration; `wsl --import` of a rootfs
+    tarball does NOT run it. So Phase A imports the rootfs and creates the user
+    itself — fully scriptable, no interactive prompt.
 
     Phase A responsibilities:
 
@@ -17,52 +24,119 @@
       3. Run `wsl --update` to keep the WSL kernel current.
       4. Configure Windows power settings (no auto-sleep on AC).
       5. Write %USERPROFILE%\.wslconfig (vmIdleTimeout=-1 so the WSL2 VM stays up).
-      6. Install WSL2 + the chosen distro with --no-launch (auto-reboots once
-         and resumes itself if the WSL feature was just enabled).
+      6. Ensure the WSL2 platform is enabled (--no-distribution; reboots+resumes
+         once only if the feature was just turned on), then `wsl --import` the
+         distro from an Ubuntu rootfs tarball (no OOBE) and provision the Linux
+         user + /etc/wsl.conf.
       7. Register a Windows boot scheduled task that wakes the distro at startup.
       8. Register a periodic keepalive task (Layer 3) that re-wakes the distro
          if it exits between Windows boots (WSL crash, background update, etc.).
 
-    What's NOT done here (deliberately):
-      - Linux user creation — happens on first `wsl -d <distro>` (Ubuntu's
-        first-run prompt asks the operator). Pick any username; Phase B adapts.
-      - /etc/wsl.conf inside the distro — Phase B writes systemd=true and
-        default user, since at that point linux-setup.sh knows whoami.
-      - Docker, NVIDIA toolkit, cloudflared, gpudev CLI, base image — all Phase B.
+    Done by Phase A (new — previously deferred to Ubuntu's hung OOBE):
+      - Linux user creation — -LinuxUser (default 'gpudev') is created with
+        passwordless sudo (SSH into the host is key-only, so no login password).
+      - /etc/wsl.conf — [user] default=<user> + [boot] systemd=true, so the very
+        first `wsl -d <distro>` lands as that user with systemd already PID 1.
+        Phase B's wsl.conf writer is section-aware and preserves both.
+
+    Still Phase B (deliberately):
+      - Docker, NVIDIA toolkit, cloudflared, gpudev CLI, base image, tunnel.
 
     Handoff (printed at the end as instructions):
 
-        wsl -d Ubuntu-24.04                 # Ubuntu first-run prompts user/pass
+        wsl -d gpudev            # lands as gpudev (no first-run prompt)
         # inside WSL:
         bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)
 
-.PARAMETER Distro
-    WSL distro to install. Default: "Ubuntu". Anything `wsl --install -d` accepts.
+.PARAMETER DistroName
+    Name to register the imported distro under. Default: "gpudev". This becomes
+    the default WSL distro that the boot/keepalive tasks wake. Naming it "gpudev"
+    (rather than "Ubuntu") sidesteps any collision with a Store-installed Ubuntu
+    and the "wrong default distro came back after reboot" problem. The distro
+    name is Windows-local — it does NOT affect the tunnel hostname or SSH alias
+    (those derive from -LinuxUser).
+
+.PARAMETER LinuxUser
+    Unix username to create (passwordless sudo, set as the distro's default
+    user). Default: "gpudev" — this IS the cloudflared tunnel name, the DNS
+    hostname (<user>.<domain>), and the Mac SSH alias (`ssh <user>`), so keeping
+    it stable avoids re-doing your DNS + ~/.ssh/config on every reinstall.
+
+.PARAMETER UbuntuSeries
+    Ubuntu LTS series (codename) to import. Default: "noble" (24.04 LTS). Pins
+    the compatibility target to a series WITHOUT pinning an exact point-release
+    image — `.../releases/<series>/current/` always resolves to Canonical's
+    latest refreshed rootfs for that series. Used only to derive -RootfsUrl when
+    that isn't given. Set e.g. "jammy" to test 22.04. We deliberately do NOT
+    auto-track a global "latest" major release: a surprise 24.04 -> 26.04 jump
+    would silently shift Docker/NVIDIA apt repos, systemd behavior, and Python
+    defaults out from under gpudev.
+
+.PARAMETER RootfsUrl
+    Explicit URL of the Ubuntu WSL rootfs tarball to import. Escape hatch — when
+    empty (default) it is derived from -UbuntuSeries:
+      https://cloud-images.ubuntu.com/wsl/releases/<series>/current/ubuntu-<series>-wsl-amd64-wsl.rootfs.tar.gz
+    Cached under ProgramData\gpudev so a resume-after-reboot or re-run doesn't
+    re-download ~340 MB.
+
+.PARAMETER InstallLocation
+    Folder for the imported distro's VHD. Default: %LOCALAPPDATA%\WSL\<DistroName>.
+
+.PARAMETER Reinstall
+    If the distro is already registered, UNREGISTER it first (this ERASES that
+    distro's data) and re-import clean. Use this for a fresh reinstall.
 
 .PARAMETER SkipReboot
-    Don't auto-reboot after enabling WSL2 / installing the distro. You'll have
-    to reboot yourself and let the resume task pick up at logon (or re-run this
+    Don't auto-reboot if enabling the WSL2 platform needs one. You'll have to
+    reboot yourself and let the resume task pick up at logon (or re-run this
     script with -Resume).
 
 .PARAMETER Resume
-    Internal: re-entry point after the post-WSL-install reboot. Don't pass by hand.
+    Internal: re-entry point after the platform-enable reboot. Don't pass by hand.
 
 .EXAMPLE
-    # Default install (distro: Ubuntu):
+    # Default install (distro gpudev on Ubuntu 24.04 LTS, user gpudev):
     .\windows-setup.ps1
 
 .EXAMPLE
-    # Specific Ubuntu release:
-    .\windows-setup.ps1 -Distro Ubuntu-24.04
+    # Fresh reinstall, wiping any existing gpudev distro first:
+    .\windows-setup.ps1 -Reinstall
+
+.EXAMPLE
+    # Test a different LTS series (22.04):
+    .\windows-setup.ps1 -UbuntuSeries jammy -Reinstall
 #>
 [CmdletBinding()]
 param(
-    [string]$Distro = 'Ubuntu',
+    [string]$DistroName = 'gpudev',
+    [string]$LinuxUser = 'gpudev',
+    [string]$UbuntuSeries = 'noble',
+    [string]$RootfsUrl = '',
+    [string]$InstallLocation = '',
+    [switch]$Reinstall,
     [switch]$SkipReboot,
     [switch]$Resume
 )
 
-$script:Distro = $Distro   # promote param into script scope so nested functions and scriptblock invocation both see it
+# Pin the LTS series, NOT an exact point-release: `.../releases/<series>/current/`
+# always points at Canonical's latest refreshed rootfs for that series, so we
+# track Noble security/point updates but never auto-jump to a new major release.
+if (-not $RootfsUrl) {
+    $RootfsUrl = "https://cloud-images.ubuntu.com/wsl/releases/$UbuntuSeries/current/ubuntu-$UbuntuSeries-wsl-amd64-wsl.rootfs.tar.gz"
+}
+if (-not $InstallLocation) {
+    $InstallLocation = Join-Path $env:LOCALAPPDATA "WSL\$DistroName"
+}
+
+# Promote params into script scope so nested functions see them, and so the
+# post-reboot resume (which re-reads them from saved state via Load-State) and
+# the first pass agree on the same values.
+$script:Distro          = $DistroName
+$script:LinuxUser       = $LinuxUser
+$script:UbuntuSeries    = $UbuntuSeries
+$script:RootfsUrl       = $RootfsUrl
+$script:InstallLocation = $InstallLocation
+$script:Reinstall       = [bool]$Reinstall
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -97,12 +171,26 @@ function Assert-WslSupported {
     Log "Windows build $build supports WSL2."
 }
 
+function Assert-LinuxUserName {
+    # The username is interpolated into useradd / sudoers / wsl.conf, and becomes
+    # the tunnel hostname + SSH alias. Restrict to a conventional Linux username
+    # so the interpolation can't be subverted and useradd won't reject it.
+    if ($script:LinuxUser -notmatch '^[a-z_][a-z0-9_-]{0,31}$') {
+        Fail "Invalid -LinuxUser '$script:LinuxUser'. Use lowercase letters/digits/'-'/'_', starting with a letter or '_' (e.g. gpudev)."
+    }
+}
+
 # ── Resume state (just enough to survive the reboot) ───────────────────────────
 function Save-State {
     if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
     $state = [ordered]@{
-        Distro     = $script:Distro
-        ScriptPath = $PSCommandPath
+        Distro          = $script:Distro
+        LinuxUser       = $script:LinuxUser
+        UbuntuSeries    = $script:UbuntuSeries
+        RootfsUrl       = $script:RootfsUrl
+        InstallLocation = $script:InstallLocation
+        Reinstall       = $script:Reinstall
+        ScriptPath      = $PSCommandPath
     }
     $state | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
 }
@@ -112,7 +200,12 @@ function Load-State {
         Fail "Resume requested but no saved state at $StateFile. Re-run without -Resume."
     }
     $s = Get-Content $StateFile -Raw | ConvertFrom-Json
-    $script:Distro = $s.Distro
+    $script:Distro          = $s.Distro
+    $script:LinuxUser       = $s.LinuxUser
+    $script:UbuntuSeries    = $s.UbuntuSeries
+    $script:RootfsUrl       = $s.RootfsUrl
+    $script:InstallLocation = $s.InstallLocation
+    $script:Reinstall       = [bool]$s.Reinstall
 }
 
 function Remove-State {
@@ -209,7 +302,7 @@ function Set-WslGlobalConfig {
     Log "Normalized .wslconfig (single vmIdleTimeout=-1 under [wsl2])."
 }
 
-# ── Install WSL2 + distro ──────────────────────────────────────────────────────
+# ── Install WSL2 + distro (OOBE-free via wsl --import) ─────────────────────────
 function Test-DistroInstalled {
     # `wsl -l -q` lists installed distros (UTF-16 output; normalize).
     try {
@@ -222,40 +315,139 @@ function Test-DistroInstalled {
     }
 }
 
-function Install-Wsl {
-    Log "Installing WSL2 + $script:Distro with --no-launch (no interactive first-run)..."
-    # --no-launch is required: it skips Ubuntu's interactive user-creation
-    # prompt, which is what Phase A is supposed to defer to the operator.
-    # If --no-launch is unsupported on this Windows version we FAIL clearly
-    # rather than fall back to the interactive `wsl --install`, which would
-    # drop the operator into a prompt mid-script.
-    # Capture stderr+stdout together and inspect $LASTEXITCODE ourselves. wsl.exe
-    # writes NON-fatal warnings (e.g. a duplicate .wslconfig key) to stderr; under
-    # `-ErrorActionPreference Stop` PowerShell turns any native-command stderr into
-    # a terminating NativeCommandError, which aborted the install on a harmless
-    # warning. Drop to Continue just for this call so only a real non-zero exit fails.
+function Test-WslPlatformReady {
+    # True when the WSL2 platform itself is installed and usable, independent of
+    # whether any distro is registered. `wsl --status` exits 0 once the optional
+    # Windows components + kernel are present and errors on a machine where WSL
+    # was never enabled — the discriminator we use to decide whether we still owe
+    # a feature-enable + reboot before `wsl --import` can work.
+    try {
+        & wsl.exe --status *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Enable-WslPlatform {
+    # Turn on the WSL2 platform WITHOUT installing a distro and WITHOUT any
+    # interactive first-run. On a machine that already has WSL (the reinstall
+    # case) this is a fast no-op; on a fresh machine it enables the optional
+    # Windows features and typically needs one reboot before `wsl --import` works.
+    # Exit code is intentionally not treated as fatal — on an already-enabled
+    # host this can return non-zero ("nothing to do") yet WSL is fine; the caller
+    # re-checks Test-WslPlatformReady to decide what actually happened.
+    Log "Ensuring the WSL2 platform is enabled (wsl --install --no-distribution)..."
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $wslOut = & wsl.exe --install -d $script:Distro --no-launch 2>&1
+        & wsl.exe --install --no-distribution 2>&1 | ForEach-Object { Write-Host $_ }
     } finally {
         $ErrorActionPreference = $prevEAP
     }
-    $wslOut | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
-        Fail @"
-'wsl --install -d $script:Distro --no-launch' failed (exit $LASTEXITCODE).
+}
 
-This usually means either:
-  - The --no-launch flag isn't supported on this Windows build (need recent WSL).
-    Try: wsl --update   (Phase A already runs this; check the output above.)
-  - The distro name is invalid. Check available distros: wsl -l --online
-
-Do NOT work around this by running plain 'wsl --install' — that triggers
-Ubuntu's interactive first-run prompt, which is exactly what Phase A defers
-to you (the operator) so you can pick your own Linux username later.
-"@
+function Import-Distro {
+    # Register the distro from an Ubuntu rootfs tarball. `wsl --import` performs
+    # NO OOBE (unlike `wsl --install` / .wsl registration), so there is no hung
+    # "Waiting for OOBE command..." and no interactive username prompt — we land
+    # as root and create the user ourselves in Initialize-LinuxUser.
+    if (Test-DistroInstalled) {
+        if ($script:Reinstall) {
+            Warn "-Reinstall: unregistering existing '$script:Distro' — this ERASES that distro's data."
+            & wsl.exe --unregister $script:Distro 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) { Fail "Could not unregister existing '$script:Distro' (exit $LASTEXITCODE)." }
+        } else {
+            Log "$script:Distro already registered — skipping import. (Pass -Reinstall to wipe and recreate.)"
+            return
+        }
     }
+
+    New-Item -ItemType Directory -Path $script:InstallLocation -Force | Out-Null
+
+    # Cache the rootfs under ProgramData so a resume-after-reboot (or a re-run)
+    # doesn't re-download ~340 MB.
+    if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+    $tarball = Join-Path $StateDir 'ubuntu-wsl-rootfs.tar.gz'
+    if (Test-Path $tarball) {
+        Log "Using cached rootfs at $tarball"
+    } else {
+        Log "Downloading Ubuntu WSL rootfs (~340 MB):"
+        Log "  $script:RootfsUrl"
+        $oldProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest's per-byte progress bar is glacial
+        try {
+            Invoke-WebRequest -Uri $script:RootfsUrl -OutFile $tarball -UseBasicParsing
+        } catch {
+            if (Test-Path $tarball) { Remove-Item $tarball -Force -ErrorAction SilentlyContinue }  # don't cache a partial file
+            Fail "Failed to download rootfs from $script:RootfsUrl`n  $_"
+        } finally {
+            $ProgressPreference = $oldProgress
+        }
+        Log "  Saved to $tarball"
+    }
+
+    Log "Importing '$script:Distro' into $script:InstallLocation (WSL2, no OOBE)..."
+    & wsl.exe --import $script:Distro $script:InstallLocation $tarball --version 2 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) {
+        Fail "'wsl --import' failed (exit $LASTEXITCODE). Check the rootfs file and that WSL2 is enabled (wsl --status)."
+    }
+    & wsl.exe --set-default $script:Distro 2>&1 | Out-Null
+    Log "Imported and set '$script:Distro' as the default WSL distro."
+
+    Initialize-LinuxUser
+}
+
+function Initialize-LinuxUser {
+    # Create the non-root Linux user that Phase B (linux-setup.sh) requires, with
+    # passwordless sudo (SSH into the host is key-only, so no login password is
+    # needed and Phase B's `sudo -v` succeeds non-interactively). Also pre-write
+    # /etc/wsl.conf:
+    #   [user] default=<user>  → `wsl -d <distro>` lands as that user, not root
+    #   [boot] systemd=true     → systemd is PID 1 from the first boot, so Phase B
+    #                             skips its enable-systemd-then-restart dance.
+    # Phase B's ensure_wsl_systemd_enabled is section-aware and preserves [user].
+    $u = $script:LinuxUser
+    Log "Provisioning Linux user '$u' (passwordless sudo) + /etc/wsl.conf inside '$script:Distro'..."
+
+    # Build the provisioning script as an LF-joined array. A fresh useradd leaves
+    # the account with a disabled ('!') password, so password login is already
+    # impossible — we add passwordless sudo on top. Single-quoted PS strings keep
+    # `$u` / `''` literal for bash; only the line injecting the username is
+    # double-quoted.
+    $bashScript = @(
+        'set -eu'
+        "u='$u'"
+        'if ! id -u "$u" >/dev/null 2>&1; then'
+        '    useradd -m -s /bin/bash "$u"'
+        'fi'
+        'usermod -aG sudo "$u"'
+        'printf ''%s ALL=(ALL) NOPASSWD:ALL\n'' "$u" > /etc/sudoers.d/90-gpudev'
+        'chmod 0440 /etc/sudoers.d/90-gpudev'
+        'printf ''[user]\ndefault=%s\n[boot]\nsystemd=true\n'' "$u" > /etc/wsl.conf'
+    ) -join "`n"
+
+    # Hand the script to root's bash as base64 rather than via stdin or a quoted
+    # argument: this preserves the exact LF bytes (no PowerShell WriteLine \r\n
+    # tacked on, no CRLF-checkout corruption) and the base64 alphabet has no
+    # shell-special characters, so there's nothing for PowerShell->wsl.exe->bash
+    # quoting to mangle.
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bashScript))
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & wsl.exe -d $script:Distro -u root -- bash -c "echo $b64 | base64 -d | bash" 2>&1 | ForEach-Object { Write-Host $_ }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Provisioning user '$u' inside '$script:Distro' failed (exit $LASTEXITCODE)."
+    }
+
+    # Terminate so [user]/default + [boot]/systemd take effect — the next launch
+    # lands as '$u' with systemd as PID 1.
+    & wsl.exe --terminate $script:Distro 2>&1 | Out-Null
+    Log "User '$u' created (sudo), /etc/wsl.conf written, distro terminated to apply."
 }
 
 # ── Resume scheduling (across the WSL-install reboot) ──────────────────────────
@@ -357,6 +549,7 @@ if (-not (`$names -contains '$script:Distro')) {
 function Invoke-HealthCheck {
     Step "Phase A health check (Windows-side only)"
     Log "  Distro:                    $script:Distro"
+    Log "  Linux user:                $script:LinuxUser"
     Write-Host ""
 
     if (Test-Path (Join-Path $env:SystemRoot 'System32\nvidia-smi.exe')) {
@@ -365,6 +558,14 @@ function Invoke-HealthCheck {
 
     if (Test-DistroInstalled) {
         Log "  WSL2 distro installed:     OK ($script:Distro)"
+        # Confirm the user we provisioned actually exists (cheap; relaunches the
+        # VM if it was terminated, which is fine).
+        & wsl.exe -d $script:Distro -u root -- id -u $script:LinuxUser *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Log "  Linux user ($script:LinuxUser): OK (default user, sudo)"
+        } else {
+            Warn "  Linux user ($script:LinuxUser): NOT found — re-run with -Reinstall"
+        }
     } else { Warn "  WSL2 distro installed:     MISSING" }
 
     if (Get-ScheduledTask -TaskName $BootTaskName -ErrorAction SilentlyContinue) {
@@ -384,24 +585,27 @@ function Invoke-HealthCheck {
     Write-Host "Phase A complete — Windows is ready for gpudev." -ForegroundColor Green
     Write-Host ""
     Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host " NEXT: Phase B — provision Linux user, then run linux-setup.sh" -ForegroundColor Cyan
+    Write-Host " NEXT: Phase B — run linux-setup.sh inside WSL" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  1. Open WSL:"
+    Write-Host "  1. (Recommended) Set a login password for '$script:LinuxUser'."
+    Write-Host "     The account is created with passwordless sudo, so Phase B works"
+    Write-Host "     without this — but '$script:LinuxUser' has no password yet, and a"
+    Write-Host "     locked account can't set its own, so do it AS ROOT:"
+    Write-Host "       wsl -d $script:Distro -u root -- passwd $script:LinuxUser"
+    Write-Host ""
+    Write-Host "  2. Open WSL — it lands straight at a shell as '$script:LinuxUser'"
+    Write-Host "     (no first-run prompt; the user is already created with sudo):"
     Write-Host "       wsl -d $script:Distro"
     Write-Host ""
-    Write-Host "     Ubuntu's first-run prompt will ask you to create a Unix"
-    Write-Host "     username and password. Pick any username you like — Phase B"
-    Write-Host "     adapts (it uses whoami)."
-    Write-Host ""
-    Write-Host "  2. Once you're at the WSL shell prompt, run the bootstrap:"
+    Write-Host "  3. Run the bootstrap:"
     Write-Host "       bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)"
     Write-Host ""
-    Write-Host "  3. linux-setup.sh will prompt you for:"
+    Write-Host "  4. linux-setup.sh will prompt you for:"
     Write-Host "       - your Cloudflare domain  (e.g. example.com)"
     Write-Host "       - your admin SSH public key"
     Write-Host ""
-    Write-Host "  4. When 'cloudflared' prints an authorization URL, open it in"
+    Write-Host "  5. When 'cloudflared' prints an authorization URL, open it in"
     Write-Host "     a browser and authorize the tunnel for your domain."
     Write-Host ""
     Write-Host "  Phase B installs Docker + cloudflared + the gpudev base image"
@@ -421,7 +625,9 @@ function Main {
     if (-not $Resume) {
         Step "Step 1: Prerequisites"
         Assert-WslSupported
-        Log "Distro:                  $Distro"
+        Assert-LinuxUserName
+        Log "Distro:                  $script:Distro"
+        Log "Linux user:              $script:LinuxUser (passwordless sudo, default user)"
         Save-State
 
         Step "Step 2: NVIDIA driver check"
@@ -435,16 +641,26 @@ function Main {
 
         Step "Step 5: WSL2 global config"
         Set-WslGlobalConfig
+    } else {
+        Load-State
+        Write-Host "Resuming Phase A after the platform-enable reboot..." -ForegroundColor Cyan
+    }
 
-        Step "Step 6: Install WSL2 + $script:Distro"
-        if (Test-DistroInstalled) {
-            Log "$script:Distro already installed — skipping install + reboot."
+    # Step 6 runs in BOTH paths: on a fresh machine the import happens AFTER the
+    # platform-enable reboot (in the resume pass), since `wsl --import` needs the
+    # WSL2 platform ready first.
+    Step "Step 6: Ensure WSL2 platform + import $script:Distro (OOBE-free)"
+    if (Test-WslPlatformReady) {
+        Import-Distro       # handles already-registered / -Reinstall / fresh import + user
+    } else {
+        Enable-WslPlatform
+        if (Test-WslPlatformReady) {
+            Import-Distro
         } else {
-            Install-Wsl
             Register-ResumeTask
             Write-Host ""
-            Write-Host "WSL2 installed. A reboot is required to finish." -ForegroundColor Yellow
-            Write-Host "After you log back in, Phase A resumes automatically." -ForegroundColor Yellow
+            Write-Host "WSL2 platform enabled. A reboot is required to finish." -ForegroundColor Yellow
+            Write-Host "After you log back in, Phase A resumes automatically and imports $script:Distro." -ForegroundColor Yellow
             if ($SkipReboot) {
                 Warn "SkipReboot set — reboot manually, then Phase A resumes at logon (or run -Resume)."
                 return
@@ -454,9 +670,6 @@ function Main {
             Restart-Computer -Force
             return
         }
-    } else {
-        Load-State
-        Write-Host "Resuming Phase A after reboot..." -ForegroundColor Cyan
     }
 
     Step "Step 7: Register WSL boot task"

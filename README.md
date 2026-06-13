@@ -75,7 +75,7 @@ Gather these **before** starting setup. Only needed for Phase B (`linux-setup.sh
 5. **Cloudflare account with a domain**
    - You need a domain managed by Cloudflare (the free plan is enough).
    - Decide the domain — it'll be passed to setup as the `CF_DOMAIN`. The host
-     gets `host-gpudev.<your-domain>`, and each client gets `<name>.<your-domain>`.
+     gets `gpudev.<your-domain>`, and each client gets `<name>.<your-domain>`.
    - **No API token needed up front.** When `linux-setup.sh` reaches the tunnel
      step it prints a Cloudflare authorization URL. The flow is:
      1. Copy the URL from the WSL terminal and paste it into your browser.
@@ -112,7 +112,7 @@ Gather these **before** starting setup. Only needed for Phase B (`linux-setup.sh
 After the Windows host setup finishes you'll be able to, from the admin laptop:
 
 ```bash
-ssh gpudev-host          # opens the host dashboard automatically
+ssh gpudev          # opens the host dashboard automatically
 gpudev client add alice  # provisions a new client container
 gpudev power sleep       # remotely sleep the Windows machine
 ```
@@ -126,11 +126,13 @@ and GPU access.
 
 Setup is split into **two phases**:
 
-- **Phase A** prepares Windows: power settings, WSL2 install, scheduled tasks.
+- **Phase A** prepares Windows (power settings, scheduled tasks) and imports the
+  WSL distro + creates the Linux user — no interactive first-run.
 - **Phase B** is the real gpudev install, running entirely inside WSL.
 
-The Linux user is created in the handoff between phases — Ubuntu's first-run
-prompt does that, not either script.
+The Linux user (`gpudev`) is created automatically by Phase A when it
+imports the distro via `wsl --import` — there is no Ubuntu first-run prompt to
+hang on (the old OOBE-based flow could hang indefinitely on a fresh `Ubuntu`).
 
 > On a **bare Linux host** (no Windows), skip Phase A entirely. `linux-setup.sh`
 > is the whole installer; jump to Phase B.
@@ -147,13 +149,15 @@ and `%USERPROFILE%`, so it's safe to run from any directory:
 iex (irm https://raw.githubusercontent.com/rleyvasal/gpudev/main/windows-setup.ps1)
 ```
 
-To pick a specific distro instead of the default `Ubuntu`:
+To override the defaults (distro name `gpudev`, Linux user `gpudev`, Ubuntu
+series `noble` = 24.04 LTS), or to wipe an existing distro and re-import clean:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rleyvasal/gpudev/main/windows-setup.ps1))) -Distro Ubuntu-24.04
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rleyvasal/gpudev/main/windows-setup.ps1))) -Reinstall
+# or e.g.:  -DistroName gpudev -LinuxUser gpudev -UbuntuSeries jammy
 ```
 
-> **Note:** Running via `[scriptblock]::Create()` keeps the script in memory and bypasses the execution policy restriction, which is why this form is used instead of downloading the file.
+> **Note:** Running via `[scriptblock]::Create()` keeps the script in memory and bypasses the execution policy restriction, which is why this form is used instead of downloading the file. Pass `-Reinstall` for a fresh reinstall — it `wsl --unregister`s the existing distro first (this **erases** it) before re-importing.
 
 What the script does, in order:
 
@@ -166,10 +170,13 @@ What the script does, in order:
    hibernate / disk-spindown on AC, sets High Performance.
 5. Writes `%USERPROFILE%\.wslconfig` with `vmIdleTimeout=-1` so the WSL2 VM
    doesn't auto-shut-down between sessions.
-6. Installs WSL2 + the chosen distro with `wsl --install --no-launch`. On a
-   fresh install (WSL feature not yet enabled), a Windows reboot is needed —
-   the script registers a logon scheduled task and reboots automatically.
-   Phase A resumes itself after login.
+6. Ensures the WSL2 **platform** is enabled (`wsl --install --no-distribution`).
+   On a truly fresh machine that needs a reboot to turn the feature on, the
+   script registers a logon scheduled task and reboots automatically, resuming
+   after login. Then it **imports** the distro from a pinned Ubuntu LTS rootfs
+   tarball (`wsl --import` — no OOBE, so nothing to hang on), creates the
+   `gpudev` user with passwordless sudo, and writes `/etc/wsl.conf`
+   (`[user] default=gpudev`, `[boot] systemd=true`).
 7. Registers a **boot task** (`gpudev-wsl-boot`): runs at Windows startup
    and wakes the WSL VM (`wsl -d <distro> --exec /bin/true`). Phase B's
    systemd inside WSL then auto-starts ssh, docker, and the tunnel.
@@ -180,9 +187,11 @@ What the script does, in order:
 The script ends with a health check; everything should be `OK`:
 
 ```
-Distro:                    Ubuntu
+Distro:                    gpudev
+Linux user:                gpudev
 NVIDIA driver (Windows):   OK
-WSL2 distro installed:     OK (Ubuntu)
+WSL2 distro installed:     OK (gpudev)
+Linux user (gpudev):  OK (default user, sudo)
 Boot task (wake on boot):  OK (gpudev-wsl-boot)
 Keepalive task (5 min):    OK (gpudev-wsl-keepalive)
 .wslconfig (idle=disabled): OK
@@ -194,28 +203,29 @@ is idempotent.
 
 ---
 
-### Phase A → Phase B: create your Linux user
+### Phase A → Phase B: open WSL
 
-The Linux user is created here, via Ubuntu's standard first-run prompt:
+Phase A already created your Linux user (`gpudev`) with passwordless sudo
+and set it as the distro's default user — **there is no first-run prompt.**
+
+(Recommended) Give the account a login password. It's created without one, and a
+passwordless account can't set its own, so do it **as root**:
 
 ```powershell
-wsl -d Ubuntu
+wsl -d gpudev -u root -- passwd gpudev
 ```
 
-Ubuntu prompts:
+This is optional — Phase B works without it because the account already has
+passwordless sudo (so `sudo -v` succeeds non-interactively). It's just good
+hygiene for a host you SSH into.
 
+Then open WSL — you land straight at a shell as `gpudev`:
+
+```powershell
+wsl -d gpudev
 ```
-Create a default Unix user account: ____
-Password: ____
-Retype password: ____
-```
 
-**Pick any username you like.** `gpudev`, `admin`, your own name — it doesn't
-matter. `linux-setup.sh` reads `whoami` and adapts. The password is what
-`sudo` will ask for on the first run; you'll only need it once or twice.
-
-After password confirmation you'll land at a `<youruser>@<host>:~$` prompt.
-That's your handoff point.
+That `gpudev@<host>:~$` prompt is your handoff point.
 
 ---
 
@@ -258,16 +268,18 @@ In order:
    tunnel unit runs as that user, and admin SSH from your laptop lands as
    that user. Running as root puts everything in `/root/` and silently breaks
    the SSH admin path.
-2. **`assert_sudo`** — runs `sudo -v`. If your user is in standard sudoers
-   (the Ubuntu first-run default), this prompts for your password and opens
-   a 15-minute sudo session.
-3. **First-run on WSL only: enable systemd.** If you're on WSL2 and systemd
-   isn't yet PID 1, the script writes `[boot] systemd=true` to `/etc/wsl.conf`,
-   calls `/mnt/c/Windows/System32/wsl.exe --shutdown` via interop to restart
-   the WSL VM, and exits cleanly. **Your terminal will close.** Re-open WSL
-   (`wsl -d <distro>` from any shell, including Windows Terminal) and run
-   the same bootstrap command again. The second invocation lands with
-   systemd as PID 1 and proceeds with the full install.
+2. **`assert_sudo`** — runs `sudo -v`. On a WSL host set up by Phase A,
+   `gpudev` has **passwordless sudo**, so this succeeds without a prompt.
+   (On a bare Linux host with a normal sudoers user, it prompts for your
+   password and opens a 15-minute sudo session.)
+3. **First-run on WSL only: enable systemd.** On a Phase A host this is already
+   done — Phase A pre-writes `[boot] systemd=true` to `/etc/wsl.conf`, so systemd
+   is PID 1 from the first boot and this step is a no-op. If you somehow land
+   without systemd (e.g. a hand-imported distro), the script writes the config,
+   calls `/mnt/c/Windows/System32/wsl.exe --shutdown` via interop to restart the
+   WSL VM, and exits cleanly. **Your terminal will close.** Re-open WSL
+   (`wsl -d <distro>`) and run the same bootstrap again; the second invocation
+   lands with systemd as PID 1 and proceeds with the full install.
 4. **Prompts for the Cloudflare domain.** Paste it (e.g. `example.com`)
    and Enter.
 5. **Prompts for the admin SSH public key.** Paste the full single-line
@@ -319,13 +331,13 @@ incomplete state without breaking anything.
 Add a stanza to your admin laptop's `~/.ssh/config`:
 
 ```sshconfig
-Host gpudev-host
-  HostName host-gpudev.example.com
+Host gpudev
+  HostName gpudev.example.com
   Port 52100
   User gpudev
   IdentityFile ~/.ssh/gpudev-admin
   IdentitiesOnly yes
-  ProxyCommand cloudflared access tcp --hostname host-gpudev.example.com
+  ProxyCommand cloudflared access tcp --hostname gpudev.example.com
   ServerAliveInterval 30
   ServerAliveCountMax 3
 ```
@@ -335,7 +347,7 @@ Host gpudev-host
 Then:
 
 ```bash
-ssh gpudev-host
+ssh gpudev
 ```
 
 You should see the dashboard render automatically:
@@ -376,7 +388,7 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 ### On the admin laptop
 
 ```bash
-ssh gpudev-host                          # opens admin shell on the host
+ssh gpudev                          # opens admin shell on the host
 gpudev client add alice                  # provisions container 'alice'
 # When prompted, paste alice's PUBLIC SSH key
 gpudev client info alice                 # prints SSH stanza + craft.json to share
@@ -429,7 +441,7 @@ notebook.
 
 ## Day-to-day admin operations
 
-All on the host (via `ssh gpudev-host`):
+All on the host (via `ssh gpudev`):
 
 ```
 gpudev status                         # dashboard — also auto-shows on login
@@ -458,8 +470,8 @@ daily-driver subset.
 ### `websocket: bad handshake` when SSH-ing as admin
 
 The Cloudflare tunnel is up but the origin (host sshd:52100) isn't reachable.
-Diagnose with `curl -I https://host-gpudev.<domain>`:
-- **HTTP 502** → tunnel OK, sshd:52100 down. On the host (via `wsl -d Ubuntu`):
+Diagnose with `curl -I https://gpudev.<domain>`:
+- **HTTP 502** → tunnel OK, sshd:52100 down. On the host (via `wsl -d gpudev`):
   `sudo systemctl status ssh` and `sudo systemctl start ssh`.
 - **HTTP 530 / 1033** → no connected tunnel for that hostname. Two distinct cases:
   - **Connector down / crash-looping** (every hostname on the host is 530). On
@@ -474,7 +486,7 @@ Diagnose with `curl -I https://host-gpudev.<domain>`:
     ```bash
     cloudflared tunnel route dns --overwrite-dns <tunnel-name> <hostname>
     # tunnel-name is the Linux user, e.g.:
-    cloudflared tunnel route dns --overwrite-dns gpudev-host gpudev-host.qsoftss.com
+    cloudflared tunnel route dns --overwrite-dns gpudev gpudev.qsoftss.com
     ```
     `linux-setup.sh` now passes `--overwrite-dns` so a fresh install/rename can't
     leave the route pointing at a dead tunnel.
@@ -485,7 +497,7 @@ Tunnel works (sshd is responding) but your admin key isn't authorized.
 
 ```bash
 # On the admin laptop — which key is ssh actually offering?
-ssh -v gpudev-host 2>&1 | grep 'Offering public key'
+ssh -v gpudev 2>&1 | grep 'Offering public key'
 
 # On the host (via wsl) — what keys are authorized?
 cat ~/.ssh/authorized_keys
@@ -513,8 +525,8 @@ Fix on the **admin machine** (safe — you reinstalled the host on purpose):
 
 ```bash
 # Drop the stale host key, then reconnect and trust the new one.
-ssh-keygen -R gpudev-host.qsoftss.com
-ssh -o StrictHostKeyChecking=accept-new gpudev-host 'echo CONNECTED; hostname'
+ssh-keygen -R gpudev.qsoftss.com
+ssh -o StrictHostKeyChecking=accept-new gpudev 'echo CONNECTED; hostname'
 ```
 
 `accept-new` records an *unknown* key automatically but still refuses a *changed*
@@ -561,7 +573,7 @@ done and fix what isn't.
 
 ```
 gpudev/
-├── windows-setup.ps1     ← Phase A: Windows-side prep only (powercfg, WSL2 install, boot+keepalive tasks)
+├── windows-setup.ps1     ← Phase A: Windows prep + OOBE-free distro import & user creation (powercfg, wsl --import, boot+keepalive tasks)
 ├── linux-setup.sh        ← Phase B: full gpudev install — works on WSL2 or bare Linux, run by operator
 ├── client-setup.sh       ← per-client container provisioning (invoked by `gpudev client add`)
 ├── kernel-manager.sh     ← in-container Jupyter kernel lifecycle (deployed into each container)

@@ -632,7 +632,7 @@ cmd_status() {
     local cf_mark="✓"
     [ "$cf_state" = "down" ] && cf_mark="✗"
     printf " CLOUDFLARE  %s tunnel %s" "$cf_mark" "$cf_state"
-    [ -n "$cf_domain" ] && printf "   (%s.%s)" "$(host_get linux_user 2>/dev/null || echo host-gpudev)" "$cf_domain"
+    [ -n "$cf_domain" ] && printf "   (%s.%s)" "$(host_get linux_user 2>/dev/null || echo gpudev)" "$cf_domain"
     echo ""
     echo "───────────────────────────────────────────────────────────────────"
     echo " COMMANDS"
