@@ -217,6 +217,15 @@ launch_kernel() {
     # land in a writable per-client workspace instead of "/" (which is where
     # sshd's forced-command shell would otherwise leave us).
     cd "$HOME_DIR"
+    # Activate the venv for the kernel PROCESS so notebook `!pip install`,
+    # `!python`, and `!uv pip install` all resolve to THIS venv — not /opt/venv or
+    # the system Python. IPython's `!` spawns a non-login shell that inherits the
+    # kernel's environment but does NOT source /etc/profile, so the profile.d
+    # activation (which only fixes SSH login shells) never reaches it. Setting it
+    # here — VIRTUAL_ENV + venv-first PATH — is the only thing that does.
+    export VIRTUAL_ENV="${VENV}"
+    export UV_PROJECT_ENVIRONMENT="${VENV}"
+    export PATH="${VENV}/bin:${PATH}"
     nohup "${VENV}/bin/python" -m ipykernel_launcher -f "$CONNECTION_FILE" \
         >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
