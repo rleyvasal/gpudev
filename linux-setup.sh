@@ -321,9 +321,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# uv — available system-wide so client containers can call it to build per-client venvs
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
+# uv — installed to /usr/local/bin (already on the default PATH) so it's reachable
+# from BOTH the Dockerfile CMD and interactive `gpudev` SSH login shells. The
+# installer's default dir is /root/.local/bin, which only lands on PATH via the
+# Dockerfile ENV below — and sshd login sessions DON'T inherit that ENV.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 # SSH: pubkey auth only, no passwords
 RUN mkdir -p /run/sshd \
@@ -334,7 +336,7 @@ RUN mkdir -p /run/sshd \
 # Base ML venv at /opt/venv — built once into the image, available read-only to all containers.
 # PyTorch bundles its own CUDA runtime so no CUDA base image is needed.
 # Per-client venvs are created on their data volumes by client-setup.sh and persist indefinitely.
-RUN uv venv /opt/venv --python 3.12 \
+RUN uv venv /opt/venv --python 3.12 --seed \
     && uv pip install --python /opt/venv/bin/python \
         ipykernel \
         jupyter_client \
@@ -357,6 +359,19 @@ RUN uv venv /opt/venv --python 3.12 \
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
+
+# Point interactive `gpudev` SSH login shells at the per-client venv (~/.venv =
+# /home/gpudev/.venv), NOT the system Python. sshd login sessions don't inherit
+# the ENV above, so we set it via /etc/profile.d, which login shells source.
+# Result: `python`/`pip` resolve to ~/.venv (it has pip via --seed in
+# client-setup.sh) and `uv pip install` targets it too — the SAME interpreter the
+# kernel runs (kernel-manager.sh: ${VENV}/bin/python). The venv is created later
+# by client-setup.sh; a missing dir here is harmless (PATH entry is just skipped).
+RUN printf '%s\n' \
+        'export VIRTUAL_ENV=/home/gpudev/.venv' \
+        'export UV_PROJECT_ENVIRONMENT=/home/gpudev/.venv' \
+        'export PATH="/home/gpudev/.venv/bin:$PATH"' \
+        > /etc/profile.d/10-gpudev-venv.sh
 
 # Mojo via pixi (Modular's package manager). Unlike `uv pip install mojo` (which is
 # compiler-only and frozen on an old PyPI build), pixi gives the current toolchain

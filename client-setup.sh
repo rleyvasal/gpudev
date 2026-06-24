@@ -173,7 +173,7 @@ chmod 600 ${CONTAINER_HOME}/.ssh/authorized_keys
 setup_client_venv() {
     local name="$1"
 
-    log "Creating client venv at ${CONTAINER_HOME}/.venv (seeding from /opt/venv)..."
+    log "Creating thin client venv at ${CONTAINER_HOME}/.venv (base packages overlaid from /opt/venv)..."
 
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
@@ -182,10 +182,19 @@ if [ -x ${CONTAINER_HOME}/.venv/bin/python ]; then
     echo 'Client venv already exists, skipping.'
     exit 0
 fi
-uv venv ${CONTAINER_HOME}/.venv --python 3.12
-uv pip freeze --python /opt/venv/bin/python \
-    | uv pip install --python ${CONTAINER_HOME}/.venv/bin/python -r /dev/stdin
-echo 'Client venv ready.'
+# Thin per-client venv. Base packages (torch, ipykernel, numpy, ...) are NOT copied
+# in — they're referenced from the image's read-only /opt/venv via the .pth overlay
+# below. So this venv holds only the USER's own installs: it stays small, survives
+# rebuilds on the data volume, and the image can update base packages independently.
+# --seed gives it its own pip, so a bare 'pip install' also lands here (not ~/.local).
+uv venv ${CONTAINER_HOME}/.venv --python 3.12 --seed
+# Overlay: this .pth makes Python append /opt/venv's site-packages to sys.path at
+# startup. Appended dirs rank BELOW the venv's own packages, so a user-installed
+# version cleanly shadows the base one. Path is python3.12-specific, matching the
+# pinned interpreter above (and the Dockerfile's /opt/venv).
+echo /opt/venv/lib/python3.12/site-packages \
+    > ${CONTAINER_HOME}/.venv/lib/python3.12/site-packages/zzz_base_overlay.pth
+echo 'Client venv ready (thin + base overlay).'
 "
 }
 

@@ -366,8 +366,76 @@ cmd_client_restart() {
 
 # ── gpudev client rebuild ─────────────────────────────────────────────────────
 
+# Refresh a client's per-client venv against the (possibly rebuilt) base image.
+# Runs as a one-shot against the data volume while the container is down, so the
+# kernel that boots afterward sees the fixed venv. Two modes:
+#   reset=0 (default) — non-destructive: snapshot the user-package manifest, ensure
+#           the thin venv + base overlay + pip exist. Fixes pip/overlay without
+#           touching installed packages. Safe to run on every rebuild.
+#   reset=1 (--reset-venv) — destructive: rebuild the venv from the base image and
+#           replay the manifest. Migrates a fat venv to thin / recovers a corrupted
+#           one. User FILES (~/work, etc.) are never touched; only ~/.venv is.
+# The manifest = packages in the client venv but NOT in /opt/venv, kept at
+# ~/.config/user-packages.txt as the recovery net.
+refresh_client_venv() {
+    local name="$1" reset="${2:-0}"
+    if [ "$reset" = "1" ]; then
+        log "  Resetting venv from base image + manifest (user files untouched)..."
+    else
+        log "  Refreshing venv overlay + manifest..."
+    fi
+    docker_cmd run --rm \
+        -e "RESET=${reset}" \
+        -v "${name}-data:/home/gpudev" \
+        "$BASE_IMAGE" bash -c '
+set -e
+HOME_DIR=/home/gpudev
+VENV="$HOME_DIR/.venv"
+BASE=/opt/venv
+SP=lib/python3.12/site-packages
+MANIFEST="$HOME_DIR/.config/user-packages.txt"
+mkdir -p "$HOME_DIR/.config"
+
+# 1. Snapshot the user delta (read-only): distributions in the client venv that are
+#    not in the base image. Refreshed every run so the recovery manifest stays current.
+if [ -x "$VENV/bin/python" ]; then
+    comm -13 \
+        <(uv pip freeze --python "$BASE/bin/python"  2>/dev/null | sort) \
+        <(uv pip freeze --python "$VENV/bin/python" 2>/dev/null | sort) \
+        > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST" || rm -f "$MANIFEST.tmp"
+    echo "  Manifest: $(wc -l < "$MANIFEST" 2>/dev/null || echo 0) user package(s) recorded."
+fi
+
+# 2. Destructive reset (opt-in): drop the venv so it is rebuilt from base + manifest.
+if [ "${RESET:-0}" = "1" ]; then
+    rm -rf "$VENV"
+fi
+
+# 3. Ensure a thin venv exists (after a reset, or for a fresh volume).
+if [ ! -x "$VENV/bin/python" ]; then
+    uv venv "$VENV" --python 3.12 --seed
+fi
+
+# 4. Ensure bare pip exists (venvs created before --seed lack it).
+if [ ! -x "$VENV/bin/pip" ]; then
+    uv pip install --python "$VENV/bin/python" -q pip || true
+fi
+
+# 5. Ensure the base overlay .pth is present and correct (idempotent).
+echo "$BASE/$SP" > "$VENV/$SP/zzz_base_overlay.pth"
+
+# 6. On reset, replay the user packages into the fresh thin venv.
+if [ "${RESET:-0}" = "1" ] && [ -s "$MANIFEST" ]; then
+    uv pip install --python "$VENV/bin/python" -r "$MANIFEST" \
+        || echo "  Note: some packages failed to replay (editable/local/private installs); see above."
+fi
+echo "  Venv ready (thin + base overlay)."
+'
+}
+
 rebuild_one() {
     local name="$1"
+    local reset="${2:-0}"
     local ssh_port
     ssh_port="$(client_get "$name" ssh_port)"
 
@@ -392,6 +460,11 @@ chmod +x /home/gpudev/bin/kernel-manager.sh
         log "  Refreshed kernel-manager.sh from repo."
     fi
 
+    # Refresh the venv against the (possibly rebuilt) base image BEFORE the container
+    # boots, so the kernel starts against the corrected venv. Container is down here,
+    # so the data volume is free for the one-shot.
+    refresh_client_venv "$name" "$reset"
+
     # --hostname gpudev-<name>: prompt becomes gpudev@gpudev-<name>:~$ after SSH.
     docker_cmd run -d \
         --name "$name" \
@@ -415,7 +488,9 @@ chmod +x /home/gpudev/bin/kernel-manager.sh
 
 cmd_client_rebuild() {
     local target="${1:-}"
-    [ -n "$target" ] || fail "Usage: gpudev client rebuild <name|--all>"
+    local reset=0
+    [ "${2:-}" = "--reset-venv" ] && reset=1
+    [ -n "$target" ] || fail "Usage: gpudev client rebuild <name|--all> [--reset-venv]"
     require_host_setup
 
     if [ "$target" = "--all" ]; then
@@ -433,7 +508,7 @@ cmd_client_rebuild() {
             # which exits) is contained to the subshell and doesn't abort the
             # whole batch. Output still streams live via tee; we keep a copy to
             # extract the failure reason for the summary.
-            if rebuild_one "$name" 2>&1 | tee "$logf"; then
+            if rebuild_one "$name" "$reset" 2>&1 | tee "$logf"; then
                 :
             else
                 reason="$(grep -aE '^(Error|Warning):' "$logf" | tail -n 1)"
@@ -457,7 +532,7 @@ cmd_client_rebuild() {
         log "All clients rebuilt."
     else
         client_exists "$target" || fail "Client '$target' not found."
-        rebuild_one "$target"
+        rebuild_one "$target" "$reset"
     fi
 }
 
@@ -1016,7 +1091,7 @@ Clients:
   gpudev client start <name>
   gpudev client stop <name>
   gpudev client restart <name>
-  gpudev client rebuild <name|--all>
+  gpudev client rebuild <name|--all> [--reset-venv]
   gpudev client logs <name>
   gpudev client info <name>
 
@@ -1060,7 +1135,7 @@ main() {
                 start)   cmd_client_start "${3:-}" ;;
                 stop)    cmd_client_stop "${3:-}" ;;
                 restart) cmd_client_restart "${3:-}" ;;
-                rebuild) cmd_client_rebuild "${3:-}" ;;
+                rebuild) cmd_client_rebuild "${3:-}" "${4:-}" ;;
                 logs)    cmd_client_logs "${3:-}" ;;
                 info)    cmd_client_info "${3:-}" ;;
                 *)       usage; exit 1 ;;
