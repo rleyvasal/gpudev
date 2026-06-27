@@ -183,16 +183,10 @@ def start_port_forwarding(kernel_info):
     errf.close()
     return proc
 
-def _pids_holding_ports(ports):
-    """PIDs of `ssh` processes bound to any of `ports` on loopback, via /proc.
-
-    Linux-only and dependency-free — SolveIt's notebook env (like the slim
-    container) has no pkill/lsof/fuser, and leftover SSH *control masters* from a
-    previous CRAFT run keep these ports bound (a bind: Address already in use that
-    the old pkill/`ssh -O exit` cleanup missed). Returns [] on non-Linux (no /proc),
-    where the pkill fallback applies. Matches only sockets with no peer (rem port 0
-    — i.e. listeners/bound-idle, never an outbound connection that happens to share
-    a source port) and only `ssh`-owned ones, so it can't kill an unrelated app."""
+def _ports_to_inodes(ports):
+    """{inode: port} for sockets bound to one of `ports` on loopback with NO peer
+    (rem port 0 — a listener/bound-idle, never an outbound connection that happens
+    to reuse the source port). Linux-only; {} where /proc/net is absent/unreadable."""
     want = set(ports)
     inodes = {}
     for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
@@ -211,17 +205,30 @@ def _pids_holding_ports(ports):
                 continue
             if lport in want and rport == 0:
                 inodes[f[9]] = lport
+    return inodes
+
+def _pids_holding_ports(ports, only_ssh=True):
+    """PIDs bound to any of `ports` on loopback (via /proc), excluding our own pid.
+    only_ssh restricts to `ssh`-named processes (safe default); pass False to match
+    ANY holder — used as a fallback when the squatter turns out not to be ssh."""
+    inodes = _ports_to_inodes(ports)
     if not inodes:
         return []
+    me = os.getpid()
     pids = set()
-    for e in os.listdir("/proc"):
-        if not e.isdigit():
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for e in entries:
+        if not e.isdigit() or int(e) == me:
             continue
-        try:
-            if Path(f"/proc/{e}/comm").read_text().strip() != "ssh":
+        if only_ssh:
+            try:
+                if Path(f"/proc/{e}/comm").read_text().strip() != "ssh":
+                    continue
+            except Exception:
                 continue
-        except Exception:
-            continue
         try:
             for fd in os.listdir(f"/proc/{e}/fd"):
                 try:
@@ -236,17 +243,70 @@ def _pids_holding_ports(ports):
     return sorted(pids)
 
 def _reap_local_forwards(ports):
-    """Kill any stale ssh process holding our forward ports so the next forward can
-    bind. TERM first, then KILL the stragglers."""
-    pids = _pids_holding_ports(ports)
+    """Free our forward ports from stale holders so the next forward can bind.
+    Precise /proc path first (ssh-only, then ANY non-self holder), then external
+    tools as a fallback for environments where /proc/net is restricted."""
+    pids = _pids_holding_ports(ports, only_ssh=True) or _pids_holding_ports(ports, only_ssh=False)
     for pid in pids:
         try: os.kill(pid, signal.SIGTERM)
         except OSError: pass
     if pids:
         time.sleep(0.3)
-        for pid in _pids_holding_ports(ports):
+        for pid in _pids_holding_ports(ports, only_ssh=False):
             try: os.kill(pid, signal.SIGKILL)
             except OSError: pass
+        return
+    # /proc revealed no holder — try tools that may exist even where pkill doesn't.
+    for port in ports:
+        _run(f"fuser -k {port}/tcp 2>/dev/null", check=False)
+
+def _diagnose_port_holders(ports):
+    """Human-readable account of what /proc reveals about our forward ports, so a
+    stubborn 'Address already in use' can be debugged without notebook-side shell
+    access. Surfaced in the forward-failure message."""
+    out = []
+    rd = []
+    for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            rd.append(f"{fn}={len(Path(fn).read_text().splitlines()) - 1} rows")
+        except Exception as e:
+            rd.append(f"{fn} UNREADABLE({type(e).__name__})")
+    out.append("  /proc/net: " + ", ".join(rd))
+    inodes = _ports_to_inodes(ports)
+    out.append("  bound-no-peer ports: " +
+               (", ".join(f"{p}(inode {i})" for i, p in sorted(inodes.items(), key=lambda x: x[1]))
+                or "NONE FOUND (ports held outside this proc's /proc/net view)"))
+    found = False
+    try:
+        entries = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError as e:
+        out.append(f"  /proc listing UNREADABLE({type(e).__name__})")
+        return "\n".join(out)
+    for e in entries:
+        try:
+            fds = os.listdir(f"/proc/{e}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                tgt = os.readlink(f"/proc/{e}/fd/{fd}")
+            except OSError:
+                continue
+            if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                comm = uid = cmd = "?"
+                try: comm = Path(f"/proc/{e}/comm").read_text().strip()
+                except Exception: pass
+                try: uid = os.stat(f"/proc/{e}").st_uid
+                except Exception: pass
+                try: cmd = Path(f"/proc/{e}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+                except Exception: pass
+                out.append(f"  holder: port {inodes[tgt[8:-1]]} pid {e} comm={comm} uid={uid} cmd={cmd[:140]}")
+                found = True
+                break
+    if inodes and not found:
+        out.append("  holder PID not found (socket owned by another pid-ns or /proc/*/fd hidden)")
+    out.append(f"  self: pid {os.getpid()} uid {os.getuid()}")
+    return "\n".join(out)
 
 # ── Output Display ────────────────────────────────────────────────────────────
 def _handle_output(msg):
@@ -477,7 +537,10 @@ class RemoteExecutionManager:
             except Exception:
                 pass
         msg = f"SSH port-forward to '{SSH_HOST}' exited (rc={rc}) without opening the port"
-        return msg + (":\n" + detail if detail else " — check cloudflared / host reachability.")
+        msg += ":\n" + detail if detail else " — check cloudflared / host reachability."
+        if not sys.platform.startswith("win"):
+            msg += "\n[port holders]\n" + _diagnose_port_holders(list(KERNEL_PORTS.values()))
+        return msg
 
     def shutdown_remote(self):
         if self.remote_kc is not None:
