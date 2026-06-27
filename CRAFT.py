@@ -295,24 +295,32 @@ class RemoteExecutionManager:
         # kernel is already healthy, so this only costs on an actual reconnect.
         self._kill_stale_forwards()
 
-        # Two attempts: a clean connect, then a forced fresh-key restart if the
-        # kernel was stale (HMAC signature mismatch surfaces as a connect timeout).
+        # NON-DESTRUCTIVE reconnect. ensure_kernel() above already guaranteed a live
+        # kernel listening on the fixed port whose key matches the connection file
+        # (`kernel-manager.sh start` reuses a healthy kernel and waits until it's
+        # listening; it self-heals genuine staleness by reaping + rekeying only when
+        # the kernel is actually dead). So a failure to attach HERE can only be a
+        # tunnel problem — a cold cloudflared handshake after idle, or a stale
+        # forward — never a dead kernel. Rebuild the forward and retry; never
+        # force-restart, which would wipe in-memory state. %restart_kernel is the
+        # explicit "clean slate" path.
         last_err = None
         for attempt in range(2):
-            kernel_info = fetch_kernel_info()
-            self._ensure_tunnel(kernel_info)
             try:
+                kernel_info = fetch_kernel_info()
+                self._ensure_tunnel(kernel_info)
                 self.remote_kc = self._connect_kernel(kernel_info)
                 print(f"Remote kernel '{CLIENT_NAME}' ready")
                 return True
             except Exception as e:
                 last_err = e
-                if attempt == 0:
-                    print("Kernel didn't respond (likely a stale connection key) — "
-                          "restarting it with a fresh key...")
-                    ensure_kernel(force_restart=True)
+                self._kill_stale_forwards()   # drop the cold/half-open forward so the
+                                              # next attempt builds a fresh one
 
-        print(f"Could not connect to remote kernel: {last_err}")
+        print(f"Could not attach to remote kernel '{CLIENT_NAME}': {last_err}")
+        print("The kernel is likely still alive — your variables are preserved. "
+              "Re-run the cell to retry, or %restart_kernel for a fresh kernel "
+              "(clears state).")
         print(kernel_doctor())
         raise last_err
 
@@ -335,16 +343,36 @@ class RemoteExecutionManager:
             _run(f"pkill -f 'ssh -N.*-L {port}:' 2>/dev/null", check=False)
             _run(f"ssh {SSH_OPTS} -O exit {SSH_HOST} 2>/dev/null", check=False)
 
-    def _ensure_tunnel(self, kernel_info):
-        """(Re)establish the SSH port-forward. Only trust an open local port when
-        WE own the live forward; otherwise it may be an orphan from a rebuild that
-        routes to a dead container, so rebuild it."""
+    def _ensure_tunnel(self, kernel_info, timeout=25):
+        """(Re)establish the SSH port-forward and wait until it actually carries
+        traffic. Only trust an open local port when WE own the live forward;
+        otherwise it may be an orphan from a rebuild that routes to a dead
+        container, so rebuild it.
+
+        Readiness is polled, not slept: a cold cloudflared+SSH handshake can take far
+        longer than a couple of seconds (a fixed sleep under-waited it and pushed the
+        warm-up onto _connect_kernel, costing a failed attempt), while a warm tunnel
+        is ready in a fraction of a second (a fixed sleep needlessly stalled it)."""
         ours_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
         if ours_alive and self._test_connection(kernel_info):
             return
         self._kill_stale_forwards()
         self._tunnel_proc = start_port_forwarding(kernel_info)
-        time.sleep(2)
+        # The local -L listener only opens once the SSH connection is authenticated
+        # (i.e. the cloudflared tunnel + SSH handshake completed), so a successful
+        # local connect is a reliable "tunnel is ready" signal.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._tunnel_proc.poll() is not None:
+                raise RuntimeError(
+                    f"SSH port-forward to '{SSH_HOST}' exited during startup — "
+                    "check cloudflared / host reachability.")
+            if self._test_connection(kernel_info, timeout=1):
+                return
+            time.sleep(0.25)
+        raise TimeoutError(
+            f"Tunnel to '{SSH_HOST}' not ready after {timeout}s "
+            "(cold cloudflared handshake or unreachable host).")
 
     def shutdown_remote(self):
         if self.remote_kc is not None:
@@ -358,9 +386,65 @@ class RemoteExecutionManager:
     def _output_hook(self, msg):
         _handle_output(msg)
 
-    def execute_remote(self, code, verbose=False):
+    def _ensure_live(self):
+        """Confirm the remote kernel is reachable right now; if an idle period
+        dropped the tunnel, transparently reconnect to the SAME running kernel
+        (variables/models preserved) before returning. Returns True when a usable
+        connection is in place, False if reconnect failed.
+        """
         if self.remote_kc is None:
-            raise RuntimeError("Remote kernel not connected. Run %gpu first.")
+            return self.reconnect()
+        # Fast local check: if our forward is gone or its port is closed, the
+        # tunnel died during idle (ServerAlive tears a dead forward down) —
+        # reconnect without paying the kernel-ping timeout.
+        tunnel_dead = (self._tunnel_proc is None
+                       or self._tunnel_proc.poll() is not None
+                       or not self._test_connection(KERNEL_PORTS))
+        if tunnel_dead:
+            return self.reconnect()
+        # Forward is up locally; confirm the kernel actually answers — a half-open
+        # forward keeps the local port open but routes nowhere — before we commit
+        # real code to it (which would otherwise block forever).
+        if self.kernel_health()[0]:
+            return True
+        return self.reconnect()
+
+    def reconnect(self):
+        """Rebuild the SSH tunnel and re-attach to the LIVE remote kernel WITHOUT
+        restarting it, so in-memory state survives an idle-dropped connection.
+
+        This is the non-destructive counterpart to restart_kernel(): ensure_kernel()
+        runs `kernel-manager.sh start`, which REUSES a healthy kernel (only creating
+        one if none exists), so the connection-file key still matches the running
+        kernel and the same namespace comes back. Returns True on success.
+        """
+        # Drop our stale client object, but never signal the remote kernel.
+        if self.remote_kc is not None:
+            try:
+                self.remote_kc.stop_channels()
+            except Exception:
+                pass
+            self.remote_kc = None
+        try:
+            ensure_kernel()                 # start = reuse a live kernel; never wipes
+            self._kill_stale_forwards()     # force a fresh forward, not a half-open one
+            kernel_info = fetch_kernel_info()
+            self._ensure_tunnel(kernel_info)
+            self.remote_kc = self._connect_kernel(kernel_info)
+        except Exception as e:
+            print(f"Reconnect failed: {e}")
+            return False
+        print(f"Reconnected to live kernel '{CLIENT_NAME}' (variables preserved)")
+        return True
+
+    def execute_remote(self, code, verbose=False):
+        # Don't send code into a dead tunnel (which blocks forever): make sure the
+        # kernel is actually reachable first, reconnecting to the SAME running
+        # kernel if an idle period dropped the connection (state is preserved).
+        if not self._ensure_live():
+            raise RuntimeError(
+                "Remote kernel unreachable and automatic reconnect failed. "
+                "Check %kernel_status, or run %restart_kernel for a fresh kernel.")
         try:
             reply = self.remote_kc.execute_interactive(
                 code=code, output_hook=self._output_hook)
