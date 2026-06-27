@@ -4,6 +4,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 import os
@@ -165,12 +166,21 @@ def fetch_kernel_info():
     return info
 
 def start_port_forwarding(kernel_info):
-    """SSH-tunnel the kernel's ZMQ ports to localhost."""
+    """SSH-tunnel the kernel's ZMQ ports to localhost.
+
+    stderr is captured to a temp file so a forward that genuinely dies on startup
+    (a local port already bound, a ProxyCommand/auth failure, ...) can report WHY
+    instead of a bare 'exited'. The path is stashed on the Popen for the caller.
+    """
     args = ["ssh", "-N", *SSH_OPT_LIST]
     for port in KERNEL_PORTS.values():
         args.extend(["-L", f"{port}:127.0.0.1:{port}"])
     args.append(SSH_HOST)
-    return subprocess.Popen(args)
+    errf = tempfile.NamedTemporaryFile(prefix="craft-fwd-", suffix=".log", delete=False)
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errf)
+    proc.craft_stderr_path = errf.name
+    errf.close()
+    return proc
 
 # ── Output Display ────────────────────────────────────────────────────────────
 def _handle_output(msg):
@@ -337,6 +347,11 @@ class RemoteExecutionManager:
                 self._tunnel_proc.wait(timeout=3)
             except Exception:
                 self._tunnel_proc.kill()
+        if self._tunnel_proc is not None:
+            path = getattr(self._tunnel_proc, "craft_stderr_path", None)
+            if path:
+                try: os.unlink(path)
+                except OSError: pass
         self._tunnel_proc = None
         if not sys.platform.startswith("win"):
             port = KERNEL_PORTS["shell_port"]
@@ -358,21 +373,41 @@ class RemoteExecutionManager:
             return
         self._kill_stale_forwards()
         self._tunnel_proc = start_port_forwarding(kernel_info)
-        # The local -L listener only opens once the SSH connection is authenticated
-        # (i.e. the cloudflared tunnel + SSH handshake completed), so a successful
-        # local connect is a reliable "tunnel is ready" signal.
+        # Success signal is the LOCAL forwarded port accepting a connection — NOT our
+        # child staying alive. With ControlMaster, the `ssh -N -L` slave can hand the
+        # forward to the persistent master and exit cleanly while the master keeps the
+        # listener open, so a dead child with an open port is still a good tunnel.
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._tunnel_proc.poll() is not None:
-                raise RuntimeError(
-                    f"SSH port-forward to '{SSH_HOST}' exited during startup — "
-                    "check cloudflared / host reachability.")
             if self._test_connection(kernel_info, timeout=1):
                 return
+            if self._tunnel_proc.poll() is not None:
+                # Child exited and nothing is listening yet. Under ControlMaster the
+                # master may still be finishing the hand-off, so give the port a brief
+                # grace to appear before declaring a genuine startup failure.
+                for _ in range(8):                       # ~2s
+                    if self._test_connection(kernel_info, timeout=1):
+                        return
+                    time.sleep(0.25)
+                raise RuntimeError(self._forward_failure_msg())
             time.sleep(0.25)
         raise TimeoutError(
             f"Tunnel to '{SSH_HOST}' not ready after {timeout}s "
             "(cold cloudflared handshake or unreachable host).")
+
+    def _forward_failure_msg(self):
+        """Build a useful error for a forward that exited without opening the port,
+        including its captured stderr and exit code so the cause is visible."""
+        rc = self._tunnel_proc.returncode if self._tunnel_proc else None
+        detail = ""
+        path = getattr(self._tunnel_proc, "craft_stderr_path", None)
+        if path:
+            try:
+                detail = Path(path).read_text().strip()
+            except Exception:
+                pass
+        msg = f"SSH port-forward to '{SSH_HOST}' exited (rc={rc}) without opening the port"
+        return msg + (":\n" + detail if detail else " — check cloudflared / host reachability.")
 
     def shutdown_remote(self):
         if self.remote_kc is not None:
