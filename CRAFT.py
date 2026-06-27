@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -182,6 +183,71 @@ def start_port_forwarding(kernel_info):
     errf.close()
     return proc
 
+def _pids_holding_ports(ports):
+    """PIDs of `ssh` processes bound to any of `ports` on loopback, via /proc.
+
+    Linux-only and dependency-free — SolveIt's notebook env (like the slim
+    container) has no pkill/lsof/fuser, and leftover SSH *control masters* from a
+    previous CRAFT run keep these ports bound (a bind: Address already in use that
+    the old pkill/`ssh -O exit` cleanup missed). Returns [] on non-Linux (no /proc),
+    where the pkill fallback applies. Matches only sockets with no peer (rem port 0
+    — i.e. listeners/bound-idle, never an outbound connection that happens to share
+    a source port) and only `ssh`-owned ones, so it can't kill an unrelated app."""
+    want = set(ports)
+    inodes = {}
+    for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            rows = Path(fn).read_text().splitlines()[1:]
+        except Exception:
+            continue
+        for ln in rows:
+            f = ln.split()
+            if len(f) < 10:
+                continue
+            try:
+                lport = int(f[1].rsplit(":", 1)[1], 16)
+                rport = int(f[2].rsplit(":", 1)[1], 16)
+            except Exception:
+                continue
+            if lport in want and rport == 0:
+                inodes[f[9]] = lport
+    if not inodes:
+        return []
+    pids = set()
+    for e in os.listdir("/proc"):
+        if not e.isdigit():
+            continue
+        try:
+            if Path(f"/proc/{e}/comm").read_text().strip() != "ssh":
+                continue
+        except Exception:
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{e}/fd"):
+                try:
+                    tgt = os.readlink(f"/proc/{e}/fd/{fd}")
+                except OSError:
+                    continue
+                if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                    pids.add(int(e))
+                    break
+        except OSError:
+            continue
+    return sorted(pids)
+
+def _reap_local_forwards(ports):
+    """Kill any stale ssh process holding our forward ports so the next forward can
+    bind. TERM first, then KILL the stragglers."""
+    pids = _pids_holding_ports(ports)
+    for pid in pids:
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    if pids:
+        time.sleep(0.3)
+        for pid in _pids_holding_ports(ports):
+            try: os.kill(pid, signal.SIGKILL)
+            except OSError: pass
+
 # ── Output Display ────────────────────────────────────────────────────────────
 def _handle_output(msg):
     msg_type = msg["msg_type"]
@@ -357,6 +423,10 @@ class RemoteExecutionManager:
             port = KERNEL_PORTS["shell_port"]
             _run(f"pkill -f 'ssh -N.*-L {port}:' 2>/dev/null", check=False)
             _run(f"ssh {SSH_OPTS} -O exit {SSH_HOST} 2>/dev/null", check=False)
+            # Authoritative cleanup: directly free any port still held by a stale ssh
+            # forward/master (covers the env where pkill is absent and `-O exit` misses
+            # a leftover master — the "Address already in use" that blocks rebinding).
+            _reap_local_forwards(list(KERNEL_PORTS.values()))
 
     def _ensure_tunnel(self, kernel_info, timeout=25):
         """(Re)establish the SSH port-forward and wait until it actually carries
