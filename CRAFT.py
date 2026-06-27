@@ -86,6 +86,21 @@ if not sys.platform.startswith("win"):
     ]
 SSH_OPTS = " ".join(SSH_OPT_LIST)
 
+# The port-forward runs as its OWN dedicated, NON-multiplexed connection. With
+# ControlMaster the process that actually holds the -L ports is a *backgrounded*
+# master we don't track (the foreground ssh exits), so it lingers across reconnects
+# and two of them race for the ports → 'Address already in use' + partial binds.
+# Disabling multiplexing makes self._tunnel_proc the real holder (terminating it
+# frees the ports); ExitOnForwardFailure makes a blocked bind fail fast and clean.
+# Keepalive still comes from the ~/.ssh/config Host block (ServerAliveInterval).
+FORWARD_OPT_LIST = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+    "-o", "ExitOnForwardFailure=yes",
+]
+
 def _ssh(cmd, capture_output=False, check=True):
     """Run a command inside the client's container via SSH.
 
@@ -173,7 +188,7 @@ def start_port_forwarding(kernel_info):
     (a local port already bound, a ProxyCommand/auth failure, ...) can report WHY
     instead of a bare 'exited'. The path is stashed on the Popen for the caller.
     """
-    args = ["ssh", "-N", *SSH_OPT_LIST]
+    args = ["ssh", "-N", *FORWARD_OPT_LIST]
     for port in KERNEL_PORTS.values():
         args.extend(["-L", f"{port}:127.0.0.1:{port}"])
     args.append(SSH_HOST)
