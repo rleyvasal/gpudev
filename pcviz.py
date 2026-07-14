@@ -33,12 +33,19 @@ _HDRS = (
 
 
 def _craft_keep_local(magic):
-    "Ask CRAFT's Python router to keep `magic` cells local; idempotent; no-op without CRAFT."
+    """Keep `magic` local under %gpu. Durable across CRAFT re-runs when CRAFT supports it."""
     try:
-        be = get_ipython().user_ns.get("PY_BACKEND")
+        ns = get_ipython().user_ns
     except Exception:
         return
 
+    reg = ns.get("register_local_magic")
+    if callable(reg):
+        reg(magic)
+        return
+
+    # Fallback: older CRAFT without register_local_magic
+    be = ns.get("PY_BACKEND")
     if be is not None and hasattr(be, "_LOCAL") and magic not in be._LOCAL:
         be._LOCAL = tuple(be._LOCAL) + (magic,)
 
@@ -189,6 +196,8 @@ try:
 
     @register_line_magic
     def pointcloud(line):
+        # Re-bind if CRAFT was loaded after pcviz (or re-run).
+        _craft_keep_local("%pointcloud")
         parts = shlex.split(line)
 
         if not parts:
@@ -232,6 +241,8 @@ try:
           %pointcloud_var pts
           %pointcloud_var pts sub=4 color=intensity size=0.1 name=front
         """
+        # Re-bind if CRAFT was loaded after pcviz (or re-run).
+        _craft_keep_local("%pointcloud_var")
         ns = get_ipython().user_ns
         pc, rr = ns.get("point_cloud"), ns.get("remote_run_")
 

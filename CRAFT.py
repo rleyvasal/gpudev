@@ -24,7 +24,30 @@ except Exception:
 CONFIG_PATH = Path.home() / ".config" / "gpudev" / "craft.json"
 _cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
 
-CLIENT_NAME = _cfg.get("client_name", "")
+# Must match host sanitize_name / DNS labels (gpudev client add).
+_CLIENT_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _normalize_client_name(raw) -> str:
+    """Return validated client name, or '' if unset. Raises ValueError if invalid."""
+    name = (raw or "").strip().lower()
+    if not name:
+        return ""
+    if len(name) > 63 or not _CLIENT_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"invalid client_name {raw!r}: use lowercase letters, digits, "
+            f"hyphens (e.g. 'alice', 'solveit') — same as gpudev client add"
+        )
+    return name
+
+
+try:
+    CLIENT_NAME = _normalize_client_name(_cfg.get("client_name", ""))
+except ValueError as e:
+    CLIENT_NAME = ""
+    _CLIENT_NAME_ERROR = str(e)
+else:
+    _CLIENT_NAME_ERROR = ""
 
 # Inside every gpudev container the UNIX user is the fixed `gpudev`; the client
 # identity lives in the container name and tunnel hostname. Paths are stable.
@@ -92,7 +115,8 @@ def _strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
-def _run(cmd, check=True, capture_output=False):
+# Shell helper only for non-SSH one-liners (e.g. cloudflared install).
+def _run_shell(cmd, check=True, capture_output=False):
     return subprocess.run(
         cmd,
         shell=True,
@@ -114,6 +138,7 @@ if not sys.platform.startswith("win"):
         "-o", "ControlPersist=300",
     ]
 
+# String form for pcviz / external tools that shlex-split SSH_OPTS.
 SSH_OPTS = " ".join(SSH_OPT_LIST)
 
 FORWARD_OPT_LIST = [
@@ -127,12 +152,20 @@ FORWARD_OPT_LIST = [
 
 
 def _ssh(cmd, capture_output=False, check=True):
-    """Run a command inside the client's container via SSH."""
+    """Run a command inside the client's container via SSH (no local shell)."""
+    if not SSH_HOST:
+        raise RuntimeError(
+            "SSH_HOST is empty — set client_name in craft.json and re-load CRAFT"
+        )
+    if not CLIENT_NAME or not _CLIENT_NAME_RE.fullmatch(CLIENT_NAME):
+        raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
+
     wrapped = f"GPUDEV_CLIENT={CLIENT_NAME} {cmd}"
-    return _run(
-        f"ssh {SSH_OPTS} {SSH_HOST} {json.dumps(wrapped)}",
+    return subprocess.run(
+        ["ssh", *SSH_OPT_LIST, SSH_HOST, wrapped],
         check=check,
         capture_output=capture_output,
+        text=True,
     )
 
 
@@ -156,7 +189,7 @@ def install_cloudflared():
     url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
     try:
-        _run(f"curl -fsSL {url} -o {CLOUDFLARED_PATH} && chmod +x {CLOUDFLARED_PATH}")
+        _run_shell(f"curl -fsSL {url} -o {CLOUDFLARED_PATH} && chmod +x {CLOUDFLARED_PATH}")
     except Exception as e:
         print(f"Could not install cloudflared automatically: {e}")
         print("Install it manually: https://developers.cloudflare.com/cloudflared/install/")
@@ -495,6 +528,10 @@ class RemoteExecutionManager:
             return False
 
         if not CLIENT_NAME:
+            if _CLIENT_NAME_ERROR:
+                print(f"Invalid craft.json: {_CLIENT_NAME_ERROR}")
+                print(f"Edit {CONFIG_PATH} and re-run CRAFT.")
+                return False
             print(f'No "client_name" set in {CONFIG_PATH}')
             print('Set it like: {"client_name": "<your-name>"}')
             return False
@@ -552,7 +589,13 @@ class RemoteExecutionManager:
         self._tunnel_proc = None
 
         if not sys.platform.startswith("win"):
-            _run(f"ssh {SSH_OPTS} -O exit {SSH_HOST} 2>/dev/null", check=False)
+            if SSH_HOST:
+                subprocess.run(
+                    ["ssh", *SSH_OPT_LIST, "-O", "exit", SSH_HOST],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
             _reap_local_forwards(list(KERNEL_PORTS.values()))
 
     def _ensure_tunnel(self, kernel_info, timeout=25):
@@ -754,11 +797,10 @@ class RemoteMojoHelper:
 
     def run_source(self, src):
         subprocess.run(
-            f"ssh {SSH_OPTS} {SSH_HOST} "
-            f"{json.dumps('mkdir -p /tmp/gpum && cat > /tmp/gpum/mojo_run.mojo')}",
+            ["ssh", *SSH_OPT_LIST, SSH_HOST,
+             "mkdir -p /tmp/gpum && cat > /tmp/gpum/mojo_run.mojo"],
             input=src,
             text=True,
-            shell=True,
             check=True,
         )
 
@@ -770,11 +812,10 @@ class RemoteMojoHelper:
 
     def bench_source(self, src, n):
         subprocess.run(
-            f"ssh {SSH_OPTS} {SSH_HOST} "
-            f"{json.dumps('mkdir -p /tmp/gpum && cat > /tmp/gpum/bench.mojo')}",
+            ["ssh", *SSH_OPT_LIST, SSH_HOST,
+             "mkdir -p /tmp/gpum && cat > /tmp/gpum/bench.mojo"],
             input=src,
             text=True,
-            shell=True,
             check=True,
         )
 
@@ -787,11 +828,10 @@ class RemoteMojoHelper:
         )
 
         return subprocess.run(
-            f"ssh {SSH_OPTS} {SSH_HOST} "
-            f"{json.dumps(f'cat > /tmp/gpum/bench.sh && {self._runner()} bash /tmp/gpum/bench.sh')}",
+            ["ssh", *SSH_OPT_LIST, SSH_HOST,
+             f"cat > /tmp/gpum/bench.sh && {self._runner()} bash /tmp/gpum/bench.sh"],
             input=script,
             text=True,
-            shell=True,
             check=False,
             capture_output=True,
         )
@@ -1095,29 +1135,67 @@ class ModeRouter:
         print(backend.banner if backend else "Local Python mode — cells run in this notebook")
 
 
+# Defaults for GPU Python mode. Extra prefixes (pcviz, user tools) register via
+# register_local_magic() into IPython user_ns so they survive CRAFT re-runs.
+_DEFAULT_LOCAL_MAGICS = (
+    "%gpu",
+    "%gpum",
+    "%local",
+    "%restart_kernel",
+    "%restart_mojo",
+    "%kernel_status",
+    "%mojo_history",
+    "%mojo_run",
+    "%bench",
+    "%mojo_add",
+)
+
+_LOCAL_MAGICS_NS_KEY = "_gpudev_local_magics"
+
+
+def _local_magic_set():
+    """Mutable set of line-magic prefixes that must stay local under %gpu."""
+    try:
+        ip = get_ipython()
+        ns = ip.user_ns
+    except Exception:
+        global _LOCAL_MAGICS_FALLBACK
+        if "_LOCAL_MAGICS_FALLBACK" not in globals():
+            _LOCAL_MAGICS_FALLBACK = set(_DEFAULT_LOCAL_MAGICS)
+        s = _LOCAL_MAGICS_FALLBACK
+    else:
+        s = ns.setdefault(_LOCAL_MAGICS_NS_KEY, set())
+    # Re-assert defaults every call so CRAFT re-run never drops core magics.
+    s.update(_DEFAULT_LOCAL_MAGICS)
+    return s
+
+
+def register_local_magic(magic: str) -> None:
+    """Register a line-magic prefix that stays local under %gpu. Idempotent."""
+    m = magic if magic.startswith("%") else f"%{magic}"
+    _local_magic_set().add(m)
+
+
 class PythonBackend:
     banner = "GPU Python mode — cells run on the remote kernel"
     dispatch = "_exec_mgr.execute_remote(ROUTER.backend.pending)"
     pending = None
 
-    _LOCAL = (
-        "%gpu",
-        "%gpum",
-        "%local",
-        "%restart_kernel",
-        "%restart_mojo",
-        "%kernel_status",
-        "%mojo_history",
-        "%mojo_run",
-        "%bench",
-        "%mojo_add",
-    )
+    # Back-compat: older pcviz did `be._LOCAL = tuple(be._LOCAL) + (magic,)`.
+    # Property reads/writes the durable set.
+    @property
+    def _LOCAL(self):
+        return tuple(_local_magic_set())
+
+    @_LOCAL.setter
+    def _LOCAL(self, value):
+        _local_magic_set().update(value)
 
     def passthru(self, c):
         s = c.lstrip()
 
         return (
-            s.startswith(self._LOCAL)
+            s.startswith(tuple(_local_magic_set()))
             or "get_ipython()" in c
             or s.startswith(("await call_tool(", "_exec_mgr.", "remote_run_("))
         )
@@ -1149,6 +1227,7 @@ ModeRouter._detach()
 
 ROUTER = ModeRouter()
 PY_BACKEND, MOJO_BACKEND = PythonBackend(), MojoBackend()
+_local_magic_set()  # seed defaults into user_ns immediately
 
 
 # ── remote_run_ for tool-style local helpers ──────────────────────────────────

@@ -297,10 +297,20 @@ verify_gpu_passthrough() {
         return 0
     fi
 
+    if [ "${SKIP_GPU_CHECK:-}" = "1" ]; then
+        warn "GPU passthrough check failed, but SKIP_GPU_CHECK=1 — continuing."
+        return 0
+    fi
+
     if [ "$HOST_ENV" = "wsl2" ]; then
-        warn "GPU passthrough check failed. Ensure NVIDIA drivers are installed on Windows and WSL2 GPU support is enabled."
+        fail "GPU passthrough check failed.
+Ensure the NVIDIA *Windows* driver is installed/updated, then from PowerShell: wsl --shutdown
+Re-open WSL and re-run linux-setup.sh.
+To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
     else
-        warn "GPU passthrough check failed. Ensure NVIDIA drivers are installed and the NVIDIA kernel module is loaded."
+        fail "GPU passthrough check failed.
+Install NVIDIA drivers + nvidia-container-toolkit, load the kernel module, re-run.
+To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
     fi
 }
 
@@ -335,14 +345,15 @@ RUN mkdir -p /run/sshd \
 
 # Base ML venv at /opt/venv — built once into the image, available read-only to all containers.
 # PyTorch bundles its own CUDA runtime so no CUDA base image is needed.
+# Install torch from the official CUDA wheel index (default PyPI often serves CPU-only).
 # Per-client venvs are created on their data volumes by client-setup.sh and persist indefinitely.
 RUN uv venv /opt/venv --python 3.12 --seed \
     && uv pip install --python /opt/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu124 \
+        torch torchvision torchaudio \
+    && uv pip install --python /opt/venv/bin/python \
         ipykernel \
         jupyter_client \
-        torch \
-        torchvision \
-        torchaudio \
         numpy \
         numba \
         pandas \
@@ -419,6 +430,31 @@ build_base_image() {
         "$CONFIG_DIR"
 
     log "Base image built: ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}"
+}
+
+# Confirm the base image's torch build can actually see a GPU. nvidia-smi in a
+# CUDA base image can pass while /opt/venv still has CPU-only torch wheels.
+verify_torch_cuda() {
+    if [ "${SKIP_GPU_CHECK:-}" = "1" ]; then
+        warn "SKIP_GPU_CHECK=1 — skipping torch.cuda check"
+        return 0
+    fi
+
+    if ! $DOCKER image inspect "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
+        fail "Base image missing; cannot verify torch.cuda."
+    fi
+
+    log "Verifying torch.cuda.is_available() inside ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}..."
+    if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
+        python -c "import torch; assert torch.cuda.is_available(), (torch.__version__, getattr(torch.version, 'cuda', None)); print('torch', torch.__version__, 'cuda', torch.version.cuda)"; then
+        log "torch.cuda.is_available(): OK"
+        return 0
+    fi
+
+    fail "torch cannot see a GPU inside the base image.
+Passthrough may work (nvidia-smi) while wheels are CPU-only, or the driver is too old for this CUDA build.
+Fix: confirm NVIDIA driver, re-run linux-setup.sh after updating the torch index if needed.
+To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 }
 
 # ── Step 5: Install cloudflared on host ──────────────────────────────────────
@@ -895,6 +931,16 @@ run_health_check() {
         && log "  base image:               OK (${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG})" \
         || warn "  base image:               NOT BUILT"
 
+    if $DOCKER image inspect "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
+        if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
+            python -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" \
+            >/dev/null 2>&1; then
+            log "  torch.cuda:               OK"
+        else
+            warn "  torch.cuda:               FAIL (rebuild base image / check GPU)"
+        fi
+    fi
+
     if sudo sshd -t >/dev/null 2>&1; then
         if systemctl is-enabled ssh >/dev/null 2>&1; then
             log "  host sshd:                OK (port $HOST_SSH_PORT, persistent via systemd)"
@@ -981,6 +1027,9 @@ main() {
 
     step "gpudev Step 5: Build base image"
     build_base_image
+
+    step "gpudev Step 5b: Verify torch CUDA"
+    verify_torch_cuda
 
     step "gpudev Step 6: Install cloudflared on host"
     install_cloudflared_host
