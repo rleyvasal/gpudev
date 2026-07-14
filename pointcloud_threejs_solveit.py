@@ -226,4 +226,4 @@ show("sample")     # <- swap the name to view a different cloud
 #   PROXY_8000 = "<SolveIt proxy URL for port 8000>"      # e.g. .../proxy/8000
 #   display(IFrame(f"{PROXY_8000}/pc/sample", width='100%', height=600))
 #
-# PROXY_8000 is the only fiddly bit — ask me and I'll wire it to your SolveIt setup.
+# PROXY_8000 is the only fiddly bit
