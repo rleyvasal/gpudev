@@ -219,6 +219,8 @@ write_startup_script() {
     local tmp_script
     tmp_script="$(mktemp)"
 
+    # Host keys live on the data volume so container recreate/rebuild keeps the
+    # same SSH fingerprints — notebook known_hosts stays valid.
     cat > "$tmp_script" <<EOF
 #!/bin/bash
 set -e
@@ -229,8 +231,36 @@ useradd -M -s /bin/bash -d ${CONTAINER_HOME} ${CONTAINER_USER} 2>/dev/null || tr
 # Fix ownership of entire home dir (covers .local, .ssh, .venv, bin)
 chown -R ${CONTAINER_USER}:${CONTAINER_USER} ${CONTAINER_HOME}
 
-# Start SSH daemon
-/usr/sbin/sshd
+# ── Persistent SSH host keys (data volume) ──────────────────────────────────
+# Keys under /etc/ssh are baked into the image layer and rotate on every
+# container recreate. Store ed25519+rsa keys on the client volume instead and
+# point sshd only at those so rebuilds do not break StrictHostKeyChecking.
+HOSTKEY_DIR="${CONTAINER_HOME}/.local/share/ssh/hostkeys"
+mkdir -p "\$HOSTKEY_DIR"
+if [ ! -f "\$HOSTKEY_DIR/ssh_host_ed25519_key" ]; then
+    ssh-keygen -t ed25519 -f "\$HOSTKEY_DIR/ssh_host_ed25519_key" -N "" -q
+fi
+if [ ! -f "\$HOSTKEY_DIR/ssh_host_rsa_key" ]; then
+    ssh-keygen -t rsa -b 3072 -f "\$HOSTKEY_DIR/ssh_host_rsa_key" -N "" -q
+fi
+# sshd requires host private keys owned by root and not group/world-readable.
+chown -R root:root "\$HOSTKEY_DIR"
+chmod 700 "\$HOSTKEY_DIR"
+chmod 600 "\$HOSTKEY_DIR"/ssh_host_*_key
+chmod 644 "\$HOSTKEY_DIR"/ssh_host_*.pub 2>/dev/null || true
+
+# Build a config that includes distro defaults but replaces HostKey lines so we
+# never also advertise the ephemeral /etc/ssh/ssh_host_* keys from the image.
+SSHD_CONFIG="\$HOSTKEY_DIR/sshd_config"
+{
+    sed '/^HostKey /d' /etc/ssh/sshd_config
+    echo "HostKey \$HOSTKEY_DIR/ssh_host_ed25519_key"
+    echo "HostKey \$HOSTKEY_DIR/ssh_host_rsa_key"
+} > "\$SSHD_CONFIG"
+chmod 600 "\$SSHD_CONFIG"
+
+# Start SSH daemon (daemonizes by default)
+/usr/sbin/sshd -f "\$SSHD_CONFIG"
 
 # Start Jupyter kernel as the gpudev user. GPUDEV_CLIENT identifies which
 # client this container belongs to (for logs and 'gpudev kernel doctor').
@@ -295,6 +325,16 @@ wait_for_container() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
+    # Refresh only start.sh on an existing volume (used by `gpudev client rebuild`).
+    if [ "${1:-}" = "--refresh-start" ]; then
+        local refresh_name="${2:-}"
+        [ -n "$refresh_name" ] || fail "Usage: client-setup.sh --refresh-start <client_name>"
+        refresh_name="$(sanitize_name "$refresh_name")"
+        write_startup_script "$refresh_name"
+        log "Refreshed start.sh for '$refresh_name' (persistent SSH host keys)."
+        return 0
+    fi
+
     local raw_name="${1:-}"
     local ssh_key_arg="${2:-}"
     [ -n "$raw_name" ] || fail "Usage: client-setup.sh <client_name> <ssh_public_key>"

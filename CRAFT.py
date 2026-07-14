@@ -151,8 +151,98 @@ FORWARD_OPT_LIST = [
 ]
 
 
-def _ssh(cmd, capture_output=False, check=True):
-    """Run a command inside the client's container via SSH (no local shell)."""
+def _is_host_key_changed(stderr: str) -> bool:
+    """True if ssh failed because a known host key no longer matches."""
+    s = stderr or ""
+    return (
+        "REMOTE HOST IDENTIFICATION HAS CHANGED" in s
+        or "Host key verification failed" in s
+    )
+
+
+def _clear_stale_host_keys(stderr: str = "") -> None:
+    """Remove known_hosts entries for this client after a container key rotation.
+
+    Safe for personal lab use: only clears hosts derived from the SSH config for
+    SSH_HOST plus any host/path named in the ssh error text. Retries once at the
+    call site with accept-new so the new fingerprint is recorded.
+    """
+    hosts = set()
+    paths = set()
+    err = stderr or ""
+
+    for m in re.finditer(r'ssh-keygen\s+-f\s+"([^"]+)"\s+-R\s+"([^"]+)"', err):
+        paths.add(m.group(1))
+        hosts.add(m.group(2))
+    for m in re.finditer(r"ssh-keygen\s+-f\s+(\S+)\s+-R\s+(\S+)", err):
+        paths.add(m.group(1).strip('"'))
+        hosts.add(m.group(2).strip('"'))
+    for m in re.finditer(r"Offending \S+ key in ([^:\n]+):", err):
+        paths.add(m.group(1).strip())
+    for m in re.finditer(r"Add correct host key in ([^\s]+) to get rid", err):
+        paths.add(m.group(1).strip())
+    for m in re.finditer(r"Host key for ([^\s]+) has changed", err):
+        hosts.add(m.group(1).strip())
+
+    if SSH_HOST:
+        hosts.add(SSH_HOST)
+
+    # Resolve HostName + UserKnownHostsFile from the user's ssh config.
+    if SSH_HOST:
+        try:
+            r = subprocess.run(
+                ["ssh", "-G", SSH_HOST],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            for line in (r.stdout or "").splitlines():
+                low = line.lower()
+                if low.startswith("hostname "):
+                    hosts.add(line.split(None, 1)[1].strip())
+                elif low.startswith("userknownhostsfile "):
+                    for p in line.split()[1:]:
+                        if p and p != "/dev/null":
+                            paths.add(os.path.expanduser(p))
+        except Exception:
+            pass
+
+    # Common notebook locations (SolveIt often uses /app/data/.ssh).
+    paths.add(str(Path.home() / ".ssh" / "known_hosts"))
+    paths.add("/app/data/.ssh/known_hosts")
+
+    if not hosts:
+        return
+
+    print(
+        "SSH host key changed (container rebuild or re-provision). "
+        "Clearing stale known_hosts entries and retrying once…"
+    )
+    for host in sorted(hosts):
+        for path in sorted(paths):
+            if path and Path(path).is_file():
+                subprocess.run(
+                    ["ssh-keygen", "-f", path, "-R", host],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        # Default known_hosts as well.
+        subprocess.run(
+            ["ssh-keygen", "-R", host],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
+    """Run a command inside the client's container via SSH (no local shell).
+
+    On host-key mismatch (common after client rebuild before persistent keys
+    were enabled, or after volume wipe), clear known_hosts once and retry.
+    """
     if not SSH_HOST:
         raise RuntimeError(
             "SSH_HOST is empty — set client_name in craft.json and re-load CRAFT"
@@ -161,12 +251,71 @@ def _ssh(cmd, capture_output=False, check=True):
         raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
 
     wrapped = f"GPUDEV_CLIENT={CLIENT_NAME} {cmd}"
-    return subprocess.run(
+    # Always capture so we can detect host-key errors; re-emit stdout when the
+    # caller did not ask for capture.
+    result = subprocess.run(
         ["ssh", *SSH_OPT_LIST, SSH_HOST, wrapped],
-        check=check,
-        capture_output=capture_output,
+        check=False,
+        capture_output=True,
         text=True,
     )
+
+    if (
+        result.returncode != 0
+        and not _hostkey_retried
+        and _is_host_key_changed(result.stderr or "")
+    ):
+        _clear_stale_host_keys(result.stderr or "")
+        return _ssh(
+            cmd,
+            capture_output=capture_output,
+            check=check,
+            _hostkey_retried=True,
+        )
+
+    if not capture_output and result.stdout:
+        print(result.stdout, end="")
+    if not capture_output and result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            ["ssh", SSH_HOST, wrapped],
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+    return result
+
+
+def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
+    """SSH with stdin payload (Mojo source upload). Host-key auto-clear once."""
+    if not SSH_HOST:
+        raise RuntimeError("SSH_HOST is empty")
+    result = subprocess.run(
+        ["ssh", *SSH_OPT_LIST, SSH_HOST, remote_cmd],
+        input=input_text,
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    if (
+        result.returncode != 0
+        and not _hostkey_retried
+        and _is_host_key_changed(result.stderr or "")
+    ):
+        _clear_stale_host_keys(result.stderr or "")
+        return _ssh_with_input(
+            remote_cmd, input_text, check=check, _hostkey_retried=True
+        )
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            ["ssh", SSH_HOST, remote_cmd],
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+    return result
 
 
 # ── Cloudflared ───────────────────────────────────────────────────────────────
@@ -605,6 +754,7 @@ class RemoteExecutionManager:
         if ours_alive and self._test_connection(kernel_info):
             return
 
+        hostkey_retried = False
         self._kill_stale_forwards()
         self._tunnel_proc = start_port_forwarding(kernel_info)
 
@@ -619,6 +769,22 @@ class RemoteExecutionManager:
                     if self._test_connection(kernel_info, timeout=1):
                         return
                     time.sleep(0.25)
+
+                err_text = ""
+                path = getattr(self._tunnel_proc, "craft_stderr_path", None)
+                if path:
+                    try:
+                        err_text = Path(path).read_text()
+                    except Exception:
+                        pass
+
+                if not hostkey_retried and _is_host_key_changed(err_text):
+                    _clear_stale_host_keys(err_text)
+                    hostkey_retried = True
+                    self._kill_stale_forwards()
+                    self._tunnel_proc = start_port_forwarding(kernel_info)
+                    deadline = time.time() + timeout
+                    continue
 
                 raise RuntimeError(self._forward_failure_msg())
 
@@ -796,11 +962,9 @@ class RemoteMojoHelper:
         return f"{self.PIXI} run --manifest-path {self.PROJ}/pixi.toml"
 
     def run_source(self, src):
-        subprocess.run(
-            ["ssh", *SSH_OPT_LIST, SSH_HOST,
-             "mkdir -p /tmp/gpum && cat > /tmp/gpum/mojo_run.mojo"],
-            input=src,
-            text=True,
+        _ssh_with_input(
+            "mkdir -p /tmp/gpum && cat > /tmp/gpum/mojo_run.mojo",
+            src,
             check=True,
         )
 
@@ -811,11 +975,9 @@ class RemoteMojoHelper:
         )
 
     def bench_source(self, src, n):
-        subprocess.run(
-            ["ssh", *SSH_OPT_LIST, SSH_HOST,
-             "mkdir -p /tmp/gpum && cat > /tmp/gpum/bench.mojo"],
-            input=src,
-            text=True,
+        _ssh_with_input(
+            "mkdir -p /tmp/gpum && cat > /tmp/gpum/bench.mojo",
+            src,
             check=True,
         )
 
@@ -827,13 +989,10 @@ class RemoteMojoHelper:
             "echo RUN $(( $(date +%s%N) - a )); done\n"
         )
 
-        return subprocess.run(
-            ["ssh", *SSH_OPT_LIST, SSH_HOST,
-             f"cat > /tmp/gpum/bench.sh && {self._runner()} bash /tmp/gpum/bench.sh"],
-            input=script,
-            text=True,
+        return _ssh_with_input(
+            f"cat > /tmp/gpum/bench.sh && {self._runner()} bash /tmp/gpum/bench.sh",
+            script,
             check=False,
-            capture_output=True,
         )
 
     def add_package(self, spec, pypi=False):

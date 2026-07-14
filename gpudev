@@ -460,6 +460,18 @@ chmod +x /home/gpudev/bin/kernel-manager.sh
         log "  Refreshed kernel-manager.sh from repo."
     fi
 
+    # Refresh start.sh so rebuilds pick up persistent SSH host-key logic (and any
+    # other startup fixes) without requiring client remove/re-add.
+    local cs_src="${REPO_DIR}/client-setup.sh"
+    if [ ! -f "$cs_src" ] && [ -f "$CLIENT_SETUP" ]; then
+        cs_src="$CLIENT_SETUP"
+    fi
+    if [ -f "$cs_src" ]; then
+        bash "$cs_src" --refresh-start "$name"
+    else
+        warn "  client-setup.sh not found — start.sh not refreshed (SSH host keys may still rotate)."
+    fi
+
     # Refresh the venv against the (possibly rebuilt) base image BEFORE the container
     # boots, so the kernel starts against the corrected venv. Container is down here,
     # so the data volume is free for the one-shot.
