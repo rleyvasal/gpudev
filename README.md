@@ -480,6 +480,30 @@ auto-clear a stale `known_hosts` entry once if a key did change.
 Point-cloud previews in the notebook: use **`pcviz.py`** (`%pointcloud` /
 `%pointcloud_var`), not older demo scripts.
 
+### Cloudflare API token (optional, for DNS cleanup)
+
+`gpudev client remove` can delete the client CNAME when `host.json` has a
+`cf_api_token` with **Zone.DNS Edit** on your domain. Tunnel login does not
+always provide that token.
+
+```bash
+# on the host
+gpudev cloudflare token-set    # paste token from dash.cloudflare.com → API Tokens
+gpudev cloudflare              # shows whether token is present
+```
+
+### Base image package pins
+
+`linux-setup.sh` writes pinned `requirements-torch.txt` + `requirements-base.txt`
+into `~/.config/gpudev/` when building `gpudev-base`. Edit those files and
+re-run setup to bump versions after testing `torch.cuda` on your driver.
+
+### Mojo packages
+
+The image seeds Mojo at `/opt/mojo-proj`. Each client copies that seed once to
+`/home/gpudev/.mojo-proj` on the **data volume**. `%mojo_add` / pixi installs
+there survive `gpudev client rebuild` (but not `client remove`).
+
 ---
 
 ## Day-to-day admin operations
@@ -496,6 +520,7 @@ gpudev client logs <name>             # tail container logs
 gpudev kernel doctor <name>           # diagnose a stuck Jupyter kernel
 gpudev gpu                            # full nvidia-smi
 gpudev cloudflare                     # tunnel + ingress + edge HTTP check
+gpudev cloudflare token-set           # store Zone.DNS Edit token for client remove
 gpudev disk                           # host + Docker volume usage
 gpudev power reboot                   # reboot the Windows host (via WSL interop)
 gpudev power sleep                    # sleep the Windows host

@@ -262,10 +262,28 @@ chmod 600 "\$SSHD_CONFIG"
 # Start SSH daemon (daemonizes by default)
 /usr/sbin/sshd -f "\$SSHD_CONFIG"
 
+# ── Persistent Mojo/pixi project (data volume) ──────────────────────────────
+# Seed from the image (/opt/mojo-proj) once; runtime packages from %mojo_add
+# live under ~/.mojo-proj and survive client rebuild.
+MOJO_SEED=/opt/mojo-proj
+MOJO_HOME="${CONTAINER_HOME}/.mojo-proj"
+if [ -d "\$MOJO_SEED" ] && [ ! -f "\$MOJO_HOME/pixi.toml" ]; then
+    cp -a "\$MOJO_SEED" "\$MOJO_HOME"
+fi
+if [ -d "\$MOJO_HOME" ]; then
+    chown -R ${CONTAINER_USER}:${CONTAINER_USER} "\$MOJO_HOME" 2>/dev/null || true
+fi
+# Login shells + kernel process see the volume path (not the image seed).
+printf '%s\n' \
+    'export MOJO_PROJ=/home/gpudev/.mojo-proj' \
+    'export PATH="/opt/pixi/bin:\$PATH"' \
+    > /etc/profile.d/20-gpudev-mojo.sh
+
 # Start Jupyter kernel as the gpudev user. GPUDEV_CLIENT identifies which
 # client this container belongs to (for logs and 'gpudev kernel doctor').
 export GPUDEV_CLIENT=${name}
-su -s /bin/bash ${CONTAINER_USER} -c "GPUDEV_CLIENT=${name} ${CONTAINER_HOME}/bin/kernel-manager.sh start"
+export MOJO_PROJ=${CONTAINER_HOME}/.mojo-proj
+su -s /bin/bash ${CONTAINER_USER} -c "GPUDEV_CLIENT=${name} MOJO_PROJ=${CONTAINER_HOME}/.mojo-proj ${CONTAINER_HOME}/bin/kernel-manager.sh start"
 
 exec sleep infinity
 EOF

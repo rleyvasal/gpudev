@@ -330,8 +330,12 @@ p.write_text(''.join(out))
             warn "Could not resolve zone ID for $cf_domain — delete DNS record manually."
         fi
     else
-        warn "No CF API token in host.json — delete DNS record for $cf_hostname manually."
-        warn "Re-run linux-setup.sh to store the token."
+        warn "No cf_api_token in host.json — cannot auto-delete DNS for $cf_hostname."
+        warn "  Option A: Cloudflare dashboard → DNS → delete CNAME $cf_hostname"
+        warn "  Option B: store a Zone.DNS Edit token, then re-run remove:"
+        warn "    gpudev cloudflare token-set   # pastes into host.json"
+        warn "  Create token: https://dash.cloudflare.com/profile/api-tokens"
+        warn "    Template 'Edit zone DNS' → only zone: $cf_domain"
     fi
 
     remove_client_from_registry "$name"
@@ -607,6 +611,14 @@ EOF
     echo "  cloudflared: on PATH, or auto-installed by CRAFT to ~/.local/bin."
     echo "  Manual install: https://developers.cloudflare.com/cloudflared/install/"
     echo ""
+    echo "── SSH host keys ──"
+    echo ""
+    echo "  Host keys live on the client data volume:"
+    echo "    /home/gpudev/.local/share/ssh/hostkeys/"
+    echo "  gpudev client rebuild keeps the same fingerprint (known_hosts stays valid)."
+    echo "  gpudev client remove deletes the volume → new keys on re-add."
+    echo "  CRAFT auto-clears a stale known_hosts entry once if a key did change."
+    echo ""
     echo "── craft.json (notebook side) ──"
     echo ""
     cat <<EOF
@@ -758,7 +770,49 @@ cmd_gpu() {
 
 # ── gpudev cloudflare ─────────────────────────────────────────────────────────
 
+cmd_cloudflare_token_set() {
+    require_host_setup
+    local token="${1:-}"
+    if [ -z "$token" ]; then
+        echo "Paste a Cloudflare API token with Zone.DNS Edit for your domain."
+        echo "Create one: https://dash.cloudflare.com/profile/api-tokens"
+        echo "  → Create Token → 'Edit zone DNS' → zone = your CF_DOMAIN"
+        echo ""
+        read -r -p "Token: " token
+    fi
+    [ -n "$token" ] || fail "Empty token."
+    python3 -c "
+import json, pathlib, sys
+p = pathlib.Path('${HOST_CONFIG}')
+d = json.loads(p.read_text()) if p.exists() else {}
+d['cf_api_token'] = sys.argv[1]
+p.write_text(json.dumps(d, indent=2))
+" "$token"
+    chmod 600 "$HOST_CONFIG"
+    log "cf_api_token saved to $HOST_CONFIG (chmod 600)."
+    log "client remove will use it to delete CNAMEs automatically."
+}
+
 cmd_cloudflare() {
+    # gpudev cloudflare [status|token-set [TOKEN]]
+    local sub="${1:-status}"
+    case "$sub" in
+        status|"") ;;
+        token-set|token)
+            cmd_cloudflare_token_set "${2:-}"
+            return 0
+            ;;
+        help|-h|--help)
+            echo "Usage: gpudev cloudflare [status|token-set [TOKEN]]"
+            echo "  status      tunnel + ingress + DNS + edge check (default)"
+            echo "  token-set   store Zone.DNS Edit API token in host.json"
+            return 0
+            ;;
+        *)
+            fail "Usage: gpudev cloudflare [status|token-set [TOKEN]]"
+            ;;
+    esac
+
     require_host_setup
 
     local config_yml="${HOME}/.cloudflared/config.yml"
@@ -913,6 +967,19 @@ cmd_cloudflare() {
         echo ""
         tail -10 "$tunnel_log" | sed 's/^/  /'
     fi
+
+    local tok
+    tok="$(host_get cf_api_token)"
+    echo ""
+    echo "── API token (DNS cleanup) ──"
+    echo ""
+    if [ -n "$tok" ]; then
+        echo "  cf_api_token: present in host.json (used by client remove)"
+    else
+        echo "  cf_api_token: MISSING — client remove cannot delete DNS automatically"
+        echo "  Fix:  gpudev cloudflare token-set"
+    fi
+    echo ""
 }
 
 # ── gpudev disk ───────────────────────────────────────────────────────────────
@@ -1123,7 +1190,7 @@ Kernel:
 
 Status:
   gpudev gpu
-  gpudev cloudflare
+  gpudev cloudflare [status|token-set]
   gpudev disk
 
 Power:
@@ -1169,7 +1236,7 @@ main() {
             cmd_gpu
             ;;
         cloudflare)
-            cmd_cloudflare
+            cmd_cloudflare "${2:-}" "${3:-}"
             ;;
         disk)
             cmd_disk

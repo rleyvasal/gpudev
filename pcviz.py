@@ -515,9 +515,36 @@ function setStatus(t) {
 
 let raw;
 try {
+  setStatus('Loading point cloud…');
   const resp = await fetch(URL_);
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  raw = new Float32Array(await resp.arrayBuffer());
+  const len = +(resp.headers.get('content-length') || 0);
+  // Progressive read so long SSH streams show progress (MB or % if length known).
+  if (resp.body && typeof resp.body.getReader === 'function') {
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.byteLength;
+      if (len > 0) {
+        setStatus('Loading… ' + Math.min(100, Math.round((100 * received) / len)) + '%');
+      } else {
+        setStatus('Loading… ' + (received / 1048576).toFixed(1) + ' MB');
+      }
+    }
+    const buf = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.byteLength;
+    }
+    raw = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4));
+  } else {
+    raw = new Float32Array(await resp.arrayBuffer());
+  }
 } catch (e) {
   setStatus('Failed to load: ' + e);
   throw e;

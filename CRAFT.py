@@ -1045,13 +1045,26 @@ def _scrub_mojo_noise(text):
 
 
 class RemoteMojoHelper:
-    """Run / build / package Mojo inside the client container via pixi, over SSH."""
+    """Run / build / package Mojo inside the client container via pixi, over SSH.
+
+    Project path is the per-client data volume (~/.mojo-proj), seeded from the
+    image /opt/mojo-proj on first container start so %mojo_add survives rebuild.
+    """
 
     PIXI = "/opt/pixi/bin/pixi"
-    PROJ = "/opt/mojo-proj"
+    PROJ = "/home/gpudev/.mojo-proj"  # volume; start.sh seeds from /opt/mojo-proj
+    PROJ_SEED = "/opt/mojo-proj"
 
     def _runner(self):
-        return f"{self.PIXI} run --manifest-path {self.PROJ}/pixi.toml"
+        # Ensure volume project exists (older containers pre-seed logic).
+        ensure = (
+            f"if [ ! -f {self.PROJ}/pixi.toml ] && [ -d {self.PROJ_SEED} ]; then "
+            f"cp -a {self.PROJ_SEED} {self.PROJ}; fi"
+        )
+        return (
+            f"{ensure} && "
+            f"{self.PIXI} run --manifest-path {self.PROJ}/pixi.toml"
+        )
 
     def run_source(self, src):
         _ssh_with_input(
@@ -1089,7 +1102,12 @@ class RemoteMojoHelper:
 
     def add_package(self, spec, pypi=False):
         flag = "--pypi " if pypi else ""
+        ensure = (
+            f"if [ ! -f {self.PROJ}/pixi.toml ] && [ -d {self.PROJ_SEED} ]; then "
+            f"cp -a {self.PROJ_SEED} {self.PROJ}; fi"
+        )
         return _ssh(
+            f"{ensure} && "
             f"{self.PIXI} add --manifest-path {self.PROJ}/pixi.toml {flag}{spec}",
             capture_output=True,
             check=False,

@@ -329,8 +329,41 @@ To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 
 # ── Step 4: Build base image ──────────────────────────────────────────────────
 
+write_base_requirements() {
+    # Pinned top-level ML stack for reproducible base images.
+    # Bump intentionally after re-testing torch.cuda on your driver.
+    # Last reviewed: 2026-07.
+    mkdir -p "$CONFIG_DIR"
+    cat > "${CONFIG_DIR}/requirements-torch.txt" <<'REQ'
+# Installed with: uv pip install --index-url https://download.pytorch.org/whl/cu124 -r …
+# If resolve fails for your platform, relax pins and re-run linux-setup.sh.
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+REQ
+    cat > "${CONFIG_DIR}/requirements-base.txt" <<'REQ'
+ipykernel==6.29.5
+jupyter_client==8.6.3
+numpy==2.1.3
+numba==0.60.0
+pandas==2.2.3
+scipy==1.14.1
+scikit-learn==1.5.2
+matplotlib==3.9.3
+plotly==5.24.1
+pillow==11.0.0
+tqdm==4.67.1
+httpx==0.28.1
+requests==2.32.3
+transformers==4.47.1
+datasets==3.2.0
+REQ
+    log "Wrote pinned requirements to ${CONFIG_DIR}/requirements-{torch,base}.txt"
+}
+
 write_dockerfile() {
     local dockerfile="${CONFIG_DIR}/Dockerfile.base"
+    write_base_requirements
 
     cat > "$dockerfile" <<'DOCKERFILE'
 FROM python:3.12-slim
@@ -358,28 +391,16 @@ RUN mkdir -p /run/sshd \
 
 # Base ML venv at /opt/venv — built once into the image, available read-only to all containers.
 # PyTorch bundles its own CUDA runtime so no CUDA base image is needed.
-# Install torch from the official CUDA wheel index (default PyPI often serves CPU-only).
+# Torch from official CUDA wheel index (default PyPI often serves CPU-only).
+# Pins live in requirements-*.txt next to this Dockerfile (written by linux-setup.sh).
 # Per-client venvs are created on their data volumes by client-setup.sh and persist indefinitely.
+COPY requirements-torch.txt requirements-base.txt /tmp/gpudev-req/
 RUN uv venv /opt/venv --python 3.12 --seed \
     && uv pip install --python /opt/venv/bin/python \
         --index-url https://download.pytorch.org/whl/cu124 \
-        torch torchvision torchaudio \
+        -r /tmp/gpudev-req/requirements-torch.txt \
     && uv pip install --python /opt/venv/bin/python \
-        ipykernel \
-        jupyter_client \
-        numpy \
-        numba \
-        pandas \
-        scipy \
-        scikit-learn \
-        matplotlib \
-        plotly \
-        pillow \
-        tqdm \
-        httpx \
-        requests \
-        transformers \
-        datasets
+        -r /tmp/gpudev-req/requirements-base.txt
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -397,32 +418,27 @@ RUN printf '%s\n' \
         'export PATH="/home/gpudev/.venv/bin:$PATH"' \
         > /etc/profile.d/10-gpudev-venv.sh
 
-# Mojo via pixi (Modular's package manager). Unlike `uv pip install mojo` (which is
-# compiler-only and frozen on an old PyPI build), pixi gives the current toolchain
-# AND `pixi add <pkg>` for the Mojo package ecosystem. The project is baked at
-# /opt/mojo-proj and made writable so packages can be added at runtime. Containers
-# run with --gpus all, so Mojo targets the same GPU as torch.
+# Mojo via pixi (Modular's package manager). Seed project at /opt/mojo-proj (image).
+# At container start, client start.sh copies the seed to /home/gpudev/.mojo-proj on
+# the data volume if missing — so %mojo_add / pixi packages survive client rebuild.
 RUN curl -fsSL https://pixi.sh/install.sh | PIXI_HOME=/opt/pixi PIXI_NO_PATH_UPDATE=1 bash
 ENV PATH="/opt/pixi/bin:${PATH}"
 # Pin STABLE Mojo: `modular<26.3` resolves to 25.4.x (Mojo 25.4) on Python 3.12,
-# NOT the 1.0.0b1 beta (modular 26.3, Python 3.14). The beta has no community
-# Mojo libraries (version conflicts) and a thin conda set (few py3.14 builds);
-# stable unlocks the modular-community channel (numojo, etc.) and the broad
-# conda-forge package set. The modular-community channel is added so `pixi add`
-# / %mojo_add can reach Mojo libraries. Containers run with --gpus all, so Mojo
-# targets the same GPU as torch.
+# NOT the 1.0.0b1 beta (modular 26.3, Python 3.14).
 RUN pixi init /opt/mojo-proj \
         -c https://conda.modular.com/max \
         -c https://repo.prefix.dev/modular-community \
         -c conda-forge \
     && pixi add --manifest-path /opt/mojo-proj/pixi.toml "modular<26.3"
-# Python interop libs, usable from Mojo via `from python import Python`. Separate
-# RUN layer so changing this list doesn't rebuild the large toolchain layer above.
-# chmod last so the env files these add are writable by the runtime gpudev user.
 RUN pixi add --manifest-path /opt/mojo-proj/pixi.toml \
         numpy pandas matplotlib scipy \
-    && chmod -R a+rwX /opt/mojo-proj
-ENV MOJO_PROJ=/opt/mojo-proj
+    && chmod -R a+rX /opt/mojo-proj
+# Runtime default is the volume path; seed remains at /opt/mojo-proj.
+ENV MOJO_PROJ=/home/gpudev/.mojo-proj
+RUN printf '%s\n' \
+        'export MOJO_PROJ="${MOJO_PROJ:-/home/gpudev/.mojo-proj}"' \
+        'export PATH="/opt/pixi/bin:$PATH"' \
+        > /etc/profile.d/20-gpudev-mojo.sh
 
 EXPOSE 22
 
@@ -768,7 +784,11 @@ p.write_text(json.dumps(d, indent=2))
             chmod 600 "$HOST_CONFIG"
             log "Cloudflare API token saved to host.json."
         else
-            warn "Could not extract API token from tunnel credentials. DNS cleanup will require manual steps."
+            warn "Could not extract a DNS-capable API token from tunnel credentials."
+            warn "  client remove will not auto-delete CNAMEs until you store one:"
+            warn "    gpudev cloudflare token-set"
+            warn "  Create token: dash.cloudflare.com → API Tokens → Edit zone DNS"
+            warn "  (zone = your CF_DOMAIN only)."
         fi
     fi
 }
