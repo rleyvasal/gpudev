@@ -615,10 +615,44 @@ def _handle_output(msg):
 
 
 # ── Remote Execution Manager ──────────────────────────────────────────────────
+def _is_kernel_auth_failure(exc, ports_open: bool) -> bool:
+    """True when attach failed in a way that often means HMAC / connection-file mismatch.
+
+    Only considered when local ZMQ forward ports are open — otherwise the failure
+    is tunnel/SSH, not a stale kernel key. See TROUBLESHOOTING.md (HMAC story).
+    """
+    if not ports_open:
+        return False
+
+    msg = str(exc).lower()
+    if any(s in msg for s in ("signature", "hmac", "invalidsignature")):
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    if any(
+        s in msg
+        for s in (
+            "ready",
+            "timeout",
+            "timed out",
+            "didn't respond",
+            "did not respond",
+            "kernel didn't",
+            "kernel did not",
+        )
+    ):
+        return True
+    # jupyter_client wait_for_ready sometimes raises with an empty message.
+    if not msg.strip():
+        return True
+    return False
+
+
 class RemoteExecutionManager:
     def __init__(self):
         self.remote_kc = None
         self._tunnel_proc = None
+        self._hmac_heal_attempted = False
 
     def _test_connection(self, kernel_info, timeout=3):
         try:
@@ -642,6 +676,51 @@ class RemoteExecutionManager:
             raise
 
         return kc
+
+    def _attach_kernel_once(self):
+        """Fetch connection file, open tunnel, connect ZMQ client (one attempt)."""
+        kernel_info = fetch_kernel_info()
+        self._ensure_tunnel(kernel_info)
+        return self._connect_kernel(kernel_info)
+
+    def _attach_kernel(self, heal_hmac=True):
+        """Attach to the remote kernel; optionally self-heal HMAC mismatch once.
+
+        Returns:
+            (kernel_client, healed) where healed is True if a forced remote
+            kernel restart was performed before a successful attach.
+        """
+        self._hmac_heal_attempted = False
+        last_err = None
+
+        # Soft attempts: preserve remote state; covers flaky tunnel opens.
+        for soft in range(2):
+            try:
+                return self._attach_kernel_once(), False
+            except Exception as e:
+                last_err = e
+                self._kill_stale_forwards()
+                ports_open = self._test_connection(KERNEL_PORTS)
+                if heal_hmac and _is_kernel_auth_failure(e, ports_open):
+                    break
+                if soft == 0:
+                    time.sleep(0.5)
+                    continue
+                raise
+
+        # Auth-class failure with open ports: force new kernel + connection key.
+        self._hmac_heal_attempted = True
+        print(
+            "Remote kernel did not accept the connection (likely a stale HMAC key).\n"
+            "Restarting the GPU kernel once — variables and loaded models will be cleared."
+        )
+        ensure_kernel(force_restart=True)
+        self._kill_stale_forwards()
+        try:
+            return self._attach_kernel_once(), True
+        except Exception as e2:
+            # Prefer the post-restart error (more relevant); chain the pre-heal one.
+            raise e2 from last_err
 
     def _check_ssh(self):
         """Verify we can reach the container over SSH."""
@@ -691,30 +770,33 @@ class RemoteExecutionManager:
         if not self._check_ssh():
             return False
 
+        # Soft start first (preserve variables when kernel is healthy).
         ensure_kernel()
         self._kill_stale_forwards()
 
-        last_err = None
+        try:
+            self.remote_kc, healed = self._attach_kernel(heal_hmac=True)
+        except Exception as last_err:
+            print(f"Could not attach to remote kernel '{CLIENT_NAME}': {last_err}")
+            if self._hmac_heal_attempted:
+                print(
+                    "A forced kernel restart was already tried. "
+                    "On the host: gpudev kernel doctor " + (CLIENT_NAME or "<name>")
+                )
+            else:
+                print(
+                    "The kernel is likely still alive — your variables are preserved. "
+                    "Re-run the cell to retry, or %restart_kernel for a fresh kernel "
+                    "(clears state)."
+                )
+            print(kernel_doctor())
+            raise last_err
 
-        for attempt in range(2):
-            try:
-                kernel_info = fetch_kernel_info()
-                self._ensure_tunnel(kernel_info)
-                self.remote_kc = self._connect_kernel(kernel_info)
-                print(f"Remote kernel '{CLIENT_NAME}' ready")
-                return True
-            except Exception as e:
-                last_err = e
-                self._kill_stale_forwards()
-
-        print(f"Could not attach to remote kernel '{CLIENT_NAME}': {last_err}")
-        print(
-            "The kernel is likely still alive — your variables are preserved. "
-            "Re-run the cell to retry, or %restart_kernel for a fresh kernel "
-            "(clears state)."
-        )
-        print(kernel_doctor())
-        raise last_err
+        if healed:
+            print(f"Remote kernel '{CLIENT_NAME}' ready (fresh after HMAC self-heal)")
+        else:
+            print(f"Remote kernel '{CLIENT_NAME}' ready")
+        return True
 
     # TODO: Refactor tunnel lifecycle helpers into a TunnelManager class.
     # Active code: do not remove until each method is migrated and tested.
@@ -856,7 +938,7 @@ class RemoteExecutionManager:
         return self.reconnect()
 
     def reconnect(self):
-        """Rebuild the SSH tunnel and re-attach to the live remote kernel."""
+        """Rebuild the SSH tunnel and re-attach; HMAC self-heal once if needed."""
         if self.remote_kc is not None:
             try:
                 self.remote_kc.stop_channels()
@@ -867,14 +949,24 @@ class RemoteExecutionManager:
         try:
             ensure_kernel()
             self._kill_stale_forwards()
-            kernel_info = fetch_kernel_info()
-            self._ensure_tunnel(kernel_info)
-            self.remote_kc = self._connect_kernel(kernel_info)
+            self.remote_kc, healed = self._attach_kernel(heal_hmac=True)
         except Exception as e:
             print(f"Reconnect failed: {e}")
+            if self._hmac_heal_attempted:
+                print(
+                    "Forced kernel restart was already tried. "
+                    "Check %kernel_status or: gpudev kernel doctor "
+                    + (CLIENT_NAME or "<name>")
+                )
             return False
 
-        print(f"Reconnected to live kernel '{CLIENT_NAME}' (variables preserved)")
+        if healed:
+            print(
+                f"Reconnected to fresh kernel '{CLIENT_NAME}' "
+                "(state cleared by HMAC self-heal)"
+            )
+        else:
+            print(f"Reconnected to live kernel '{CLIENT_NAME}' (variables preserved)")
         return True
 
     def execute_remote(self, code, verbose=False):
@@ -910,10 +1002,9 @@ class RemoteExecutionManager:
         self.remote_kc = None
 
         ensure_kernel(force_restart=True)
-
-        kernel_info = fetch_kernel_info()
-        self._ensure_tunnel(kernel_info)
-        self.remote_kc = self._connect_kernel(kernel_info)
+        self._kill_stale_forwards()
+        # Explicit restart: no second HMAC heal loop (kernel is already fresh).
+        self.remote_kc, _ = self._attach_kernel(heal_hmac=False)
 
         print(f"Remote kernel '{CLIENT_NAME}' restarted")
 
