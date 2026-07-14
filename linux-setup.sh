@@ -358,7 +358,8 @@ requests==2.32.3
 transformers==4.47.1
 datasets==3.2.0
 REQ
-    log "Wrote pinned requirements to ${CONFIG_DIR}/requirements-{torch,base}.txt"
+    # Must go to stderr: write_dockerfile's stdout is captured as the Dockerfile path.
+    log "Wrote pinned requirements to ${CONFIG_DIR}/requirements-torch.txt and requirements-base.txt" >&2
 }
 
 write_dockerfile() {
@@ -449,8 +450,13 @@ DOCKERFILE
 }
 
 build_base_image() {
+    # write_dockerfile prints only the Dockerfile path on stdout (logs go to stderr).
     local dockerfile
-    dockerfile="$(write_dockerfile)"
+    dockerfile="$(write_dockerfile | tail -n1)"
+    [ -f "$dockerfile" ] || fail "Dockerfile not written (got path: ${dockerfile:-empty})"
+    [ -f "${CONFIG_DIR}/requirements-torch.txt" ] \
+        && [ -f "${CONFIG_DIR}/requirements-base.txt" ] \
+        || fail "Pinned requirements missing in ${CONFIG_DIR} — write_base_requirements failed."
 
     $DOCKER build \
         --network=host \
