@@ -333,6 +333,10 @@ write_base_requirements() {
     # Pinned top-level ML stack for reproducible base images.
     # Bump intentionally after re-testing torch.cuda on your driver.
     # Last reviewed: 2026-07.
+    #
+    # Order in Dockerfile: torch (cu124 index) first, then this base file.
+    # Do NOT pin numpy here — torch pulls a compatible numpy (often 2.x).
+    # numba must support that numpy: 0.60.x only allows numpy<2.1 → use >=0.61.
     mkdir -p "$CONFIG_DIR"
     cat > "${CONFIG_DIR}/requirements-torch.txt" <<'REQ'
 # Installed with: uv pip install --index-url https://download.pytorch.org/whl/cu124 -r …
@@ -344,19 +348,20 @@ REQ
     cat > "${CONFIG_DIR}/requirements-base.txt" <<'REQ'
 ipykernel==6.29.5
 jupyter_client==8.6.3
-numpy==2.1.3
-numba==0.60.0
-pandas==2.2.3
-scipy==1.14.1
-scikit-learn==1.5.2
-matplotlib==3.9.3
-plotly==5.24.1
-pillow==11.0.0
-tqdm==4.67.1
-httpx==0.28.1
-requests==2.32.3
-transformers==4.47.1
-datasets==3.2.0
+# numpy: left unpinned — already installed by the torch layer
+numba>=0.61.0,<0.63
+pandas>=2.2.0,<2.3
+scipy>=1.14.0,<1.16
+scikit-learn>=1.5.0,<1.7
+matplotlib>=3.9.0,<3.11
+plotly>=5.24.0,<6
+# pillow: torch may already install a newer build; allow either
+pillow>=10.0.0
+tqdm>=4.66.0
+httpx>=0.27.0
+requests>=2.32.0
+transformers>=4.46.0,<4.50
+datasets>=3.0.0,<3.3
 REQ
     # Must go to stderr: write_dockerfile's stdout is captured as the Dockerfile path.
     log "Wrote pinned requirements to ${CONFIG_DIR}/requirements-torch.txt and requirements-base.txt" >&2
