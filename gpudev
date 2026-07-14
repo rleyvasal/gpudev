@@ -162,7 +162,12 @@ cmd_host_status() {
         echo "      HostName ${host_cf_hostname}"
         echo "      User ${linux_user}"
         echo "      IdentityFile ~/.ssh/<your-admin-key>"
-        echo "      ProxyCommand cloudflared access ssh --hostname %h"
+        echo "      IdentitiesOnly yes"
+        # Canonical ProxyCommand (same as client info / README / linux-setup):
+        # PATH first, then CRAFT/SolveIt install dir; access tcp + %h.
+        echo "      ProxyCommand bash -c 'p=\$(command -v cloudflared 2>/dev/null || echo \"\$HOME/.local/bin/cloudflared\"); exec \"\$p\" access tcp --hostname %h'"
+        echo "      ServerAliveInterval 30"
+        echo "      ServerAliveCountMax 3"
         echo "  then:  ssh ${linux_user}"
         echo "  (port ${host_ssh_port:-52100} is internal to WSL — never 'ssh -p' it directly)"
         echo ""
@@ -584,19 +589,23 @@ cmd_client_info() {
     echo ""
     echo "── SSH config (add to ~/.ssh/config on the client/notebook machine) ──"
     echo ""
+    # Canonical ProxyCommand — keep in sync with README + linux-setup.sh epilogue:
+    #   • resolve cloudflared from PATH, else ~/.local/bin (CRAFT install path)
+    #   • access tcp (SSH over published hostname → ssh:// origin)
+    #   • %h expands to HostName above
     cat <<EOF
 Host gpudev-${name}
   HostName ${hostname}
   User gpudev
   IdentityFile ~/.ssh/gpudev-${name}
   IdentitiesOnly yes
-  ProxyCommand bash -c 'p=\$(command -v cloudflared 2>/dev/null || echo "\$HOME/.local/bin/cloudflared"); exec "\$p" access tcp --hostname ${hostname}'
+  ProxyCommand bash -c 'p=\$(command -v cloudflared 2>/dev/null || echo "\$HOME/.local/bin/cloudflared"); exec "\$p" access tcp --hostname %h'
   ServerAliveInterval 30
   ServerAliveCountMax 3
 EOF
     echo ""
-    echo "  cloudflared is auto-installed by CRAFT.py (%run CRAFT.py installs it to ~/.local/bin)."
-    echo "  If you need it manually: https://developers.cloudflare.com/cloudflared/install/"
+    echo "  cloudflared: on PATH, or auto-installed by CRAFT to ~/.local/bin."
+    echo "  Manual install: https://developers.cloudflare.com/cloudflared/install/"
     echo ""
     echo "── craft.json (notebook side) ──"
     echo ""

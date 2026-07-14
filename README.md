@@ -349,16 +349,20 @@ Add a stanza to your admin laptop's `~/.ssh/config`:
 ```sshconfig
 Host gpudev
   HostName gpudev.example.com
-  Port 52100
   User gpudev
   IdentityFile ~/.ssh/gpudev-admin
   IdentitiesOnly yes
-  ProxyCommand cloudflared access tcp --hostname gpudev.example.com
+  ProxyCommand bash -c 'p=$(command -v cloudflared 2>/dev/null || echo "$HOME/.local/bin/cloudflared"); exec "$p" access tcp --hostname %h'
   ServerAliveInterval 30
   ServerAliveCountMax 3
 ```
 
 (Substitute `example.com` for your domain, `gpudev` for the WSL user you chose.)
+
+Do **not** set `Port 52100` here — that port is internal to the host/WSL. Traffic
+reaches it only through the Cloudflare tunnel via `ProxyCommand`. The same
+`ProxyCommand` form is printed by `linux-setup.sh` and `gpudev client info`
+(PATH first, then `~/.local/bin` where CRAFT may install cloudflared).
 
 Then:
 
@@ -418,7 +422,7 @@ Host gpudev-alice
   User gpudev
   IdentityFile ~/.ssh/gpudev-alice
   IdentitiesOnly yes
-  ProxyCommand cloudflared access tcp --hostname alice.example.com
+  ProxyCommand bash -c 'p=$(command -v cloudflared 2>/dev/null || echo "$HOME/.local/bin/cloudflared"); exec "$p" access tcp --hostname %h'
   ServerAliveInterval 30
   ServerAliveCountMax 3
 ```
