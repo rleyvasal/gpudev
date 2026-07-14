@@ -322,6 +322,74 @@ wait_for_container() {
     warn "Container '$name' may not be fully ready. Check: docker logs $name"
 }
 
+# ── Partial-provision cleanup ─────────────────────────────────────────────────
+# If client add fails after creating a volume / tunnel rule / container but before
+# clients.json registration, tear those down so a retry is clean.
+
+remove_tunnel_ingress() {
+    local cf_hostname="$1"
+    local config_yml="${HOME}/.cloudflared/config.yml"
+    [ -f "$config_yml" ] || return 0
+    grep -qF "hostname: ${cf_hostname}" "$config_yml" || return 0
+
+    python3 -c "
+import pathlib
+p = pathlib.Path('${config_yml}')
+lines = p.read_text().splitlines(keepends=True)
+out = []
+skip_next = False
+for line in lines:
+    if 'hostname: ${cf_hostname}' in line:
+        skip_next = True
+        continue
+    if skip_next:
+        skip_next = False
+        continue
+    out.append(line)
+p.write_text(''.join(out))
+"
+    log "  Removed ingress rule for $cf_hostname"
+
+    local tunnel_name
+    tunnel_name="$(host_get linux_user 2>/dev/null || true)"
+    if [ -n "$tunnel_name" ] && command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+        sudo systemctl restart gpudev-tunnel 2>/dev/null || true
+    fi
+}
+
+cleanup_partial_client() {
+    # Only runs on failure (see trap). Never touches a fully registered client.
+    [ "${_CLIENT_ADD_OK:-}" = "1" ] && return 0
+    local name="${_PARTIAL_NAME:-}"
+    local cf_hostname="${_PARTIAL_CF_HOSTNAME:-}"
+    [ -n "$name" ] || return 0
+
+    # If registration completed, leave everything alone.
+    if client_exists "$name" 2>/dev/null; then
+        return 0
+    fi
+
+    warn "Client add failed — cleaning up partial provision for '$name'..."
+
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        log "  Removed container '$name'"
+    fi
+
+    if [ "${_PARTIAL_VOLUME:-}" = "1" ] \
+        && docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "${name}-data"; then
+        docker volume rm "${name}-data" >/dev/null 2>&1 || true
+        log "  Removed volume '${name}-data'"
+    fi
+
+    if [ "${_PARTIAL_TUNNEL:-}" = "1" ] && [ -n "$cf_hostname" ]; then
+        remove_tunnel_ingress "$cf_hostname" || true
+        warn "  DNS CNAME for $cf_hostname may still exist (delete manually if re-add fails)."
+    fi
+
+    warn "Cleanup done. Safe to re-run: gpudev client add $name"
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -373,12 +441,22 @@ main() {
     log "Hostname:   $CF_HOSTNAME"
     echo ""
 
+    # Partial-failure tracking for cleanup_partial_client.
+    _PARTIAL_NAME="$CLIENT_NAME"
+    _PARTIAL_CF_HOSTNAME="$CF_HOSTNAME"
+    _PARTIAL_VOLUME=0
+    _PARTIAL_TUNNEL=0
+    _CLIENT_ADD_OK=0
+    trap cleanup_partial_client EXIT
+
     step "Step 1: Create Docker volume"
     docker volume create "${CLIENT_NAME}-data"
+    _PARTIAL_VOLUME=1
     log "Volume '${CLIENT_NAME}-data' ready."
 
     step "Step 2: Add client to host tunnel"
     add_client_to_host_tunnel "$CLIENT_NAME" "$SSH_PORT" "$CF_HOSTNAME"
+    _PARTIAL_TUNNEL=1
 
     step "Step 3: Initialize client volume"
     setup_ssh_authorized_keys "$CLIENT_NAME" "$SSH_PUBLIC_KEY"
@@ -392,6 +470,8 @@ main() {
 
     step "Step 5: Register client"
     register_client "$CLIENT_NAME" "$SSH_PORT" "$ADDED_AT"
+    _CLIENT_ADD_OK=1
+    trap - EXIT
 
     step "Done"
     log "Client '$CLIENT_NAME' is ready."

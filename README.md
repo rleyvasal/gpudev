@@ -457,6 +457,29 @@ hostname `gpudev-alice`, attaches the kernel, and starts routing. From that
 point on, every cell runs on the GPU container; `%local` flips back to the
 notebook.
 
+### One kernel per client (important)
+
+Each client container runs **one** long-lived Jupyter kernel. Every notebook that
+connects as that client (e.g. `solveit`) attaches to the **same** process:
+
+- Variables, loaded models, and GPU memory are **shared** across tabs/notebooks.
+- One notebook’s `%restart_kernel` clears state for everyone on that client.
+- Concurrent cells from two notebooks interleave on one REPL.
+
+For isolated work, use a **second client** (`gpudev client add bob`) or restart
+when you need a clean slate.
+
+### Rebuilds and SSH host keys
+
+Client SSH host keys live on the data volume
+(`/home/gpudev/.local/share/ssh/hostkeys/`). `gpudev client rebuild` keeps the
+same fingerprint, so notebook `known_hosts` stays valid. Keys only rotate if you
+`client remove` (volume deleted) or wipe the hostkeys directory. CRAFT will
+auto-clear a stale `known_hosts` entry once if a key did change.
+
+Point-cloud previews in the notebook: use **`pcviz.py`** (`%pointcloud` /
+`%pointcloud_var`), not older demo scripts.
+
 ---
 
 ## Day-to-day admin operations
@@ -593,12 +616,13 @@ done and fix what isn't.
 
 ```
 gpudev/
-├── windows-setup.ps1     ← Phase A: Windows prep + OOBE-free distro import & user creation (powercfg, wsl --import, boot+keepalive tasks)
-├── linux-setup.sh        ← Phase B: full gpudev install — works on WSL2 or bare Linux, run by operator
-├── client-setup.sh       ← per-client container provisioning (invoked by `gpudev client add`)
-├── kernel-manager.sh     ← in-container Jupyter kernel lifecycle (deployed into each container)
+├── windows-setup.ps1     ← Phase A: Windows prep + OOBE-free distro import & user creation
+├── linux-setup.sh        ← Phase B: full gpudev install (WSL2 or bare Linux)
+├── client-setup.sh       ← per-client container provisioning (`gpudev client add`)
+├── kernel-manager.sh     ← in-container Jupyter kernel lifecycle
 ├── gpudev                ← admin CLI (deployed to ~/bin on the host)
-└── CRAFT.py              ← notebook-side cell-routing magics (runs on the client/notebook machine)
+├── CRAFT.py              ← notebook cell-routing magics (SolveIt craft / %run)
+└── pcviz.py              ← local FastHTML + three.js point-cloud viewer magics
 ```
 
 Configuration on the host:

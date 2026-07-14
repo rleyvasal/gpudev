@@ -91,8 +91,9 @@ def _find_free_kernel_ports(start=60000, stop=65000, step=100):
 KERNEL_PORTS = _find_free_kernel_ports()
 
 
-# Keep debugging noise low: one attempt shows the first real failure cleanly.
-CONNECT_ATTEMPTS = 1
+# Outer connect attempts for flaky tunnels (Cloudflare blips). Each attempt runs
+# full setup_remote (SSH + attach + HMAC heal). Override: GPUDEV_CONNECT_ATTEMPTS=1
+CONNECT_ATTEMPTS = max(1, int(os.environ.get("GPUDEV_CONNECT_ATTEMPTS", "3")))
 
 CLOUDFLARED_PATH = Path(
     os.environ.get("CLOUDFLARED_PATH")

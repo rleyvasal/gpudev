@@ -2,6 +2,14 @@
 *.json
 *.log
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
 # OS
 .DS_Store
 
