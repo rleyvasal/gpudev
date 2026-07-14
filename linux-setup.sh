@@ -268,8 +268,21 @@ restart_docker() {
 
 # ── Step 3: NVIDIA Container Toolkit ─────────────────────────────────────────
 
+# True if the toolkit package is installed. Prefer dpkg-query over
+# `dpkg -l | grep "^ii  …"` — column spacing in dpkg -l is not stable and
+# produced false MISSING health-check results with a working toolkit.
+nvidia_toolkit_installed() {
+    local status
+    status="$(dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null || true)"
+    case "$status" in
+        *"install ok installed"*) return 0 ;;
+    esac
+    # Fallback: CLI present (some installs / partial package sets).
+    command_exists nvidia-ctk
+}
+
 install_nvidia_container_toolkit() {
-    if dpkg -l 2>/dev/null | grep -q "^ii  nvidia-container-toolkit"; then
+    if nvidia_toolkit_installed; then
         log "NVIDIA Container Toolkit already installed."
         return 0
     fi
@@ -923,9 +936,11 @@ run_health_check() {
         warn "  cloudflared (host):       MISSING"
     fi
 
-    dpkg -l 2>/dev/null | grep -q "^ii  nvidia-container-toolkit" \
-        && log "  nvidia-container-toolkit: OK" \
-        || warn "  nvidia-container-toolkit: MISSING"
+    if nvidia_toolkit_installed; then
+        log "  nvidia-container-toolkit: OK"
+    else
+        warn "  nvidia-container-toolkit: MISSING"
+    fi
 
     $DOCKER image inspect "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" >/dev/null 2>&1 \
         && log "  base image:               OK (${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG})" \
