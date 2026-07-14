@@ -1274,7 +1274,6 @@ class MojoExecutionManager:
 
         if r.returncode != 0:
             raise RuntimeError("mojo run failed")
-
         self.upsert_cell(msg_id, code)
 
     def restart_mojo(self):
@@ -1646,4 +1645,3 @@ print("  %mojo_run        show the last generated Mojo source")
 print("  %mojo_add <pkg>  pixi-add a Mojo/Python package into the GPU container")
 print("  %bench [N]       compile last Mojo program once, time N runs (no compile)")
 print("  %kernel_status   show mode + connection + GPU status")
-
