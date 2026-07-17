@@ -255,13 +255,48 @@ def _scene():
     )
 
 
+def stop_server():
+    """Stop the local Three.js viewer process (safe to call multiple times)."""
+    global _app, _srv, _preview, _scene_lf, _PORT
+    srv = _srv
+    _srv = None
+    _app = None
+    _preview = None
+    _scene_lf = None
+    _PORT = None
+    if srv is None:
+        return
+    try:
+        if hasattr(srv, "stop") and callable(srv.stop):
+            srv.stop()
+        elif getattr(srv, "server", None) is not None:
+            # uvicorn Server under JupyUvi
+            try:
+                srv.server.should_exit = True
+            except Exception:
+                pass
+            if hasattr(srv.server, "force_exit"):
+                try:
+                    srv.server.force_exit = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def restart_viewer(height="600px"):
+    """Stop any viewer and start fresh (use after re-%run pcviz if HTMX 500s)."""
+    stop_server()
+    _ensure_server(height=height)
+
+
 def _ensure_server(height="600px"):
     "Start the singleton FastHTML server once; reused by every point_cloud() call."
     global _app, _srv, _preview, _scene_lf, _PORT
 
     if _srv is not None:
         # Keep existing server, but refresh HTMX height if needed
-        if _preview is not None and height:
+        if height:
             try:
                 _preview = partial(HTMX, app=_app, host=None, port=_PORT, height=height)
             except Exception:
@@ -540,14 +575,20 @@ def point_cloud_plotly(
         title=ttl,
         height=h,
         margin=dict(l=0, r=0, t=40, b=0),
-        scene=dict(aspectmode="data"),
+        scene=dict(
+            aspectmode="data",
+            xaxis_title="x",
+            yaxis_title="y",
+            zaxis_title="z",
+        ),
         template="plotly_dark",
         paper_bgcolor="#0b1020",
         font=dict(color="#9ab"),
     )
     print(f"pcviz plotly: {n0:,} points (max_points={int(max_points)}) → {ttl}")
     fig.show()
-    return fig
+    # Do not return fig — IPython/SolveIt would auto-display it a second time
+    return None
 
 
 try:
@@ -734,6 +775,24 @@ except Exception:
     pass
 
 _craft_keep_local("%pointcloud_var")
+
+
+# On re-%run of this file, stop the previous JupyUvi so the next %pointcloud
+# binds /pcviz_scene and /points/* to *this* code (avoids Internal Server Error
+# from a stale server still holding port 8000).
+try:
+    _ip = get_ipython()
+    _old = (_ip.user_ns or {}).get("_srv") if _ip is not None else None
+    if _old is not None and _old is not _srv:
+        try:
+            if hasattr(_old, "stop") and callable(_old.stop):
+                _old.stop()
+            elif getattr(_old, "server", None) is not None:
+                _old.server.should_exit = True
+        except Exception:
+            pass
+except Exception:
+    pass
 
 
 _VIEWER_JS = """
