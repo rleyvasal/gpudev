@@ -20,6 +20,7 @@ import subprocess
 import shlex
 import itertools
 import json
+import re
 import socket
 import uuid
 
@@ -83,9 +84,20 @@ def _ssh_cfg():
 
 
 def _slug(path):
-    base = str(path).rsplit("/", 1)[-1]
-    base = base[:-4] if base.endswith(".bin") else base
-    return base or f"cloud_{next(_ctr)}"
+    """URL-safe short name (avoid '+' etc. which break /points/{name}.bin routes)."""
+    import hashlib
+
+    raw = str(path)
+    base = raw.rsplit("/", 1)[-1]
+    if base.endswith(".pcd.bin"):
+        base = base[: -len(".pcd.bin")]
+    elif base.endswith(".bin"):
+        base = base[:-4]
+    # Keep alnum / . _ - only — '+' and spaces break HTMX/fetch URLs
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "cloud"
+    # Short hash keeps names unique after sanitizing
+    tag = hashlib.md5(raw.encode("utf-8", "replace")).hexdigest()[:6]
+    return f"{base[:60]}_{tag}"
 
 
 def _port_free(port):
@@ -138,6 +150,47 @@ def _subsample_params(sub, max_points, n_points):
     return sub
 
 
+def _remote_thin_cmd(src: str, *, stride: int, sub: int) -> str:
+    """SSH remote command: stream thinned float32 rows (or full file if sub<=1)."""
+    sub = max(1, int(sub or 1))
+    stride = max(3, int(stride or 3))
+    if sub <= 1:
+        return "cat -- " + shlex.quote(src)
+    # Same recipe the viewer has used successfully for large remote clouds
+    return (
+        "python3 -c "
+        + shlex.quote(
+            "import sys,numpy as np;"
+            f"a=np.fromfile({src!r},dtype=np.float32);"
+            f"s={stride};"
+            "n=a.size//s;"
+            f"a=a[:n*s].reshape(n,s)[::{sub}];"
+            "sys.stdout.buffer.write(np.ascontiguousarray(a,dtype=np.float32).tobytes())"
+        )
+    )
+
+
+def _ssh_collect_bytes(remote_cmd: str) -> bytes:
+    """Run remote_cmd over CRAFT SSH; return full stdout bytes or raise with stderr."""
+    host, opts = _ssh_cfg()
+    opt_list = shlex.split(opts) if opts else []
+    cmd = ["ssh", *opt_list, host, remote_cmd]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        # Some ssh failures only print to stdout
+        if not err and proc.stdout:
+            try:
+                err = proc.stdout[:400].decode("utf-8", "replace").strip()
+            except Exception:
+                err = f"({len(proc.stdout)} bytes on stdout)"
+        raise RuntimeError(
+            f"ssh to {host!r} failed (rc={proc.returncode}): {err or 'no stderr'} "
+            f"[cmd starts with: {remote_cmd[:80]!r}…]"
+        )
+    return proc.stdout or b""
+
+
 def _data(name: str):
     "Serve a cloud's raw float32 bytes; remote clouds stream over ssh, never stored."
     c = _CLOUDS.get(name)
@@ -149,23 +202,9 @@ def _data(name: str):
         host, opts = _ssh_cfg()
         src = c["src"]
         sub = max(1, int(c.get("sub") or 1))
-        # Full file, or thin on the GPU box so SolveIt/browser never see full density.
-        if sub <= 1:
-            remote_cmd = "cat -- " + shlex.quote(src)
-        else:
-            # Stream every `sub`-th point (row) as float32; keeps xyz+fields aligned.
-            remote_cmd = (
-                "python3 -c "
-                + shlex.quote(
-                    "import sys,numpy as np;"
-                    f"a=np.fromfile({src!r},dtype=np.float32);"
-                    f"s={int(c['stride'])};"
-                    "n=a.size//s;"
-                    f"a=a[:n*s].reshape(n,s)[::{sub}];"
-                    "sys.stdout.buffer.write(np.ascontiguousarray(a,dtype=np.float32).tobytes())"
-                )
-            )
-        cmd = ["ssh", *shlex.split(opts), host, remote_cmd]
+        remote_cmd = _remote_thin_cmd(src, stride=int(c["stride"]), sub=sub)
+        opt_list = shlex.split(opts) if opts else []
+        cmd = ["ssh", *opt_list, host, remote_cmd]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def gen():
@@ -188,6 +227,11 @@ def _data(name: str):
 
 def _scene():
     "The three.js page for the currently-selected cloud."
+    if not _CURRENT or _CURRENT not in _CLOUDS:
+        return Div(
+            Style("body{margin:0;background:#0b1020;color:#9ab;font:14px system-ui}"),
+            P("No cloud selected — re-run %pointcloud …"),
+        )
     c = _CLOUDS[_CURRENT]
 
     return Div(
@@ -216,6 +260,12 @@ def _ensure_server(height="600px"):
     global _app, _srv, _preview, _scene_lf, _PORT
 
     if _srv is not None:
+        # Keep existing server, but refresh HTMX height if needed
+        if _preview is not None and height:
+            try:
+                _preview = partial(HTMX, app=_app, host=None, port=_PORT, height=height)
+            except Exception:
+                pass
         return
 
     _PORT = _pick_port(_PREF_PORT, _PORT_RANGE)
@@ -362,40 +412,38 @@ def _load_points_array(
         if arr.ndim != 2 or arr.shape[1] < 3:
             raise ValueError(f"expected (N,K>=3) array, got shape {arr.shape!r}")
         stride = int(arr.shape[1])
-        # max_points=0 → no cap; else thin to budget
         sub_eff = _subsample_params(sub, max_points if max_points > 0 else 0, arr.shape[0])
         if sub_eff > 1:
             arr = np.ascontiguousarray(arr[::sub_eff])
         return arr
 
     if remote:
-        host, opts = _ssh_cfg()
-        # Thin on the GPU box, then stream only the kept rows (xyz + fields).
-        remote_py = (
-            "import sys,numpy as np;"
-            f"p={str(src)!r};s={stride};sub0={sub};mx={max_points};"
-            "a=np.fromfile(p,dtype=np.float32);"
-            "n=a.size//s;"
-            "a=a[:n*s].reshape(n,s);"
-            "sub=max(1,int(sub0));"
-            "if mx and mx>0 and n>mx*sub: sub=max(sub,(n+mx-1)//mx);"
-            "a=np.ascontiguousarray(a[::sub]);"
-            "sys.stdout.buffer.write(a.tobytes())"
-        )
-        cmd = ["ssh", *shlex.split(opts), host, "python3 -c " + shlex.quote(remote_py)]
-        proc = subprocess.run(cmd, capture_output=True, check=False)
-        if proc.returncode != 0:
-            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
-            raise RuntimeError(
-                f"remote load failed for {src!r} (rc={proc.returncode}): {err or 'no stderr'}"
+        # Estimate N from remote file size (same idea as point_cloud) → choose sub
+        n_pts = None
+        try:
+            out = _ssh_run(
+                "stat -c%s -- " + shlex.quote(str(src)) + " 2>/dev/null || "
+                "stat -f%z -- " + shlex.quote(str(src)),
+                check=False,
             )
-        raw = proc.stdout
+            nbytes = int((out.stdout or "0").strip() or "0")
+            if nbytes > 0:
+                n_pts = nbytes // (4 * stride)
+        except Exception:
+            n_pts = None
+        sub_eff = _subsample_params(sub, max_points if max_points > 0 else 0, n_pts)
+        raw = _ssh_collect_bytes(
+            _remote_thin_cmd(str(src), stride=stride, sub=sub_eff)
+        )
         if not raw:
             raise RuntimeError(f"remote load returned empty data for {src!r}")
         arr = np.frombuffer(raw, dtype=np.float32)
         n = arr.size // stride
         if n < 1:
-            raise RuntimeError(f"no points loaded from {src!r}")
+            raise RuntimeError(
+                f"no points loaded from {src!r} "
+                f"(got {len(raw)} bytes, stride={stride})"
+            )
         return arr[: n * stride].reshape(n, stride).copy()
 
     # Local file on SolveIt host
