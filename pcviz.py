@@ -1,11 +1,15 @@
 # pcviz.py — reusable point-cloud viewer for SolveIt (FastHTML + three.js).
 #
 # The viewer server runs in the LOCAL SolveIt kernel.
-# It can still be called while %gpu mode is active because %pointcloud and
-# %pointcloud_var are registered as local passthrough magics in CRAFT.
+# It can still be called while %gpu mode is active because %pointcloud,
+# %pointcloud_var, and %pointcloud_plotly are registered as local passthrough
+# magics in CRAFT.
 #
 # Remote .bin paths stream over SSH (not stored on SolveIt). Snapshots from
 # %pointcloud_var write a temp file on the GPU box, stream it, then delete it.
+#
+# %pointcloud          → interactive Three.js (live SolveIt only; not portable)
+# %pointcloud_plotly   → Plotly Scatter3d (live + portable sslive export)
 
 from fasthtml.common import *
 from fasthtml.jupyter import JupyUvi, HTMX
@@ -31,6 +35,8 @@ _app = _srv = _preview = _scene_lf = None
 
 # Default interactive density for large clouds (override with sub=1 or max_points=0).
 _DEFAULT_MAX_POINTS = 500_000
+# Lower default for Plotly portable export (browser + HTML size).
+_DEFAULT_PLOTLY_MAX_POINTS = 80_000
 
 
 _HDRS = (
@@ -338,6 +344,164 @@ def clear_clouds():
     return []
 
 
+def _load_points_array(
+    src,
+    *,
+    stride=5,
+    sub=1,
+    max_points=_DEFAULT_PLOTLY_MAX_POINTS,
+    remote=True,
+):
+    """Load (N, stride) float32 points on the SolveIt host (thin on GPU when remote)."""
+    stride = max(3, int(stride or 3))
+    sub = max(1, int(sub or 1))
+    max_points = int(max_points) if max_points is not None else 0
+
+    if isinstance(src, np.ndarray):
+        arr = np.ascontiguousarray(src, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] < 3:
+            raise ValueError(f"expected (N,K>=3) array, got shape {arr.shape!r}")
+        stride = int(arr.shape[1])
+        # max_points=0 → no cap; else thin to budget
+        sub_eff = _subsample_params(sub, max_points if max_points > 0 else 0, arr.shape[0])
+        if sub_eff > 1:
+            arr = np.ascontiguousarray(arr[::sub_eff])
+        return arr
+
+    if remote:
+        host, opts = _ssh_cfg()
+        # Thin on the GPU box, then stream only the kept rows (xyz + fields).
+        remote_py = (
+            "import sys,numpy as np;"
+            f"p={str(src)!r};s={stride};sub0={sub};mx={max_points};"
+            "a=np.fromfile(p,dtype=np.float32);"
+            "n=a.size//s;"
+            "a=a[:n*s].reshape(n,s);"
+            "sub=max(1,int(sub0));"
+            "if mx and mx>0 and n>mx*sub: sub=max(sub,(n+mx-1)//mx);"
+            "a=np.ascontiguousarray(a[::sub]);"
+            "sys.stdout.buffer.write(a.tobytes())"
+        )
+        cmd = ["ssh", *shlex.split(opts), host, "python3 -c " + shlex.quote(remote_py)]
+        proc = subprocess.run(cmd, capture_output=True, check=False)
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError(
+                f"remote load failed for {src!r} (rc={proc.returncode}): {err or 'no stderr'}"
+            )
+        raw = proc.stdout
+        if not raw:
+            raise RuntimeError(f"remote load returned empty data for {src!r}")
+        arr = np.frombuffer(raw, dtype=np.float32)
+        n = arr.size // stride
+        if n < 1:
+            raise RuntimeError(f"no points loaded from {src!r}")
+        return arr[: n * stride].reshape(n, stride).copy()
+
+    # Local file on SolveIt host
+    with open(src, "rb") as f:
+        raw = f.read()
+    arr = np.frombuffer(raw, dtype=np.float32)
+    n = arr.size // stride
+    arr = arr[: n * stride].reshape(n, stride)
+    sub_eff = _subsample_params(sub, max_points if max_points > 0 else 0, n)
+    if sub_eff > 1:
+        arr = np.ascontiguousarray(arr[::sub_eff])
+    return arr
+
+
+def point_cloud_plotly(
+    src,
+    *,
+    stride=5,
+    size=1.5,
+    color="height",
+    icol=3,
+    remote=True,
+    sub=1,
+    max_points=None,
+    opacity=0.65,
+    height=640,
+    title=None,
+):
+    """Plot a point cloud with Plotly Scatter3d (portable for sslive export).
+
+    Same CRAFT/host local pattern as ``point_cloud`` / ``%pointcloud``, but the
+    result is a Plotly figure (``fig.show()``) that sslive can embed in export
+    HTML — unlike the Three.js viewer, which needs a live localhost server.
+
+    src        : remote path (default), local path with remote=False, or numpy (N,K).
+    stride     : floats per point — nuScenes=5, KITTI=4, xyz=3.
+    color      : "height", "intensity", or "mono".
+    size       : Plotly marker size (screen units; ~1–3 typical).
+    max_points : cap after thinning (default 80_000 for portable HTML).
+    remote     : stream/thin from GPU box via SSH (default True).
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError as e:
+        raise RuntimeError(
+            "plotly is required on the SolveIt host for %pointcloud_plotly — "
+            "install with: pip install plotly"
+        ) from e
+
+    if max_points is None:
+        max_points = _DEFAULT_PLOTLY_MAX_POINTS
+
+    arr = _load_points_array(
+        src, stride=stride, sub=sub, max_points=max_points, remote=remote
+    )
+    n0 = arr.shape[0]
+    x, y, z = arr[:, 0], arr[:, 1], arr[:, 2]
+
+    marker = dict(size=float(size), opacity=float(opacity))
+    cmode = (color or "height").lower()
+    if cmode == "height":
+        marker["color"] = z
+        marker["colorscale"] = "Viridis"
+        marker["showscale"] = False
+    elif cmode == "intensity" and arr.shape[1] > int(icol):
+        marker["color"] = arr[:, int(icol)]
+        marker["colorscale"] = "Viridis"
+        marker["showscale"] = False
+    # mono: leave default marker color
+
+    if isinstance(src, np.ndarray):
+        ttl = title or "point cloud"
+    else:
+        ttl = title or _slug(src)
+
+    h = height
+    if isinstance(h, str):
+        h = int("".join(ch for ch in h if ch.isdigit()) or "640")
+    h = max(240, int(h))
+
+    fig = go.Figure(
+        data=[
+            go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode="markers",
+                marker=marker,
+                name=ttl,
+            )
+        ]
+    )
+    fig.update_layout(
+        title=ttl,
+        height=h,
+        margin=dict(l=0, r=0, t=40, b=0),
+        scene=dict(aspectmode="data"),
+        template="plotly_dark",
+        paper_bgcolor="#0b1020",
+        font=dict(color="#9ab"),
+    )
+    print(f"pcviz plotly: {n0:,} points (max_points={int(max_points)}) → {ttl}")
+    fig.show()
+    return fig
+
+
 try:
     from IPython.core.magic import register_line_magic
 
@@ -375,6 +539,52 @@ except Exception:
     pass
 
 _craft_keep_local("%pointcloud")
+
+
+try:
+    from IPython.core.magic import register_line_magic
+
+    @register_line_magic
+    def pointcloud_plotly(line):
+        """Portable LiDAR view via Plotly Scatter3d (works with sslive export).
+
+        Usage:
+          %pointcloud_plotly /home/gpudev/.../scan.pcd.bin
+          %pointcloud_plotly PATH max_points=60000 stride=5 color=height size=1.5
+        """
+        _craft_keep_local("%pointcloud_plotly")
+        parts = shlex.split(line)
+
+        if not parts:
+            raise ValueError(
+                "usage: %pointcloud_plotly <path> [stride=N] [color=height|intensity|mono] "
+                "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [opacity=F] "
+                "[height=N] [title=...]"
+            )
+
+        path, kw = parts[0], {}
+
+        for tok in parts[1:]:
+            k, _, v = tok.partition("=")
+
+            if k in ("stride", "icol", "sub", "max_points", "height"):
+                kw[k] = int(v)
+            elif k in ("size", "opacity"):
+                kw[k] = float(v)
+            elif k == "remote":
+                kw[k] = v.lower() in ("1", "true", "yes")
+            elif k in ("color", "title", "name"):
+                # name accepted as alias for title
+                kw["title" if k == "name" else k] = v
+            else:
+                raise ValueError(f"unknown option {tok!r}")
+
+        return point_cloud_plotly(path, **kw)
+
+except Exception:
+    pass
+
+_craft_keep_local("%pointcloud_plotly")
 
 
 try:
