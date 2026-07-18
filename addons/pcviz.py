@@ -603,6 +603,200 @@ def point_cloud_plotly(
     return None
 
 
+# Self-contained Three.js embed — portable for sslive export (no server).
+# Positions quantized to uint16 per axis (sub-mm on lidar scenes): ~640 KB
+# base64 at 80k points vs ~3 MB of Plotly JSON (over sslive's 1.8 MB cap).
+_EMBED_DOC = """<!doctype html>
+<html><head><meta charset="utf-8">
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"}}</script>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#0b1020;color:#9ab}</style>
+</head><body>
+<div id="pcviz-status" style="position:absolute;z-index:2;left:12px;top:12px;font:13px/1.4 system-ui,sans-serif">Loading…</div>
+<div id="scene" style="width:100vw;height:100vh"></div>
+<script type="text/plain" id="pcviz-pos">__POS_B64__</script>
+<script type="text/plain" id="pcviz-int">__INT_B64__</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const META = __META__;
+const el = document.getElementById('scene');
+const status = document.getElementById('pcviz-status');
+function setStatus(t) { if (status) status.textContent = t || ''; }
+
+function u16(id) {
+  const node = document.getElementById(id);
+  const b64 = node ? node.textContent.trim() : '';
+  if (!b64) return null;
+  const s = atob(b64);
+  const a = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+  return new Uint16Array(a.buffer);
+}
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+const camera = new THREE.PerspectiveCamera(
+  60, Math.max(el.clientWidth, 1) / Math.max(el.clientHeight, 1), 0.1, 5000);
+camera.up.set(0, 0, 1);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(el.clientWidth, el.clientHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+el.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const q = u16('pcviz-pos');
+const n = META.n;
+const positions = new Float32Array(n * 3);
+for (let i = 0; i < n * 3; i += 3) {
+  positions[i] = META.mins[0] + (q[i] / 65535) * META.scale[0];
+  positions[i + 1] = META.mins[1] + (q[i + 1] / 65535) * META.scale[1];
+  positions[i + 2] = META.mins[2] + (q[i + 2] / 65535) * META.scale[2];
+}
+const qi = u16('pcviz-int');
+
+let scal = null;
+if (META.cmode === 'height') scal = (i) => positions[i * 3 + 2];
+else if (META.cmode === 'intensity' && qi) scal = (i) => qi[i];
+
+const colors = new Float32Array(n * 3);
+const c = new THREE.Color();
+if (scal && n > 0) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) { const v = scal(i); if (v < lo) lo = v; if (v > hi) hi = v; }
+  for (let i = 0; i < n; i++) {
+    const t = (scal(i) - lo) / (hi - lo + 1e-6);
+    c.setHSL((1 - t) * 0.66, 1.0, 0.5);
+    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+  }
+} else {
+  colors.fill(0.8);
+}
+
+setStatus(n.toLocaleString() + ' points');
+setTimeout(() => setStatus(''), 2500);
+
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geo.computeBoundingSphere();
+scene.add(new THREE.Points(geo, new THREE.PointsMaterial({
+  size: META.size, vertexColors: true, sizeAttenuation: true })));
+scene.add(new THREE.AxesHelper(5));
+
+const sphere = geo.boundingSphere || { radius: 1, center: new THREE.Vector3() };
+const r = Math.max(sphere.radius || 1, 1e-3);
+const ctr = sphere.center;
+camera.position.set(ctr.x, ctr.y - r * 1.4, ctr.z + r * 0.8);
+camera.far = r * 20;
+camera.updateProjectionMatrix();
+controls.target.copy(ctr);
+controls.update();
+
+function onResize() {
+  const w = Math.max(el.clientWidth, 1);
+  const h = Math.max(el.clientHeight, 1);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(onResize).observe(el);
+else addEventListener('resize', onResize);
+
+(function loop() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body></html>"""
+
+
+def point_cloud_embed(
+    src,
+    *,
+    stride=5,
+    size=0.06,
+    color="height",
+    icol=3,
+    remote=True,
+    sub=1,
+    max_points=None,
+    height="600px",
+    title=None,
+):
+    """Self-contained Three.js viewer (no server) — portable for sslive export.
+
+    Same loading pattern as ``point_cloud`` / ``point_cloud_plotly``, but the
+    output is one iframe whose srcdoc carries the viewer + quantized points, so
+    it survives ``%sslive_export`` and works anywhere with internet (three.js
+    from CDN). ~640 KB at 80k points; default ``max_points`` matches plotly's.
+    """
+    import base64
+    import html as _htmlesc
+
+    from IPython.display import HTML as _IPyHTML, display as _display
+
+    if max_points is None:
+        max_points = _DEFAULT_PLOTLY_MAX_POINTS
+
+    arr = _load_points_array(
+        src, stride=stride, sub=sub, max_points=max_points, remote=remote
+    )
+    n = int(arr.shape[0])
+    xyz = np.ascontiguousarray(arr[:, :3], dtype=np.float32)
+    mins = xyz.min(axis=0)
+    scale = xyz.max(axis=0) - mins
+    scale = np.where(scale > 0, scale, np.float32(1.0))
+    q = np.round((xyz - mins) / scale * 65535.0).astype("<u2")
+    pos_b64 = base64.b64encode(q.tobytes()).decode("ascii")
+
+    cmode = (color or "height").lower()
+    int_b64 = ""
+    if cmode == "intensity" and arr.shape[1] > int(icol):
+        iv = np.ascontiguousarray(arr[:, int(icol)], dtype=np.float32)
+        imin = iv.min()
+        iscale = iv.max() - imin
+        iscale = iscale if iscale > 0 else np.float32(1.0)
+        qi = np.round((iv - imin) / iscale * 65535.0).astype("<u2")
+        # Color ramp normalizes lo/hi itself, so quantized order is all it needs.
+        int_b64 = base64.b64encode(qi.tobytes()).decode("ascii")
+
+    meta = json.dumps(
+        {
+            "n": n,
+            "mins": [float(v) for v in mins],
+            "scale": [float(v) for v in scale],
+            "size": float(size),
+            "cmode": cmode,
+        },
+        separators=(",", ":"),
+    )
+    doc = (
+        _EMBED_DOC.replace("__META__", meta)
+        .replace("__POS_B64__", pos_b64)
+        .replace("__INT_B64__", int_b64)
+    )
+
+    ttl = title or (_slug(src) if not isinstance(src, np.ndarray) else "point cloud")
+    h_css = height if isinstance(height, str) else f"{int(height)}px"
+    iframe = (
+        f'<iframe srcdoc="{_htmlesc.escape(doc, quote=True)}" '
+        f'style="width:100%;height:{h_css};border:0;border-radius:6px;'
+        f'background:#0b1020" title="{_htmlesc.escape(str(ttl))}"></iframe>'
+    )
+    kb = len(iframe) // 1024
+    print(f"pcviz embed: {n:,} points → {kb:,} KB portable HTML ({ttl})")
+    if kb > 1500:
+        print(
+            f"pcviz embed: warning — {kb:,} KB may exceed sslive's in-slide cap "
+            "(~1.8 MB); lower max_points"
+        )
+    _display(_IPyHTML(iframe))
+    return None
+
+
 # Hide-from-AI (same mechanism as sslive): mark the calling cell skipped=1
 # (red eye) so viewer HTML — especially plotly's embedded point JSON — stays
 # out of LLM context. The output remains visible in the dialog.
@@ -771,10 +965,10 @@ try:
             raise ValueError(
                 "usage: %pointcloud <path> [stride=N] [color=height|intensity|mono] "
                 "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [name=...] "
-                "[hide=0|1]"
+                "[hide=0|1] [embed=0|1]"
             )
 
-        path, kw, hide = parts[0], {}, True
+        path, kw, hide, embed = parts[0], {}, True, False
 
         for tok in parts[1:]:
             k, _, v = tok.partition("=")
@@ -787,13 +981,18 @@ try:
                 kw[k] = v.lower() in ("1", "true", "yes")
             elif k == "hide":
                 hide = v.lower() in ("1", "true", "yes")
+            elif k == "embed":
+                embed = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 kw[k] = v
             else:
                 raise ValueError(f"unknown option {tok!r}")
 
         mid = _find_caller_msg_id() if hide else None
-        out = point_cloud(path, **kw)
+        if embed:
+            out = point_cloud_embed(path, title=kw.pop("name", None), **kw)
+        else:
+            out = point_cloud(path, **kw)
         if hide:
             _hide_caller_from_ai(mid)
         return out
@@ -883,13 +1082,14 @@ try:
         if not parts:
             raise ValueError(
                 "usage: %pointcloud_var <expr> [sub=N] [max_points=N] [color=...] "
-                "[size=F] [icol=N] [name=...] [hide=0|1]"
+                "[size=F] [icol=N] [name=...] [hide=0|1] [embed=0|1]"
             )
 
         expr = parts[0]
         sub = 1
-        max_points = _DEFAULT_MAX_POINTS
+        max_points = None
         hide = True
+        embed = False
         opts = dict(color="height", size=0.06, icol=3, name=None)
 
         for tok in parts[1:]:
@@ -905,10 +1105,15 @@ try:
                 opts["icol"] = int(v)
             elif k == "hide":
                 hide = v.lower() in ("1", "true", "yes")
+            elif k == "embed":
+                embed = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 opts[k] = v
             else:
                 raise ValueError(f"unknown option: {tok}")
+
+        if max_points is None:
+            max_points = _DEFAULT_PLOTLY_MAX_POINTS if embed else _DEFAULT_MAX_POINTS
 
         opts["name"] = opts["name"] or expr
         mid = _find_caller_msg_id() if hide else None
@@ -941,19 +1146,36 @@ print(json.dumps({{"shape": list(_arr.shape), "path": {remote_path!r}, "sub": _s
             _rm_remote(remote_path)
             raise RuntimeError(f"remote snapshot failed:\n{out}")
 
-        try:
-            out = pc(
-                meta["path"],
-                remote=True,
-                stride=meta["shape"][1],
-                sub=1,  # already thinned on GPU
-                max_points=0,  # do not thin again when streaming
-                cleanup=True,  # delete /tmp/pcviz_*.bin after stream
-                **opts,
-            )
-        except Exception:
-            _rm_remote(remote_path)
-            raise
+        if embed:
+            try:
+                out = point_cloud_embed(
+                    meta["path"],
+                    remote=True,
+                    stride=meta["shape"][1],
+                    sub=1,  # already thinned on GPU
+                    max_points=0,  # do not thin again
+                    color=opts["color"],
+                    size=opts["size"],
+                    icol=opts["icol"],
+                    title=opts["name"],
+                )
+            finally:
+                # Embed reads the snapshot once — the temp is done either way.
+                _rm_remote(remote_path)
+        else:
+            try:
+                out = pc(
+                    meta["path"],
+                    remote=True,
+                    stride=meta["shape"][1],
+                    sub=1,  # already thinned on GPU
+                    max_points=0,  # do not thin again when streaming
+                    cleanup=True,  # delete /tmp/pcviz_*.bin after stream
+                    **opts,
+                )
+            except Exception:
+                _rm_remote(remote_path)
+                raise
         if hide:
             _hide_caller_from_ai(mid)
         return out

@@ -21,6 +21,12 @@ The pcviz magics mark their own cell hidden-from-AI (`skipped=1`, red eye)
 after rendering — viewer HTML, especially plotly's embedded point data, can be
 megabytes of LLM context. Pass `hide=0` to keep a cell visible to the AI.
 
+For slides, prefer `embed=1` (`%pointcloud` / `%pointcloud_var`): a
+self-contained Three.js viewer with uint16-quantized points that survives
+`%sslive_export` — ~640 KB at 80k points vs ~3 MB of Plotly JSON (which is
+over sslive's 1.8 MB in-slide cap). Needs internet at view time (CDN three.js),
+same as the live viewer.
+
 ## Addon contract
 
 An addon must register its **entire public surface itself** via `get_ipython()`:
