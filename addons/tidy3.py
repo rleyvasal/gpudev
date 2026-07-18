@@ -1,10 +1,13 @@
 # tidy3 addon entry — separate repo, linked under addons/tidy3/
 #
 #   %local
-#   %run /path/to/gpudev/addons/tidy3.py
+#   %run /path/to/gpudev/CRAFT.py
+#   %gpu
+#   %run /path/to/gpudev/addons/tidy3.py   # load ON remote under %gpu for big data
 #
-# Or point at a clone elsewhere:
-#   %run /path/to/tidy3/...  (after pip install -e)
+# Or standalone (no CRAFT):
+#   %run /path/to/gpudev/addons/tidy3.py
+#   pip install -e /path/to/tidy3
 
 from __future__ import annotations
 
@@ -22,7 +25,6 @@ _CANDIDATES = [
 
 _root = next((p for p in _CANDIDATES if (p / "src" / "tidy3").is_dir() or (p / "tidy3").is_dir()), None)
 if _root is None:
-    # Fall back to already-installed package
     try:
         import tidy3  # noqa: F401
     except ImportError as e:
@@ -71,10 +73,6 @@ from tidy3 import (  # noqa: E402
     options,
     partial_run,
     peek,
-    remote,
-    remote_bind,
-    remote_collect,
-    remote_status,
     rename,
     sample_frac,
     sample_n,
@@ -131,10 +129,6 @@ _PUBLIC = {
     "collect": collect,
     "peek": peek,
     "partial_run": partial_run,
-    "remote": remote,
-    "remote_bind": remote_bind,
-    "remote_collect": remote_collect,
-    "remote_status": remote_status,
     "options": options,
     "tidy3": tidy3,
 }
@@ -145,10 +139,10 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
     try:
         ip.run_line_magic("load_ext", "tidy3.jupyter")
     except Exception:
-        pass  # IPython magics optional
+        pass
 
-print(f"CRAFT: tidy3 {tidy3.__version__} loaded (Jupyter/SolveIt + CRAFT remote)")
-print("  Local:  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
-print("  Partial: Run Selected Text on a prefix, or %%tidy3_run  (or own cell)")
-print("  Remote: %%tidy3_remote / remote(\"\"\"scan_parquet('/path/on/gpu/...')\"\"\")")
+print(f"CRAFT: tidy3 {tidy3.__version__} loaded")
+print("  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
+print("  Large data: %gpu then scan_parquet('/path/on/gpu/host/...') as usual")
+print("  Partial: Run Selected Text on a prefix, or %%tidy3_run / own cell")
 print("  %tidy3_pipes on|off")
