@@ -1,13 +1,14 @@
 # tidy3 addon entry — separate repo, linked under addons/tidy3/
 #
+# Same pattern as pcviz / mojo / sslive:
+#
 #   %local
 #   %run /path/to/gpudev/CRAFT.py
-#   %gpu
-#   %run /path/to/gpudev/addons/tidy3.py   # load ON remote under %gpu for big data
-#
-# Or standalone (no CRAFT):
 #   %run /path/to/gpudev/addons/tidy3.py
-#   pip install -e /path/to/tidy3
+#   %gpu
+#
+# Under %gpu, cells run on the remote kernel (paths are remote paths).
+# Ensure tidy3 is importable there (shared clone / pip on the host image).
 
 from __future__ import annotations
 
@@ -143,6 +144,6 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
 
 print(f"CRAFT: tidy3 {tidy3.__version__} loaded")
 print("  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
-print("  Large data: %gpu then scan_parquet('/path/on/gpu/host/...') as usual")
+print("  After %gpu: cells run remote — use host paths in scan_parquet(...), etc.")
 print("  Partial: Run Selected Text on a prefix, or %%tidy3_run / own cell")
 print("  %tidy3_pipes on|off")

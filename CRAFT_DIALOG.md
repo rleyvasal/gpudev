@@ -18,7 +18,7 @@ gpudev/
 %gpu
 ```
 
-## Optional addons
+## Optional addons (all under `%local`, same as core)
 
 ```text
 %local

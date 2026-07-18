@@ -9,7 +9,7 @@ Optional tools loaded with the **same pattern as core**:
 %run /path/to/gpudev/addons/mojo.py        # Mojo (in-tree)
 %run /path/to/gpudev/addons/sslive.py      # slides → linked sslive repo
 %run /path/to/gpudev/addons/tidy3.py       # dplyr prep → linked tidy3 repo
-%gpu
+%gpu                                       # then cells run on remote
 ```
 
 | Addon | In gpudev | Full code | Provides |
