@@ -25,6 +25,7 @@ def _inject_installers_into_user_ns() -> None:
     ns["install_pcviz"] = install_pcviz
     ns["install_sslive"] = install_sslive
     ns["install_mojo"] = install_mojo
+    ns["install_plot3"] = install_plot3
 
 
 def install_core(*, quiet: bool = False) -> bool:
@@ -89,6 +90,22 @@ def install_mojo(path: str | Path | None = None, *, quiet: bool = False) -> bool
     ok = _run_addon_script(p, label="mojo")
     if ok and not quiet:
         print("  %gpum  %restart_mojo  %mojo_*  %bench")
+    return ok
+
+
+def install_plot3(path: str | Path | None = None, *, quiet: bool = False) -> bool:
+    """Load plot3 — prefer ``%local`` + ``%run …/addons/plot3.py``."""
+    # The wrapper owns the candidate list for locating the plot3 repo and
+    # prints the resolved path + API names itself.
+    p = Path(path) if path else _ADDONS / "plot3.py"
+    ok = _run_addon_script(p, label="plot3")
+    if not ok and not quiet:
+        print(
+            "  Tip:\n"
+            "    %local\n"
+            "    %run /path/to/gpudev/addons/plot3.py\n"
+            "  or clone https://github.com/rleyvasal/plot3 next to gpudev"
+        )
     return ok
 
 

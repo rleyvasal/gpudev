@@ -8,6 +8,7 @@ from .magics import (
     install_core,
     install_mojo,
     install_pcviz,
+    install_plot3,
     install_sslive,
     install,
 )
@@ -18,4 +19,5 @@ __all__ = [
     "install_pcviz",
     "install_sslive",
     "install_mojo",
+    "install_plot3",
 ]

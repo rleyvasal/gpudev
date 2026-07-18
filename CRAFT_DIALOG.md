@@ -38,6 +38,7 @@ gpudev/
 | pcviz | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | mojo | `%gpum` `%mojo_*` `%bench` |
 | sslive | `%sslive` `%sslive_export` |
+| plot3 | `%plot3` + `ggplot(df, aes(...))` grammar (separate repo, linked) |
 
 ## sslive as separate repo
 

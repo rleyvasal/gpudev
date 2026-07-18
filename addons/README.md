@@ -16,6 +16,7 @@ Optional tools loaded with the **same pattern as core**:
 | **pcviz** | `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | **mojo** | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
 | **sslive** | `addons/sslive.py` → linked repo | `%sslive` `%sslive_export` |
+| **plot3** | `addons/plot3.py` → linked repo | `%plot3` + `ggplot()` grammar (2D/3D DataFrame plots) |
 
 The pcviz magics mark their own cell hidden-from-AI (`skipped=1`, red eye)
 after rendering — viewer HTML, especially plotly's embedded point data, can be
