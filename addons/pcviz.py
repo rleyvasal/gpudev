@@ -642,27 +642,96 @@ def _find_caller_msg_id():
     return None
 
 
+def _note_hide_err(msg):
+    """Surface hide failures (user_ns + print) instead of failing silently."""
+    try:
+        ip = get_ipython()
+        if ip is not None and isinstance(getattr(ip, "user_ns", None), dict):
+            ip.user_ns["_pcviz_hide_err"] = str(msg)
+    except Exception:
+        pass
+    try:
+        print(f"pcviz: hide-from-ai failed — {msg} (pass hide=0 to silence)")
+    except Exception:
+        pass
+
+
+async def _read_current_msg_id():
+    """dialoghelper-native current message (works where __msg_id probes don't)."""
+    import inspect
+
+    try:
+        from dialoghelper.core import read_msg
+
+        msg = read_msg(n=0, relative=True)
+        if inspect.iscoroutine(msg):
+            msg = await msg
+        mid = msg.get("id") if isinstance(msg, dict) else getattr(msg, "id", None)
+        return str(mid) if mid else None
+    except Exception:
+        return None
+
+
+async def _find_pointcloud_cell_id():
+    """Last resort: newest code cell whose content matches %pointcloud."""
+    import inspect
+
+    try:
+        from dialoghelper.core import find_msgs
+
+        msgs = find_msgs(
+            msg_type="code",
+            re_pattern=r"%pointcloud",
+            include_output=False,
+            include_meta=True,
+            include_skipped=True,
+            use_regex=True,
+        )
+        if inspect.iscoroutine(msgs):
+            msgs = await msgs
+        best = None
+        for m in msgs or []:
+            mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", None)
+            if mid:
+                best = mid
+        return str(best) if best else None
+    except Exception:
+        return None
+
+
 def _hide_caller_from_ai(mid=None):
-    """Best-effort ``skipped=1`` on the calling cell; no-op outside SolveIt."""
+    """Best-effort ``skipped=1`` on the calling cell; no-op outside SolveIt.
+
+    Runs synchronously inside the magic — while this cell is still the
+    *current* message — via the same nest_asyncio pattern as sslive's runner.
+    """
     try:
         from dialoghelper.core import update_msg
     except Exception:
         return
-    mid = mid or _find_caller_msg_id()
-    if not mid:
-        return
 
-    async def _skip():
+    async def _run():
         import inspect
 
-        for m in (mid, mid[1:] if mid.startswith("_") else "_" + mid):
+        m = mid or _find_caller_msg_id()
+        if not m:
+            m = await _read_current_msg_id()
+        if not m:
+            m = await _find_pointcloud_cell_id()
+        if not m:
+            _note_hide_err("could not resolve this cell's msg id")
+            return
+        m = str(m)
+        err = None
+        for cand in (m, m[1:] if m.startswith("_") else "_" + m):
             try:
-                res = update_msg(id=m, skipped=1)
+                res = update_msg(id=cand, skipped=1)
                 if inspect.iscoroutine(res):
                     await res
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                err = e
+        _note_hide_err(f"update_msg({m}): {err}")
 
     try:
         import asyncio
@@ -671,13 +740,22 @@ def _hide_caller_from_ai(mid=None):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
-            # Fire-and-forget: lands right after the cell finishes rendering.
-            loop.create_task(_skip())
-        else:
-            asyncio.run(_skip())
-    except Exception:
-        pass
+        if loop is None:
+            asyncio.run(_run())
+            return
+        try:
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            loop.run_until_complete(_run())
+        except Exception:
+            # Fallback: fresh loop in a worker thread (sslive's pattern)
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(lambda: asyncio.run(_run())).result()
+    except Exception as e:
+        _note_hide_err(e)
 
 
 try:
