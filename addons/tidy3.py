@@ -70,6 +70,11 @@ from tidy3 import (  # noqa: E402
     n,
     options,
     partial_run,
+    peek,
+    remote,
+    remote_bind,
+    remote_collect,
+    remote_status,
     rename,
     sample_frac,
     sample_n,
@@ -124,7 +129,12 @@ _PUBLIC = {
     "left_join": left_join,
     "inner_join": inner_join,
     "collect": collect,
+    "peek": peek,
     "partial_run": partial_run,
+    "remote": remote,
+    "remote_bind": remote_bind,
+    "remote_collect": remote_collect,
+    "remote_status": remote_status,
     "options": options,
     "tidy3": tidy3,
 }
@@ -137,7 +147,8 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
     except Exception:
         pass  # IPython magics optional
 
-print(f"CRAFT: tidy3 {tidy3.__version__} loaded (Jupyter/SolveIt kernel integration)")
-print("  tidy(df) >> filter(col('x') > 0) >> mutate(...)   # multi-line >> auto-rewritten")
-print("  Partial run: put a pipe prefix in a cell and run it, or %%tidy3_run")
-print("  %tidy3_pipes on|off   # toggle auto-rewrite of multi-line >> pipes")
+print(f"CRAFT: tidy3 {tidy3.__version__} loaded (Jupyter/SolveIt + CRAFT remote)")
+print("  Local:  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
+print("  Partial: Run Selected Text on a prefix, or %%tidy3_run  (or own cell)")
+print("  Remote: %%tidy3_remote / remote(\"\"\"scan_parquet('/path/on/gpu/...')\"\"\")")
+print("  %tidy3_pipes on|off")
