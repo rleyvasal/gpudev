@@ -8,7 +8,6 @@ from pathlib import Path
 
 _GPUDEV_ROOT = Path(__file__).resolve().parent.parent
 _ADDONS = _GPUDEV_ROOT / "addons"
-_WORKSPACE = _GPUDEV_ROOT.parent
 
 
 def _inject_installers_into_user_ns() -> None:
@@ -95,21 +94,11 @@ def install_mojo(path: str | Path | None = None, *, quiet: bool = False) -> bool
 
 def install_sslive(path: str | Path | None = None, *, quiet: bool = False) -> bool:
     """Load sslive — prefer ``%local`` + ``%run …/addons/sslive.py``."""
-    if path is not None:
-        candidates = [Path(path)]
-    else:
-        candidates = [
-            _ADDONS / "sslive.py",  # wrapper
-            _ADDONS / "sslive" / "sslive.py",  # linked repo
-            _WORKSPACE / "sslive" / "sslive.py",
-            Path("/app/data/sslive/sslive.py"),
-            Path.home() / "sslive" / "sslive.py",
-        ]
-    p = next((c.expanduser() for c in candidates if c.expanduser().is_file()), candidates[0])
+    # The wrapper owns the candidate list for locating the sslive repo and
+    # prints the resolved path + magic names itself.
+    p = Path(path) if path else _ADDONS / "sslive.py"
     ok = _run_addon_script(p, label="sslive")
-    if ok and not quiet:
-        print("  %sslive  %sslive_export")
-    elif not ok and not quiet:
+    if not ok and not quiet:
         print(
             "  Tip:\n"
             "    %local\n"
