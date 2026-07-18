@@ -12,13 +12,10 @@ gpudev/
   CRAFT.py                 # short %run entry (core only)
   CRAFT_DIALOG.md
   gpudev_craft/            # core package (GPU connect only)
-    core.py
-    magics.py
   addons/                  # optional tools (%local + %run)
-    pcviz.py
-    mojo.py                # full Mojo addon (single file)
-    sslive.py              # entry → linked sslive repo
-    sslive/ → …            # symlink or submodule (separate repo)
+    pcviz.py, mojo.py      # in-tree
+    sslive.py + sslive/    # thin loader + link → separate sslive repo
+    tidy3.py  + tidy3/     # thin loader + link → separate tidy3 repo
     README.md
 ```
 
@@ -28,6 +25,7 @@ gpudev/
 %run /path/to/gpudev/addons/pcviz.py
 %run /path/to/gpudev/addons/mojo.py
 %run /path/to/gpudev/addons/sslive.py
+%run /path/to/gpudev/addons/tidy3.py
 %gpu
 %sslive
 ```
@@ -37,7 +35,10 @@ gpudev/
 | `CRAFT.py` | `%gpu` `%local` `%kernel_status` `remote_run_` |
 | `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
-| `addons/sslive.py` | `%sslive` `%sslive_export` (needs sslive linked) |
+| `addons/sslive.py` | `%sslive` `%sslive_export` (link `addons/sslive` → sslive clone) |
+| `addons/tidy3.py` | `tidy` / `>>` / `%%tidy3_run` (link `addons/tidy3` → [tidy3](https://github.com/rleyvasal/tidy3)) |
+
+**plot3** is not a gpudev addon — clone [rleyvasal/plot3](https://github.com/rleyvasal/plot3) and `%run /path/to/plot3/plot3.py`.
 
 Always **`%local` + `%run`**. Mark the CRAFT cell **skipped** after a stable load.
 

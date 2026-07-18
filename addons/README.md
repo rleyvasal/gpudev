@@ -5,30 +5,75 @@ Optional tools loaded with the **same pattern as core**:
 ```text
 %local
 %run /path/to/gpudev/CRAFT.py              # core (required first for GPU)
-%run /path/to/gpudev/addons/pcviz.py       # point clouds
-%run /path/to/gpudev/addons/mojo.py        # Mojo language
-%run /path/to/gpudev/addons/sslive.py      # slides (wraps separate sslive repo)
+%run /path/to/gpudev/addons/pcviz.py       # point clouds (in-tree)
+%run /path/to/gpudev/addons/mojo.py        # Mojo (in-tree)
+%run /path/to/gpudev/addons/sslive.py      # slides → linked sslive repo
+%run /path/to/gpudev/addons/tidy3.py       # dplyr prep → linked tidy3 repo
 %gpu
 ```
 
-| Addon | Path | Provides |
-|-------|------|----------|
-| **pcviz** | `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
-| **mojo** | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
-| **sslive** | `addons/sslive.py` → linked repo | `%sslive` `%sslive_export` |
-| **plot3** | `addons/plot3.py` → linked repo | `%plot3` + `ggplot()` grammar (2D/3D DataFrame plots) |
+| Addon | In gpudev | Full code | Provides |
+|-------|-----------|-----------|----------|
+| **pcviz** | `addons/pcviz.py` | this repo | `%pointcloud` … |
+| **mojo** | `addons/mojo.py` | this repo | `%gpum` `%mojo_*` … |
+| **sslive** | `addons/sslive.py` (thin) + `addons/sslive` → link | [sslive repo](https://github.com/rleyvasal/sslive) | `%sslive` … |
+| **tidy3** | `addons/tidy3.py` (thin) + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run` |
 
-The pcviz magics mark their own cell hidden-from-AI (`skipped=1`, red eye)
-after rendering — viewer HTML, especially plotly's embedded point data, can be
-megabytes of LLM context. Pass `hide=0` to keep a cell visible to the AI.
+**plot3** is **not** under gpudev addons. It is only [rleyvasal/plot3](https://github.com/rleyvasal/plot3):
 
-For slides, prefer `embed=1` (`%pointcloud` / `%pointcloud_var`): a
-self-contained Three.js viewer with uint16-quantized points that survives
-`%sslive_export` — vs ~3 MB of Plotly JSON at 80k points (over sslive's
-1.8 MB in-slide cap). The payload is delta+byte-shuffle+gzip compressed by
-default (browser `DecompressionStream`; `gzip=0` for raw), roughly 300-500 KB
-at 80k points depending on scan structure. Needs internet at view time
-(CDN three.js), same as the live viewer.
+```text
+%run /path/to/plot3/plot3.py
+```
+
+## Linking separate repos (recommended)
+
+gpudev does **not** vendor full addon code for external projects. Keep a thin
+`*.py` loader in `addons/` and point a **symlink** (or git submodule) at a
+clone of the real repo.
+
+### Side-by-side clones (simple)
+
+```text
+/app/data/gpudevd/
+  gpudev/          # this repo
+  tidy3/           # https://github.com/rleyvasal/tidy3
+  sslive/          # https://github.com/rleyvasal/sslive
+  plot3/           # https://github.com/rleyvasal/plot3  (load directly)
+```
+
+```bash
+cd /path/to/gpudev/addons
+ln -sfn ../../tidy3 tidy3     # or absolute path to your tidy3 clone
+ln -sfn ../../sslive sslive
+```
+
+Loaders also search sibling directories without a symlink (e.g. `../tidy3`
+next to `gpudev/`).
+
+### Git submodules (optional, clone-friendly)
+
+```bash
+cd /path/to/gpudev
+git submodule add https://github.com/rleyvasal/tidy3.git addons/tidy3
+git submodule add https://github.com/rleyvasal/sslive.git addons/sslive
+# later: git clone --recurse-submodules <gpudev-url>
+```
+
+Symlinks work better when every machine already has sibling checkouts;
+submodules work better when you want one `git clone` to pull everything.
+
+### Standalone (no gpudev)
+
+```bash
+pip install -e /path/to/tidy3
+# notebook:
+%load_ext tidy3.jupyter
+```
+
+```text
+%run /path/to/plot3/plot3.py
+%run /path/to/sslive/sslive.py
+```
 
 ## Addon contract
 
@@ -36,39 +81,9 @@ An addon must register its **entire public surface itself** via `get_ipython()`:
 
 - magics through the magics manager, plus `register_local_magic('%name')` so
   they run on the host under `%gpu`;
-- any names meant for direct cell use written explicitly into `user_ns`
-  (see mojo's handle injection, sslive's `_inject_public_api_into_user_ns`,
-  pcviz's `_publish_srv`).
+- any names meant for direct cell use written explicitly into `user_ns`.
 
-Never rely on `%run` leaking module globals into the dialog namespace: the
-`install_*()` loaders run addons through `runpy` and discard the module
-namespace, so anything not explicitly registered does not exist there — and
-even under `%run`, leaked globals are a stale snapshot from load time, not
-live state.
-
-## Separate repos
-
-**sslive** stays its own repository. In this tree it is linked for convenience:
-
-```text
-addons/sslive -> /path/to/sslive   # git submodule or symlink
-```
-
-If the link is missing, either:
-
-```bash
-cd /path/to/gpudev/addons
-ln -s /path/to/sslive sslive
-# or: git submodule add <sslive-url> addons/sslive
-```
-
-or run the real file directly:
-
-```text
-%run /path/to/sslive/sslive.py
-```
-
-**pcviz** currently lives in this repo under `addons/pcviz.py` (can move to its own repo later the same way as sslive).
+Never rely on `%run` leaking module globals into the dialog namespace.
 
 ## Order
 

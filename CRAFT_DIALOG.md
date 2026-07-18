@@ -2,13 +2,12 @@
 
 ```text
 gpudev/
-  CRAFT.py                 # tiny core loader
-  gpudev_craft/            # implementation package
+  CRAFT.py
+  gpudev_craft/
   addons/
-    pcviz.py               # point clouds
-    mojo.py                # Mojo language
-    sslive.py              # wrapper → linked sslive repo
-    sslive/ → …/sslive     # symlink or git submodule (separate repo)
+    pcviz.py, mojo.py          # in-tree
+    sslive.py + sslive/ → …    # thin loader + linked separate repo
+    tidy3.py  + tidy3/  → …    # thin loader + linked separate repo
 ```
 
 ## Always (core)
@@ -19,13 +18,14 @@ gpudev/
 %gpu
 ```
 
-## Optional addons (same pattern)
+## Optional addons
 
 ```text
 %local
 %run /app/data/gpudevd/gpudev/addons/pcviz.py
 %run /app/data/gpudevd/gpudev/addons/mojo.py
 %run /app/data/gpudevd/gpudev/addons/sslive.py
+%run /app/data/gpudevd/gpudev/addons/tidy3.py
 %gpu
 %sslive
 ```
@@ -38,18 +38,22 @@ gpudev/
 | pcviz | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | mojo | `%gpum` `%mojo_*` `%bench` |
 | sslive | `%sslive` `%sslive_export` |
-| plot3 | `%plot3` + `ggplot(df, aes(...))` grammar (separate repo, linked) |
+| tidy3 | `tidy` / `>>` verbs, `%%tidy3_run`, `%tidy3_pipes` |
 
-## sslive as separate repo
+## Link separate repos
+
+Side-by-side under e.g. `/app/data/gpudevd/`:
 
 ```bash
-cd /path/to/gpudev/addons
-ln -s /path/to/sslive sslive
-# or: git submodule add <url> addons/sslive
+cd /app/data/gpudevd/gpudev/addons
+ln -sfn /app/data/gpudevd/sslive sslive
+ln -sfn /app/data/gpudevd/tidy3 tidy3
 ```
 
-If unlinked, run the real file:
+Or git submodules (see `addons/README.md`).
+
+**plot3** (own repo only):
 
 ```text
-%run /path/to/sslive/sslive.py
+%run /app/data/gpudevd/plot3/plot3.py
 ```

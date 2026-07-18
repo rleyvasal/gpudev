@@ -25,7 +25,7 @@ def _inject_installers_into_user_ns() -> None:
     ns["install_pcviz"] = install_pcviz
     ns["install_sslive"] = install_sslive
     ns["install_mojo"] = install_mojo
-    ns["install_plot3"] = install_plot3
+    ns["install_tidy3"] = install_tidy3
 
 
 def install_core(*, quiet: bool = False) -> bool:
@@ -93,18 +93,21 @@ def install_mojo(path: str | Path | None = None, *, quiet: bool = False) -> bool
     return ok
 
 
-def install_plot3(path: str | Path | None = None, *, quiet: bool = False) -> bool:
-    """Load plot3 — prefer ``%local`` + ``%run …/addons/plot3.py``."""
-    # The wrapper owns the candidate list for locating the plot3 repo and
-    # prints the resolved path + API names itself.
-    p = Path(path) if path else _ADDONS / "plot3.py"
-    ok = _run_addon_script(p, label="plot3")
+def install_tidy3(path: str | Path | None = None, *, quiet: bool = False) -> bool:
+    """Load tidy3 — prefer ``%local`` + ``%run …/addons/tidy3.py``.
+
+    Full package lives in https://github.com/rleyvasal/tidy3 (linked under
+    ``addons/tidy3`` or installed standalone).
+    """
+    p = Path(path) if path else _ADDONS / "tidy3.py"
+    ok = _run_addon_script(p, label="tidy3")
     if not ok and not quiet:
         print(
             "  Tip:\n"
             "    %local\n"
-            "    %run /path/to/gpudev/addons/plot3.py\n"
-            "  or clone https://github.com/rleyvasal/plot3 next to gpudev"
+            "    %run /path/to/gpudev/addons/tidy3.py\n"
+            "  link: ln -s /path/to/tidy3 addons/tidy3\n"
+            "  or:   pip install -e /path/to/tidy3"
         )
     return ok
 
