@@ -279,7 +279,9 @@ def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
     if not CLIENT_NAME or not _CLIENT_NAME_RE.fullmatch(CLIENT_NAME):
         raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
 
-    wrapped = f"GPUDEV_CLIENT={CLIENT_NAME} {cmd}"
+    # Use ``export …; cmd`` so compound scripts (if/then, &&) work.
+    # ``GPUDEV_CLIENT=x if …`` is a bash syntax error (Mojo pixi seed path).
+    wrapped = f"export GPUDEV_CLIENT={CLIENT_NAME}; {cmd}"
     # Always capture so we can detect host-key errors; re-emit stdout when the
     # caller did not ask for capture.
     result = subprocess.run(
@@ -321,8 +323,12 @@ def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
     """SSH with stdin payload (Mojo source upload). Host-key auto-clear once."""
     if not SSH_HOST:
         raise RuntimeError("SSH_HOST is empty")
+    if not CLIENT_NAME or not _CLIENT_NAME_RE.fullmatch(CLIENT_NAME):
+        raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
+    # Same export prefix as _ssh (compound remote commands + client env)
+    wrapped = f"export GPUDEV_CLIENT={CLIENT_NAME}; {remote_cmd}"
     result = subprocess.run(
-        ["ssh", *SSH_OPT_LIST, SSH_HOST, remote_cmd],
+        ["ssh", *SSH_OPT_LIST, SSH_HOST, wrapped],
         input=input_text,
         text=True,
         check=False,
@@ -340,7 +346,7 @@ def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode,
-            ["ssh", SSH_HOST, remote_cmd],
+            ["ssh", SSH_HOST, wrapped],
             output=result.stdout,
             stderr=result.stderr,
         )
