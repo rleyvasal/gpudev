@@ -23,9 +23,11 @@ megabytes of LLM context. Pass `hide=0` to keep a cell visible to the AI.
 
 For slides, prefer `embed=1` (`%pointcloud` / `%pointcloud_var`): a
 self-contained Three.js viewer with uint16-quantized points that survives
-`%sslive_export` — ~640 KB at 80k points vs ~3 MB of Plotly JSON (which is
-over sslive's 1.8 MB in-slide cap). Needs internet at view time (CDN three.js),
-same as the live viewer.
+`%sslive_export` — vs ~3 MB of Plotly JSON at 80k points (over sslive's
+1.8 MB in-slide cap). The payload is delta+byte-shuffle+gzip compressed by
+default (browser `DecompressionStream`; `gzip=0` for raw), roughly 300-500 KB
+at 80k points depending on scan structure. Needs internet at view time
+(CDN three.js), same as the live viewer.
 
 ## Addon contract
 

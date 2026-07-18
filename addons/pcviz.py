@@ -624,14 +624,22 @@ const el = document.getElementById('scene');
 const status = document.getElementById('pcviz-status');
 function setStatus(t) { if (status) status.textContent = t || ''; }
 
-function u16(id) {
+async function u16(id) {
   const node = document.getElementById(id);
   const b64 = node ? node.textContent.trim() : '';
   if (!b64) return null;
   const s = atob(b64);
   const a = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
-  return new Uint16Array(a.buffer);
+  if (!META.gz) return new Uint16Array(a.buffer);
+  const ds = new DecompressionStream('gzip');
+  const buf = new Uint8Array(
+    await new Response(new Blob([a]).stream().pipeThrough(ds)).arrayBuffer());
+  // Undo byte-plane shuffle: [all low bytes][all high bytes]
+  const m = buf.length >> 1;
+  const out = new Uint16Array(m);
+  for (let i = 0; i < m; i++) out[i] = buf[i] | (buf[m + i] << 8);
+  return out;
 }
 
 const scene = new THREE.Scene();
@@ -646,15 +654,22 @@ el.appendChild(renderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-const q = u16('pcviz-pos');
+if (META.gz && typeof DecompressionStream === 'undefined') {
+  setStatus('Browser lacks DecompressionStream — re-export with gzip=0');
+  throw new Error('DecompressionStream unavailable');
+}
+const q = await u16('pcviz-pos');
 const n = META.n;
+// gz payloads are column-delta encoded — undo with mod-2^16 running sums
+if (META.gz) for (let i = 3; i < n * 3; i++) q[i] = (q[i] + q[i - 3]) & 0xffff;
 const positions = new Float32Array(n * 3);
 for (let i = 0; i < n * 3; i += 3) {
   positions[i] = META.mins[0] + (q[i] / 65535) * META.scale[0];
   positions[i + 1] = META.mins[1] + (q[i + 1] / 65535) * META.scale[1];
   positions[i + 2] = META.mins[2] + (q[i + 2] / 65535) * META.scale[2];
 }
-const qi = u16('pcviz-int');
+const qi = await u16('pcviz-int');
+if (META.gz && qi) for (let i = 1; i < n; i++) qi[i] = (qi[i] + qi[i - 1]) & 0xffff;
 
 let scal = null;
 if (META.cmode === 'height') scal = (i) => positions[i * 3 + 2];
@@ -725,21 +740,46 @@ def point_cloud_embed(
     max_points=None,
     height="600px",
     title=None,
+    compress=True,
 ):
     """Self-contained Three.js viewer (no server) — portable for sslive export.
 
     Same loading pattern as ``point_cloud`` / ``point_cloud_plotly``, but the
     output is one iframe whose srcdoc carries the viewer + quantized points, so
     it survives ``%sslive_export`` and works anywhere with internet (three.js
-    from CDN). ~640 KB at 80k points; default ``max_points`` matches plotly's.
+    from CDN). Payload is gzipped by default (browser DecompressionStream;
+    ``compress=False`` / magic ``gzip=0`` for very old browsers) — roughly
+    250-350 KB at 80k points; default ``max_points`` matches plotly's.
     """
     import base64
+    import gzip as _gz
     import html as _htmlesc
 
     from IPython.display import HTML as _IPyHTML, display as _display
 
     if max_points is None:
         max_points = _DEFAULT_PLOTLY_MAX_POINTS
+
+    def _delta(a):
+        """Column-wise delta mod 2^16 — scan-ordered points make these tiny,
+        which is what lets gzip actually compress quantized coordinates."""
+        d = a.astype(np.int32)
+        d[1:] = (d[1:] - d[:-1]) % 65536
+        return d.astype("<u2")
+
+    def _pack(a) -> str:
+        if compress:
+            # Delta then byte-plane shuffle (lows first, highs after): the
+            # high-byte plane becomes long constant runs that deflate crushes.
+            d = _delta(a).view(np.uint8).reshape(-1, 2)
+            raw = _gz.compress(
+                np.ascontiguousarray(d[:, 0]).tobytes()
+                + np.ascontiguousarray(d[:, 1]).tobytes(),
+                6,
+            )
+        else:
+            raw = a.tobytes()
+        return base64.b64encode(raw).decode("ascii")
 
     arr = _load_points_array(
         src, stride=stride, sub=sub, max_points=max_points, remote=remote
@@ -750,7 +790,7 @@ def point_cloud_embed(
     scale = xyz.max(axis=0) - mins
     scale = np.where(scale > 0, scale, np.float32(1.0))
     q = np.round((xyz - mins) / scale * 65535.0).astype("<u2")
-    pos_b64 = base64.b64encode(q.tobytes()).decode("ascii")
+    pos_b64 = _pack(q)
 
     cmode = (color or "height").lower()
     int_b64 = ""
@@ -761,7 +801,7 @@ def point_cloud_embed(
         iscale = iscale if iscale > 0 else np.float32(1.0)
         qi = np.round((iv - imin) / iscale * 65535.0).astype("<u2")
         # Color ramp normalizes lo/hi itself, so quantized order is all it needs.
-        int_b64 = base64.b64encode(qi.tobytes()).decode("ascii")
+        int_b64 = _pack(qi)
 
     meta = json.dumps(
         {
@@ -770,6 +810,7 @@ def point_cloud_embed(
             "scale": [float(v) for v in scale],
             "size": float(size),
             "cmode": cmode,
+            "gz": 1 if compress else 0,
         },
         separators=(",", ":"),
     )
@@ -965,10 +1006,10 @@ try:
             raise ValueError(
                 "usage: %pointcloud <path> [stride=N] [color=height|intensity|mono] "
                 "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [name=...] "
-                "[hide=0|1] [embed=0|1]"
+                "[hide=0|1] [embed=0|1] [gzip=0|1]"
             )
 
-        path, kw, hide, embed = parts[0], {}, True, False
+        path, kw, hide, embed, gz = parts[0], {}, True, False, True
 
         for tok in parts[1:]:
             k, _, v = tok.partition("=")
@@ -983,6 +1024,8 @@ try:
                 hide = v.lower() in ("1", "true", "yes")
             elif k == "embed":
                 embed = v.lower() in ("1", "true", "yes")
+            elif k in ("gzip", "compress"):
+                gz = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 kw[k] = v
             else:
@@ -990,7 +1033,9 @@ try:
 
         mid = _find_caller_msg_id() if hide else None
         if embed:
-            out = point_cloud_embed(path, title=kw.pop("name", None), **kw)
+            out = point_cloud_embed(
+                path, title=kw.pop("name", None), compress=gz, **kw
+            )
         else:
             out = point_cloud(path, **kw)
         if hide:
@@ -1082,7 +1127,7 @@ try:
         if not parts:
             raise ValueError(
                 "usage: %pointcloud_var <expr> [sub=N] [max_points=N] [color=...] "
-                "[size=F] [icol=N] [name=...] [hide=0|1] [embed=0|1]"
+                "[size=F] [icol=N] [name=...] [hide=0|1] [embed=0|1] [gzip=0|1]"
             )
 
         expr = parts[0]
@@ -1090,6 +1135,7 @@ try:
         max_points = None
         hide = True
         embed = False
+        gz = True
         opts = dict(color="height", size=0.06, icol=3, name=None)
 
         for tok in parts[1:]:
@@ -1107,6 +1153,8 @@ try:
                 hide = v.lower() in ("1", "true", "yes")
             elif k == "embed":
                 embed = v.lower() in ("1", "true", "yes")
+            elif k in ("gzip", "compress"):
+                gz = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 opts[k] = v
             else:
@@ -1158,6 +1206,7 @@ print(json.dumps({{"shape": list(_arr.shape), "path": {remote_path!r}, "sub": _s
                     size=opts["size"],
                     icol=opts["icol"],
                     title=opts["name"],
+                    compress=gz,
                 )
             finally:
                 # Embed reads the snapshot once — the temp is done either way.
