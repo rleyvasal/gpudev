@@ -16,6 +16,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if __name__ == "tidy3":  # pragma: no cover
+    # %run prepends addons/ to sys.path, so this file can shadow the real
+    # tidy3 package. The path fix below prevents it; fail loudly if it recurs.
+    raise ImportError(
+        "addons/tidy3.py was imported as module 'tidy3' (sys.path shadowing); "
+        "load it with %run — the real package lives in the tidy3 clone"
+    )
+
 _HERE = Path(__file__).resolve().parent
 _CANDIDATES = [
     _HERE / "tidy3",  # symlink: addons/tidy3/ → tidy3 clone
@@ -43,11 +51,13 @@ if _root is None:
         ) from e
 else:
     src = _root / "src"
-    if src.is_dir() and (src / "tidy3").is_dir():
-        if str(src) not in sys.path:
-            sys.path.insert(0, str(src))
-    elif str(_root) not in sys.path:
-        sys.path.insert(0, str(_root))
+    _pkg_dir = str(src if (src / "tidy3").is_dir() else _root)
+    # ALWAYS re-insert at position 0: every %run prepends addons/ to sys.path,
+    # and addons/tidy3.py would shadow the tidy3 package after the purge below
+    # (self-import recursion). Front position must be reclaimed each load.
+    while _pkg_dir in sys.path:
+        sys.path.remove(_pkg_dir)
+    sys.path.insert(0, _pkg_dir)
 
 try:
     from IPython import get_ipython
@@ -220,10 +230,14 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
     ip.user_ns.update(_PUBLIC)
     ip.user_ns["seed_tidy3_remote"] = seed_remote
     try:
-        # reload (not load) when already loaded: after the sys.modules purge
-        # above, plain load_ext would no-op and keep the stale extension
+        # After the sys.modules purge, "tidy3.jupyter" may be marked loaded in
+        # the extension manager while absent from sys.modules — plain load_ext
+        # would no-op and keep the stale extension. Clear the mark, then load.
         _em = ip.extension_manager
-        if "tidy3.jupyter" in getattr(_em, "loaded", set()):
+        _loaded = getattr(_em, "loaded", set())
+        if "tidy3.jupyter" in _loaded and "tidy3.jupyter" not in sys.modules:
+            _loaded.discard("tidy3.jupyter")
+        if "tidy3.jupyter" in _loaded:
             _em.reload_extension("tidy3.jupyter")
         else:
             _em.load_extension("tidy3.jupyter")
