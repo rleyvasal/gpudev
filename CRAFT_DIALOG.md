@@ -1,18 +1,17 @@
-# CRAFT + sslive: how to start
+# CRAFT dialog — load sequence
 
-## Mental model
+```text
+gpudev/
+  CRAFT.py                 # tiny core loader
+  gpudev_craft/            # implementation package
+  addons/
+    pcviz.py               # point clouds
+    mojo.py                # Mojo language
+    sslive.py              # wrapper → linked sslive repo
+    sslive/ → …/sslive     # symlink or git submodule (separate repo)
+```
 
-| Piece | Repo / path | Essential? |
-|-------|-------------|------------|
-| **CRAFT / gpudev** | `gpudev/` | Yes — GPU connection |
-| **sslive** | **separate** repo (e.g. `sslive/`) | No — slides addon |
-| **pcviz** | lives next to gpudev (`pcviz.py`) | No — point clouds |
-
-sslive can be used **alone** (just `%run sslive.py`) or as an **addon** after CRAFT.
-
----
-
-## A) CRAFT only (GPU Python)
+## Always (core)
 
 ```text
 %local
@@ -20,77 +19,36 @@ sslive can be used **alone** (just `%run sslive.py`) or as an **addon** after CR
 %gpu
 ```
 
----
-
-## B) CRAFT + sslive (slides as addon) — **correct sequence**
+## Optional addons (same pattern)
 
 ```text
 %local
-%run /app/data/gpudevd/gpudev/CRAFT.py
+%run /app/data/gpudevd/gpudev/addons/pcviz.py
+%run /app/data/gpudevd/gpudev/addons/mojo.py
+%run /app/data/gpudevd/gpudev/addons/sslive.py
 %gpu
-
-# Load sslive on the HOST (not the remote GPU kernel):
-%load_sslive /app/data/sslive/sslive.py
-
-# Or under %local:
-# %local
-# install_sslive("/app/data/sslive/sslive.py")
-
 %sslive
 ```
 
-### Why your error happened
+## Magics
 
-```text
-install_sslive()
-NameError: name 'install_sslive' is not defined
+| After load | Magics |
+|------------|--------|
+| core | `%gpu` `%local` `%kernel_status` `%restart_kernel` |
+| pcviz | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
+| mojo | `%gpum` `%mojo_*` `%bench` |
+| sslive | `%sslive` `%sslive_export` |
+
+## sslive as separate repo
+
+```bash
+cd /path/to/gpudev/addons
+ln -s /path/to/sslive sslive
+# or: git submodule add <url> addons/sslive
 ```
 
-1. Under **`%gpu`**, a plain Python call is sent to the **remote** kernel — that machine never imported CRAFT’s installers.  
-2. Use **`%load_sslive`** (host-local magic) **or** `%local` then `install_sslive(...)`.
-
----
-
-## C) sslive alone (no CRAFT / no GPU)
+If unlinked, run the real file:
 
 ```text
-%local
-%run /app/data/sslive/sslive.py
-%sslive
+%run /path/to/sslive/sslive.py
 ```
-
-Slide **▶ Run** still needs a GPU kernel if you use CRAFT’s remote execution; for static decks / export-only you may only need host + last outputs.
-
----
-
-## D) Full stack (CRAFT + pcviz + sslive)
-
-```text
-%local
-%run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu
-%load_pcviz
-%load_sslive /app/data/sslive/sslive.py
-%sslive
-```
-
----
-
-## Paths on your machine (from your screenshot)
-
-| What | Typical path |
-|------|----------------|
-| CRAFT loader | `/app/data/gpudevd/gpudev/CRAFT.py` |
-| sslive (separate) | `/app/data/sslive/sslive.py` (adjust if different) |
-
-If `install_sslive()` can’t find the file, always pass the path explicitly.
-
----
-
-## After load (all magics use the **sslive** prefix)
-
-| Magic | Purpose |
-|-------|---------|
-| `%sslive` | Open live deck |
-| `%sslive_export talk.html` | Portable HTML (host-local) |
-| `%pointcloud_plotly …` | Portable lidar (pcviz) for export |

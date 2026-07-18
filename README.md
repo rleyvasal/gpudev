@@ -7,37 +7,39 @@ container over a Cloudflare tunnel and execute on the GPU as if it were local.
 
 ## SolveIt CRAFT loader (dialog stays tiny)
 
-Implementation lives in the **`gpudev_craft/`** package. The dialog cell should
-only load it — not paste the full source (LLM context budget).
-
 ```text
 gpudev/
-  CRAFT.py              # short %run entry (core + commented addons)
-  CRAFT_DIALOG.md       # copy-paste notes for SolveIt
-  gpudev_craft/
-    core.py             # %gpu, tunnel, remote_run_, Mojo
-    magics.py           # install_core / install_pcviz / install_sslive
-  pcviz.py              # optional point-cloud addon
+  CRAFT.py                 # short %run entry (core only)
+  CRAFT_DIALOG.md
+  gpudev_craft/            # core package (GPU connect only)
+    core.py
+    magics.py
+  addons/                  # optional tools (%local + %run)
+    pcviz.py
+    mojo.py                # full Mojo addon (single file)
+    sslive.py              # entry → linked sslive repo
+    sslive/ → …            # symlink or submodule (separate repo)
+    README.md
 ```
 
 ```python
 %local
-%run /path/to/gpudev/CRAFT.py   # install_core()
+%run /path/to/gpudev/CRAFT.py
+%run /path/to/gpudev/addons/pcviz.py
+%run /path/to/gpudev/addons/mojo.py
+%run /path/to/gpudev/addons/sslive.py
 %gpu
-
-# In CRAFT.py, uncomment when needed:
-# install_pcviz()
-# install_sslive()               # finds ../sslive/sslive.py if present
-# install_mojo()                 # help only; Mojo magics ship in core
+%sslive
 ```
 
-| Install | Provides |
-|---------|----------|
-| `install_core()` | `%gpu` `%local` `%kernel_status` `remote_run_` (+ Mojo `%gpum` …) |
-| `install_pcviz()` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
-| `install_sslive()` | `%sslive` `%sslive_export` |
+| Load | Provides |
+|------|----------|
+| `CRAFT.py` | `%gpu` `%local` `%kernel_status` `remote_run_` |
+| `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
+| `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
+| `addons/sslive.py` | `%sslive` `%sslive_export` (needs sslive linked) |
 
-After a stable load, mark the CRAFT cell **skipped** so it stays out of AI context.
+Always **`%local` + `%run`**. Mark the CRAFT cell **skipped** after a stable load.
 
 ```
   ┌─────────────┐    Cloudflare    ┌─────────────────────────────────────┐

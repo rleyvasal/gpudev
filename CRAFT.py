@@ -1,10 +1,13 @@
 # CRAFT dialog loader — keep this cell short (LLM context budget).
-# Implementation: gpudev_craft/  |  optional addons: pcviz, sslive, mojo
+# Core: gpudev_craft/   Addons: addons/ (pcviz, mojo, sslive)
 #
-# Usage in SolveIt:
 #   %local
 #   %run /path/to/gpudev/CRAFT.py
+#   %run /path/to/gpudev/addons/pcviz.py    # optional
+#   %run /path/to/gpudev/addons/mojo.py     # optional
+#   %run /path/to/gpudev/addons/sslive.py   # optional (separate repo via link)
 #   %gpu
+#   %sslive
 
 import sys
 from pathlib import Path
@@ -13,23 +16,6 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from gpudev_craft.magics import (  # noqa: E402
-    install_core,
-    install_mojo,
-    install_pcviz,
-    install_sslive,
-)
+from gpudev_craft.magics import install_core  # noqa: E402
 
-# ── always: GPU connection spine ─────────────────────────────────────────────
 install_core()
-
-# ── optional addons (uncomment when needed; host-only — use %local if needed) ─
-# install_pcviz()
-# install_sslive()                                 # auto-finds sibling sslive/
-# install_sslive("/app/data/sslive/sslive.py")     # explicit path (separate repo)
-# install_mojo()
-#
-# Or after %gpu, use local magics (stay on host):
-#   %load_pcviz
-#   %load_sslive
-#   %load_sslive /app/data/sslive/sslive.py
