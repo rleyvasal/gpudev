@@ -17,6 +17,10 @@ Optional tools loaded with the **same pattern as core**:
 | **mojo** | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
 | **sslive** | `addons/sslive.py` → linked repo | `%sslive` `%sslive_export` |
 
+The pcviz magics mark their own cell hidden-from-AI (`skipped=1`, red eye)
+after rendering — viewer HTML, especially plotly's embedded point data, can be
+megabytes of LLM context. Pass `hide=0` to keep a cell visible to the AI.
+
 ## Addon contract
 
 An addon must register its **entire public surface itself** via `get_ipython()`:

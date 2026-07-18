@@ -603,6 +603,83 @@ def point_cloud_plotly(
     return None
 
 
+# Hide-from-AI (same mechanism as sslive): mark the calling cell skipped=1
+# (red eye) so viewer HTML — especially plotly's embedded point JSON — stays
+# out of LLM context. The output remains visible in the dialog.
+
+def _find_caller_msg_id():
+    """SolveIt current message id — stack / user_ns / find_var probes."""
+    import inspect
+
+    frame = inspect.currentframe()
+    try:
+        f = frame.f_back if frame is not None else None
+        while f is not None:
+            for ns in (f.f_locals, f.f_globals):
+                mid = ns.get("__msg_id") if isinstance(ns, dict) else None
+                if mid:
+                    return str(mid)
+            f = f.f_back
+    finally:
+        del frame
+    try:
+        ip = get_ipython()
+        for ns_name in ("user_ns", "user_global_ns"):
+            ns = getattr(ip, ns_name, None) or {}
+            mid = ns.get("__msg_id") if isinstance(ns, dict) else None
+            if mid:
+                return str(mid)
+    except Exception:
+        pass
+    try:
+        from safepyrun import find_var  # type: ignore
+
+        mid = find_var("__msg_id")
+        if mid:
+            return str(mid)
+    except Exception:
+        pass
+    return None
+
+
+def _hide_caller_from_ai(mid=None):
+    """Best-effort ``skipped=1`` on the calling cell; no-op outside SolveIt."""
+    try:
+        from dialoghelper.core import update_msg
+    except Exception:
+        return
+    mid = mid or _find_caller_msg_id()
+    if not mid:
+        return
+
+    async def _skip():
+        import inspect
+
+        for m in (mid, mid[1:] if mid.startswith("_") else "_" + mid):
+            try:
+                res = update_msg(id=m, skipped=1)
+                if inspect.iscoroutine(res):
+                    await res
+                return
+            except Exception:
+                pass
+
+    try:
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            # Fire-and-forget: lands right after the cell finishes rendering.
+            loop.create_task(_skip())
+        else:
+            asyncio.run(_skip())
+    except Exception:
+        pass
+
+
 try:
     from IPython.core.magic import register_line_magic
 
@@ -615,10 +692,11 @@ try:
         if not parts:
             raise ValueError(
                 "usage: %pointcloud <path> [stride=N] [color=height|intensity|mono] "
-                "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [name=...]"
+                "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [name=...] "
+                "[hide=0|1]"
             )
 
-        path, kw = parts[0], {}
+        path, kw, hide = parts[0], {}, True
 
         for tok in parts[1:]:
             k, _, v = tok.partition("=")
@@ -629,12 +707,18 @@ try:
                 kw[k] = float(v)
             elif k == "remote":
                 kw[k] = v.lower() in ("1", "true", "yes")
+            elif k == "hide":
+                hide = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 kw[k] = v
             else:
                 raise ValueError(f"unknown option {tok!r}")
 
-        return point_cloud(path, **kw)
+        mid = _find_caller_msg_id() if hide else None
+        out = point_cloud(path, **kw)
+        if hide:
+            _hide_caller_from_ai(mid)
+        return out
 
 except Exception:
     pass
@@ -660,10 +744,10 @@ try:
             raise ValueError(
                 "usage: %pointcloud_plotly <path> [stride=N] [color=height|intensity|mono] "
                 "[size=F] [icol=N] [remote=0|1] [sub=N] [max_points=N] [opacity=F] "
-                "[height=N] [title=...]"
+                "[height=N] [title=...] [hide=0|1]"
             )
 
-        path, kw = parts[0], {}
+        path, kw, hide = parts[0], {}, True
 
         for tok in parts[1:]:
             k, _, v = tok.partition("=")
@@ -674,13 +758,19 @@ try:
                 kw[k] = float(v)
             elif k == "remote":
                 kw[k] = v.lower() in ("1", "true", "yes")
+            elif k == "hide":
+                hide = v.lower() in ("1", "true", "yes")
             elif k in ("color", "title", "name"):
                 # name accepted as alias for title
                 kw["title" if k == "name" else k] = v
             else:
                 raise ValueError(f"unknown option {tok!r}")
 
-        return point_cloud_plotly(path, **kw)
+        mid = _find_caller_msg_id() if hide else None
+        out = point_cloud_plotly(path, **kw)
+        if hide:
+            _hide_caller_from_ai(mid)
+        return out
 
 except Exception:
     pass
@@ -715,12 +805,13 @@ try:
         if not parts:
             raise ValueError(
                 "usage: %pointcloud_var <expr> [sub=N] [max_points=N] [color=...] "
-                "[size=F] [icol=N] [name=...]"
+                "[size=F] [icol=N] [name=...] [hide=0|1]"
             )
 
         expr = parts[0]
         sub = 1
         max_points = _DEFAULT_MAX_POINTS
+        hide = True
         opts = dict(color="height", size=0.06, icol=3, name=None)
 
         for tok in parts[1:]:
@@ -734,12 +825,15 @@ try:
                 opts["size"] = float(v)
             elif k == "icol":
                 opts["icol"] = int(v)
+            elif k == "hide":
+                hide = v.lower() in ("1", "true", "yes")
             elif k in ("color", "name"):
                 opts[k] = v
             else:
                 raise ValueError(f"unknown option: {tok}")
 
         opts["name"] = opts["name"] or expr
+        mid = _find_caller_msg_id() if hide else None
 
         remote_path = f"/tmp/pcviz_{uuid.uuid4().hex}.bin"
         # Apply sub on the GPU; max_points applied as extra step if needed after shape known.
@@ -770,7 +864,7 @@ print(json.dumps({{"shape": list(_arr.shape), "path": {remote_path!r}, "sub": _s
             raise RuntimeError(f"remote snapshot failed:\n{out}")
 
         try:
-            return pc(
+            out = pc(
                 meta["path"],
                 remote=True,
                 stride=meta["shape"][1],
@@ -782,6 +876,9 @@ print(json.dumps({{"shape": list(_arr.shape), "path": {remote_path!r}, "sub": _s
         except Exception:
             _rm_remote(remote_path)
             raise
+        if hide:
+            _hide_caller_from_ai(mid)
+        return out
 
 except Exception:
     pass
