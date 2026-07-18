@@ -38,15 +38,14 @@ try:
 except Exception:
     read_msg = None
 
-try:
-    get_ipython  # type: ignore[name-defined]
-except NameError:
-    def get_ipython():  # type: ignore[misc]
-        try:
-            from IPython import get_ipython as _gi
-            return _gi()
-        except Exception:
-            return None
+def get_ipython():  # type: ignore[misc]
+    """Always bound on this module so addons can call ``core.get_ipython()``."""
+    try:
+        from IPython import get_ipython as _gi
+
+        return _gi()
+    except Exception:
+        return None
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────

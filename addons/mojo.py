@@ -30,6 +30,19 @@ _ssh_with_input = _core._ssh_with_input
 read_msg = _core.read_msg
 register_local_magic = _core.register_local_magic
 
+
+def _get_ipython():
+    """IPython shell for magic registration (do not use _core.get_ipython attribute)."""
+    try:
+        from IPython import get_ipython as _gi
+
+        return _gi()
+    except Exception:
+        try:
+            return _core.get_ipython()
+        except Exception:
+            return None
+
 # ── Mojo Execution Manager ────────────────────────────────────────────────────
 _MOJO_NOISE = (
     "Failed to initialize Crashpad",
@@ -462,16 +475,18 @@ def install_mojo_addon(*, quiet: bool = False) -> bool:
     for name in ("%gpum", "%restart_mojo", "%mojo_history", "%mojo_run", "%bench", "%mojo_add"):
         register_local_magic(name)
     try:
-        ip = _core.get_ipython()
-        if ip is not None:
-            mm = ip.magics_manager
-            for name, fn in _MOJO_MAGIC_FUNCS:
-                mm.register_function(fn, magic_kind="line", magic_name=name)
-            ns = ip.user_ns
-            ns["_mojo_mgr"] = _mojo_mgr
-            ns["MOJO_BACKEND"] = MOJO_BACKEND
-            for name, fn in _MOJO_MAGIC_FUNCS:
-                ns[name] = fn
+        ip = _get_ipython()
+        if ip is None:
+            print("CRAFT mojo: no IPython shell — magics not registered")
+            return False
+        mm = ip.magics_manager
+        for name, fn in _MOJO_MAGIC_FUNCS:
+            mm.register_function(fn, magic_kind="line", magic_name=name)
+        ns = ip.user_ns
+        ns["_mojo_mgr"] = _mojo_mgr
+        ns["MOJO_BACKEND"] = MOJO_BACKEND
+        for name, fn in _MOJO_MAGIC_FUNCS:
+            ns[name] = fn
     except Exception as e:
         print(f"CRAFT mojo: magic register issue: {e}")
         return False
