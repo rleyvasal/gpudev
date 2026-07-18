@@ -5,6 +5,40 @@ machine with an NVIDIA GPU becomes a shared host; isolated per-user Linux
 containers run on it; remote notebooks (e.g. SolveIt) route cells to their
 container over a Cloudflare tunnel and execute on the GPU as if it were local.
 
+## SolveIt CRAFT loader (dialog stays tiny)
+
+Implementation lives in the **`gpudev_craft/`** package. The dialog cell should
+only load it — not paste the full source (LLM context budget).
+
+```text
+gpudev/
+  CRAFT.py              # short %run entry (core + commented addons)
+  CRAFT_DIALOG.md       # copy-paste notes for SolveIt
+  gpudev_craft/
+    core.py             # %gpu, tunnel, remote_run_, Mojo
+    magics.py           # install_core / install_pcviz / install_sslive
+  pcviz.py              # optional point-cloud addon
+```
+
+```python
+%local
+%run /path/to/gpudev/CRAFT.py   # install_core()
+%gpu
+
+# In CRAFT.py, uncomment when needed:
+# install_pcviz()
+# install_sslive()               # finds ../sslive/sslive.py if present
+# install_mojo()                 # help only; Mojo magics ship in core
+```
+
+| Install | Provides |
+|---------|----------|
+| `install_core()` | `%gpu` `%local` `%kernel_status` `remote_run_` (+ Mojo `%gpum` …) |
+| `install_pcviz()` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
+| `install_sslive()` | `%slive` `%slive_export` |
+
+After a stable load, mark the CRAFT cell **skipped** so it stays out of AI context.
+
 ```
   ┌─────────────┐    Cloudflare    ┌─────────────────────────────────────┐
   │  Notebook   │ ───── tunnel ──→ │  Host (Windows + WSL2  OR  Linux)   │
