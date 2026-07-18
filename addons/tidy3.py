@@ -7,8 +7,9 @@
 #   %run /path/to/gpudev/addons/tidy3.py
 #   %gpu
 #
-# Under %gpu, cells run on the remote kernel (paths are remote paths).
-# Ensure tidy3 is importable there (shared clone / pip on the host image).
+# Local inject + remote seed: under %gpu, cells run on the remote kernel
+# (separate namespace). This loader puts tidy3 on the remote so `tidy` works
+# there too — same UX as loading any other addon under %local.
 
 from __future__ import annotations
 
@@ -17,29 +18,34 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _CANDIDATES = [
-    _HERE / "tidy3",  # symlink or submodule: addons/tidy3/ → tidy3 clone
-    _HERE.parent.parent / "tidy3",  # sibling of gpudev/ (…/gpudevd/tidy3)
+    _HERE / "tidy3",  # symlink: addons/tidy3/ → tidy3 clone
+    _HERE.parent.parent / "tidy3",  # sibling …/gpudevd/tidy3
     Path("/app/data/gpudevd/tidy3"),
     Path("/app/data/tidy3"),
     Path.home() / "tidy3",
+    Path("/home/gpudev/tidy3"),
 ]
 
-_root = next((p for p in _CANDIDATES if (p / "src" / "tidy3").is_dir() or (p / "tidy3").is_dir()), None)
+_root = next(
+    (p for p in _CANDIDATES if (p / "src" / "tidy3").is_dir() or (p / "tidy3").is_dir()),
+    None,
+)
 if _root is None:
     try:
         import tidy3  # noqa: F401
     except ImportError as e:
         raise FileNotFoundError(
-            "tidy3 not found. Clone the tidy3 repo and either:\n"
-            f"  ln -s ../../tidy3 {_HERE / 'tidy3'}\n"
+            "tidy3 not found. Clone https://github.com/rleyvasal/tidy3 and either:\n"
+            f"  ln -s /path/to/tidy3 {_HERE / 'tidy3'}\n"
             "or:\n"
             "  pip install -e /path/to/tidy3\n"
             "then re-run this addon."
         ) from e
 else:
     src = _root / "src"
-    if src.is_dir() and str(src) not in sys.path:
-        sys.path.insert(0, str(src))
+    if src.is_dir() and (src / "tidy3").is_dir():
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
     elif str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
@@ -134,16 +140,93 @@ _PUBLIC = {
     "tidy3": tidy3,
 }
 
+# Remote seeding: push the local tidy3 source to the remote kernel through
+# the ZMQ channel (tidy3.craft). No shared filesystem or remote clone needed.
+# Re-seeds automatically when the remote kernel changes (%restart_kernel /
+# reconnect) or when the local source changes (content stamp).
+_SEED_STATE = {"stamp": None, "kc_id": None, "ok": False}
+
+
+def seed_remote(*, force: bool = False, quiet: bool = False, style_polars: bool = True) -> bool:
+    """Ship tidy3 to the CRAFT remote kernel and load it there (idempotent)."""
+    from tidy3 import craft
+
+    ip = get_ipython() if get_ipython else None
+    if ip is None:
+        return False
+    ns = ip.user_ns or {}
+    rr = ns.get("remote_run_")
+    mgr = ns.get("_exec_mgr")
+    if not callable(rr) or mgr is None:
+        if not quiet:
+            print(
+                "CRAFT: tidy3 local only (remote not connected yet — "
+                "will seed on first %gpu cell)"
+            )
+        return False
+
+    payload, stamp = craft.build_payload()
+    kc_id = id(getattr(mgr, "remote_kc", None))
+    if (
+        not force
+        and _SEED_STATE["stamp"] == stamp
+        and _SEED_STATE["kc_id"] == kc_id
+    ):
+        return _SEED_STATE["ok"]  # same source + same kernel: keep last outcome
+
+    ok, msg = craft.seed(rr, payload=payload, stamp=stamp, style_polars=style_polars)
+    _SEED_STATE.update(stamp=stamp, kc_id=kc_id, ok=ok)
+    if ok:
+        if not quiet:
+            print(f"CRAFT: {msg}")
+    else:
+        print(
+            "CRAFT: tidy3 remote seed FAILED — %gpu cells won't know tidy3.\n"
+            + msg
+            + "\nRetry with seed_tidy3_remote(force=True)"
+        )
+    return ok
+
+
+def _maybe_seed_on_cell(_info=None):
+    """Before each cell: if in %gpu Python mode, ensure the remote has tidy3."""
+    try:
+        import gpudev_craft.core as _core
+
+        router = getattr(_core, "ROUTER", None)
+        py_be = getattr(_core, "PY_BACKEND", None)
+        if router is None or py_be is None or router.backend is not py_be:
+            return
+    except Exception:
+        return
+    seed_remote(quiet=True)
+
+
 ip = get_ipython() if get_ipython else None
 if ip is not None and getattr(ip, "user_ns", None) is not None:
     ip.user_ns.update(_PUBLIC)
+    ip.user_ns["seed_tidy3_remote"] = seed_remote
     try:
         ip.run_line_magic("load_ext", "tidy3.jupyter")
     except Exception:
         pass
+    # Re-running the addon must not stack pre_run_cell callbacks
+    try:
+        _prev = ip.user_ns.get("_tidy3_seed_cb")
+        if _prev is not None:
+            try:
+                ip.events.unregister("pre_run_cell", _prev)
+            except Exception:
+                pass
+        ip.events.register("pre_run_cell", _maybe_seed_on_cell)
+        ip.user_ns["_tidy3_seed_cb"] = _maybe_seed_on_cell
+    except Exception:
+        pass
+    # If already connected (user re-ran addon after %gpu), seed now
+    seed_remote(quiet=False)
 
-print(f"CRAFT: tidy3 {tidy3.__version__} loaded")
+print(f"CRAFT: tidy3 {tidy3.__version__} loaded (local)")
 print("  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
-print("  After %gpu: cells run remote — use host paths in scan_parquet(...), etc.")
-print("  Partial: Run Selected Text on a prefix, or %%tidy3_run / own cell")
-print("  %tidy3_pipes on|off")
+print("  %gpu: source is pushed to the remote kernel automatically; after manual")
+print("        kernel surgery use seed_tidy3_remote(force=True)")
+print("  Partial: Run Selected Text / %%tidy3_run / own cell  |  %tidy3_pipes on|off")

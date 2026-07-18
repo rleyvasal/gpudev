@@ -17,7 +17,7 @@ Optional tools loaded with the **same pattern as core**:
 | **pcviz** | `addons/pcviz.py` | this repo | `%pointcloud` … |
 | **mojo** | `addons/mojo.py` | this repo | `%gpum` `%mojo_*` … |
 | **sslive** | `addons/sslive.py` (thin) + `addons/sslive` → link | [sslive repo](https://github.com/rleyvasal/sslive) | `%sslive` … |
-| **tidy3** | `addons/tidy3.py` (thin) + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run` |
+| **tidy3** | `addons/tidy3.py` (thin) + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run`; auto-seeds the remote kernel under `%gpu` |
 
 **plot3** is **not** under gpudev addons. It is only [rleyvasal/plot3](https://github.com/rleyvasal/plot3):
 
