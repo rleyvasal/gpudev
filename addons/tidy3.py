@@ -54,6 +54,11 @@ try:
 except Exception:  # pragma: no cover
     get_ipython = None
 
+# Fresh import on every %run so a `git pull` of the tidy3 clone takes effect
+# without restarting the kernel (this addon is the only loader).
+for _m in [m for m in list(sys.modules) if m == "tidy3" or m.startswith("tidy3.")]:
+    del sys.modules[_m]
+
 import tidy3
 from tidy3 import (  # noqa: E402
     TidyFrame,
@@ -149,7 +154,15 @@ _SEED_STATE = {"stamp": None, "kc_id": None, "ok": False}
 
 def seed_remote(*, force: bool = False, quiet: bool = False, style_polars: bool = True) -> bool:
     """Ship tidy3 to the CRAFT remote kernel and load it there (idempotent)."""
-    from tidy3 import craft
+    try:
+        from tidy3 import craft
+    except ImportError:
+        print(
+            "CRAFT: tidy3 remote seed unavailable — loaded tidy3 has no craft "
+            "module (clone older than this addon). git pull the tidy3 clone "
+            "and re-run addons/tidy3.py"
+        )
+        return False
 
     ip = get_ipython() if get_ipython else None
     if ip is None:
@@ -207,7 +220,13 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
     ip.user_ns.update(_PUBLIC)
     ip.user_ns["seed_tidy3_remote"] = seed_remote
     try:
-        ip.run_line_magic("load_ext", "tidy3.jupyter")
+        # reload (not load) when already loaded: after the sys.modules purge
+        # above, plain load_ext would no-op and keep the stale extension
+        _em = ip.extension_manager
+        if "tidy3.jupyter" in getattr(_em, "loaded", set()):
+            _em.reload_extension("tidy3.jupyter")
+        else:
+            _em.load_extension("tidy3.jupyter")
     except Exception:
         pass
     # Re-running the addon must not stack pre_run_cell callbacks
@@ -225,7 +244,10 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
     # If already connected (user re-ran addon after %gpu), seed now
     seed_remote(quiet=False)
 
-print(f"CRAFT: tidy3 {tidy3.__version__} loaded (local)")
+print(
+    f"CRAFT: tidy3 {tidy3.__version__} loaded (local) "
+    f"from {Path(tidy3.__file__).resolve().parent}"
+)
 print("  tidy(df) >> filter(...) >> mutate(...)   # multi-line >> auto-rewritten")
 print("  %gpu: source is pushed to the remote kernel automatically; after manual")
 print("        kernel surgery use seed_tidy3_remote(force=True)")
