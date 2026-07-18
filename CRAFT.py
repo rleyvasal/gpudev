@@ -23,8 +23,13 @@ from gpudev_craft.magics import (  # noqa: E402
 # ── always: GPU connection spine ─────────────────────────────────────────────
 install_core()
 
-# ── optional addons (uncomment when needed) ───────────────────────────────────
-# install_pcviz()                          # %pointcloud / %pointcloud_plotly
-# install_sslive()                         # %slive / %slive_export
-# install_sslive("/path/to/sslive/sslive.py")  # if not next to gpudev/
-# install_mojo()                           # re-print Mojo help (already in core)
+# ── optional addons (uncomment when needed; host-only — use %local if needed) ─
+# install_pcviz()
+# install_sslive()                                 # auto-finds sibling sslive/
+# install_sslive("/app/data/sslive/sslive.py")     # explicit path (separate repo)
+# install_mojo()
+#
+# Or after %gpu, use local magics (stay on host):
+#   %load_pcviz
+#   %load_sslive
+#   %load_sslive /app/data/sslive/sslive.py

@@ -15,11 +15,69 @@ _GPUDEV_ROOT = Path(__file__).resolve().parent.parent
 _WORKSPACE = _GPUDEV_ROOT.parent
 
 
+def _inject_installers_into_user_ns() -> None:
+    """So dialog cells can call install_sslive() after %run CRAFT.py."""
+    try:
+        from IPython import get_ipython
+
+        ip = get_ipython()
+    except Exception:
+        return
+    if ip is None:
+        return
+    ns = ip.user_ns
+    ns["install_core"] = install_core
+    ns["install"] = install_core
+    ns["install_pcviz"] = install_pcviz
+    ns["install_sslive"] = install_sslive
+    ns["install_mojo"] = install_mojo
+
+
+def _register_loader_magics() -> None:
+    """%load_sslive etc. stay on the host under %gpu (CRAFT local magics)."""
+    try:
+        from IPython import get_ipython
+
+        ip = get_ipython()
+    except Exception:
+        return
+    if ip is None:
+        return
+    try:
+        from . import core
+
+        mm = ip.magics_manager
+
+        def load_pcviz(line=""):
+            path = (line or "").strip() or None
+            return install_pcviz(path)
+
+        def load_sslive(line=""):
+            path = (line or "").strip() or None
+            return install_sslive(path)
+
+        def load_mojo(line=""):
+            return install_mojo()
+
+        for name, fn in (
+            ("load_pcviz", load_pcviz),
+            ("load_sslive", load_sslive),
+            ("load_mojo", load_mojo),
+        ):
+            mm.register_function(fn, magic_kind="line", magic_name=name)
+            core.register_local_magic(f"%{name}")
+    except Exception:
+        pass
+
+
 def install_core(*, quiet: bool = False) -> bool:
     """Load GPU connection magics (%gpu, %local, …) and remote_run_."""
     from . import core
 
-    return core.install_core(quiet=quiet)
+    ok = core.install_core(quiet=quiet)
+    _inject_installers_into_user_ns()
+    _register_loader_magics()
+    return ok
 
 
 # Alias used by some docs / old muscle memory
@@ -91,18 +149,33 @@ def install_pcviz(path: str | Path | None = None, *, quiet: bool = False) -> boo
 
 
 def install_sslive(path: str | Path | None = None, *, quiet: bool = False) -> bool:
-    """Load sslive (%slive, %slive_export) — optional slides addon."""
+    """Load sslive (%sslive, %sslive_export) — optional slides addon (host only).
+
+    Must run on the SolveIt **host** (under ``%local``, or via ``%load_sslive``
+    which is registered as a CRAFT local magic). sslive stays its own repo;
+    pass ``path=`` if it is not a sibling of ``gpudev/``.
+    """
     if path is not None:
         candidates = [Path(path)]
     else:
         candidates = [
             _WORKSPACE / "sslive" / "sslive.py",
+            _GPUDEV_ROOT.parent / "sslive" / "sslive.py",
             _GPUDEV_ROOT / "sslive" / "sslive.py",
+            Path("/app/data/sslive/sslive.py"),
             Path.home() / "sslive" / "sslive.py",
             _WORKSPACE / "sslive.py",
         ]
-    p = next((c for c in candidates if c.is_file()), candidates[0])
+    p = next((c.expanduser() for c in candidates if c.expanduser().is_file()), candidates[0])
     ok = _run_addon_script(p, label="sslive")
     if ok and not quiet:
-        print("  %slive  %slive_export  (host-local under %gpu)")
+        print("  %sslive  %sslive_export  (host-local under %gpu)")
+        print("  then: %sslive   or   %sslive 800")
+    elif not ok and not quiet:
+        print(
+            "  Tip: sslive is a separate project. Example:\n"
+            "    %local\n"
+            "    install_sslive('/app/data/sslive/sslive.py')\n"
+            "    # or: %load_sslive /app/data/sslive/sslive.py"
+        )
     return ok

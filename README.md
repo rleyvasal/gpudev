@@ -35,7 +35,7 @@ gpudev/
 |---------|----------|
 | `install_core()` | `%gpu` `%local` `%kernel_status` `remote_run_` (+ Mojo `%gpum` …) |
 | `install_pcviz()` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
-| `install_sslive()` | `%slive` `%slive_export` |
+| `install_sslive()` | `%sslive` `%sslive_export` |
 
 After a stable load, mark the CRAFT cell **skipped** so it stays out of AI context.
 
