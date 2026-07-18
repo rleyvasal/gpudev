@@ -264,6 +264,7 @@ def stop_server():
     _preview = None
     _scene_lf = None
     _PORT = None
+    _publish_srv(None)
     if srv is None:
         return
     try:
@@ -290,6 +291,16 @@ def restart_viewer(height="600px"):
     _ensure_server(height=height)
 
 
+def _publish_srv(handle):
+    """Expose the live server handle in user_ns so a re-load (any load path) can stop it."""
+    try:
+        ip = get_ipython()
+        if ip is not None and isinstance(getattr(ip, "user_ns", None), dict):
+            ip.user_ns["_pcviz_srv"] = handle
+    except Exception:
+        pass
+
+
 def _ensure_server(height="600px"):
     "Start the singleton FastHTML server once; reused by every point_cloud() call."
     global _app, _srv, _preview, _scene_lf, _PORT
@@ -309,6 +320,7 @@ def _ensure_server(height="600px"):
     _app.route("/points/{name}.bin")(_data)
     _scene_lf = _app.route("/pcviz_scene")(_scene)
     _srv = JupyUvi(_app, port=_PORT)
+    _publish_srv(_srv)
     # Pass port explicitly so HTMX/proxy hits this server (not a stale 8000).
     _preview = partial(HTMX, app=_app, host=None, port=_PORT, height=height)
 
@@ -782,7 +794,9 @@ _craft_keep_local("%pointcloud_var")
 # from a stale server still holding port 8000).
 try:
     _ip = get_ipython()
-    _old = (_ip.user_ns or {}).get("_srv") if _ip is not None else None
+    _ns = (_ip.user_ns or {}) if _ip is not None else {}
+    # _srv is the pre-contract %run leak from an older loaded copy.
+    _old = _ns.get("_pcviz_srv") or _ns.get("_srv")
     if _old is not None and _old is not _srv:
         try:
             if hasattr(_old, "stop") and callable(_old.stop):

@@ -17,6 +17,22 @@ Optional tools loaded with the **same pattern as core**:
 | **mojo** | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
 | **sslive** | `addons/sslive.py` → linked repo | `%sslive` `%sslive_export` |
 
+## Addon contract
+
+An addon must register its **entire public surface itself** via `get_ipython()`:
+
+- magics through the magics manager, plus `register_local_magic('%name')` so
+  they run on the host under `%gpu`;
+- any names meant for direct cell use written explicitly into `user_ns`
+  (see mojo's handle injection, sslive's `_inject_public_api_into_user_ns`,
+  pcviz's `_publish_srv`).
+
+Never rely on `%run` leaking module globals into the dialog namespace: the
+`install_*()` loaders run addons through `runpy` and discard the module
+namespace, so anything not explicitly registered does not exist there — and
+even under `%run`, leaked globals are a stale snapshot from load time, not
+live state.
+
 ## Separate repos
 
 **sslive** stays its own repository. In this tree it is linked for convenience:
