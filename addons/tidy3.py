@@ -277,8 +277,13 @@ if ip is not None and getattr(ip, "user_ns", None) is not None:
             _em.reload_extension("tidy3.jupyter")
         else:
             _em.load_extension("tidy3.jupyter")
-    except Exception:
-        pass
+        # Force pipe rewriter even if extension manager thought it was loaded.
+        from tidy3.jupyter import ensure_ipython_integration
+
+        ensure_ipython_integration(quiet=True)
+    except Exception as _ext_err:
+        print(f"CRAFT: tidy3.jupyter extension failed: {_ext_err}")
+        print("  Multi-line >> pipes need parentheses, or re-run this addon.")
     # Re-running the addon must not stack pre_run_cell callbacks
     try:
         _prev = ip.user_ns.get("_tidy3_seed_cb")
