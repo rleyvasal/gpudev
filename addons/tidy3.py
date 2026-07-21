@@ -58,12 +58,13 @@ if _root is None:
             "Then re-run this addon."
         ) from e
 else:
+    _root = _root.resolve()  # follow symlink → real clone (for git pull path)
     src = _root / "src"
     _pkg_dir = str(src if (src / "tidy3").is_dir() else _root)
     while _pkg_dir in sys.path:
         sys.path.remove(_pkg_dir)
     sys.path.insert(0, _pkg_dir)
-    print(f"CRAFT: tidy3 root={_root.resolve()}  pkg_path={_pkg_dir}", flush=True)
+    print(f"CRAFT: tidy3 root={_root}  pkg_path={_pkg_dir}", flush=True)
 
 try:
     from IPython import get_ipython
@@ -185,43 +186,62 @@ else:
     print(f"CRAFT: injected {len(_PUBLIC)} names into user_ns", flush=True)
 
     # Register pipe rewriter + %tidy3_pipes / %%tidy3_run
-    _ext_ok = False
     try:
-        from tidy3.jupyter import ensure_ipython_integration, enable_pipe_transform
+        import tidy3.jupyter as _tj
 
-        _ext_ok = bool(ensure_ipython_integration(quiet=False))
-        enable_pipe_transform(ip)
-        # Verify magic
-        _lines = getattr(ip.magics_manager, "magics", {}).get("line", {})
-        if "tidy3_pipes" in _lines:
-            print("CRAFT: %tidy3_pipes registered", flush=True)
+        # New clones: ensure_ipython_integration. Older clones: load_ext only.
+        if hasattr(_tj, "ensure_ipython_integration"):
+            _tj.ensure_ipython_integration(quiet=False)
         else:
             print(
-                "CRAFT: WARNING — %tidy3_pipes still missing after ensure; "
-                "trying load_extension…",
+                "CRAFT: tidy3.jupyter is an older build (no ensure_ipython_integration).\n"
+                "  On this host run:\n"
+                f"    cd {_root or Path(tidy3.__file__).resolve().parents[1]}\n"
+                "    git fetch && git checkout expand-dplyr-parity && git pull\n"
+                "  Then re-%run addons/tidy3.py",
                 flush=True,
             )
             _em = ip.extension_manager
             _loaded = getattr(_em, "loaded", set())
             _loaded.discard("tidy3.jupyter")
-            _em.load_extension("tidy3.jupyter")
-            ensure_ipython_integration(quiet=False)
-            _lines = getattr(ip.magics_manager, "magics", {}).get("line", {})
-            print(
-                f"CRAFT: tidy3_pipes in magics: {'tidy3_pipes' in _lines}",
-                flush=True,
-            )
-        _cleanup = getattr(ip, "input_transformers_cleanup", []) or []
-        from tidy3.jupyter import _is_pipe_transformer
+            try:
+                _em.load_extension("tidy3.jupyter")
+            except Exception as _le:
+                print(f"CRAFT: load_extension(tidy3.jupyter) failed: {_le}", flush=True)
 
-        _pos = next(
-            (i for i, t in enumerate(_cleanup) if _is_pipe_transformer(t)), None
+        if hasattr(_tj, "enable_pipe_transform"):
+            _tj.enable_pipe_transform(ip)
+
+        _lines = getattr(ip.magics_manager, "magics", {}).get("line", {})
+        print(
+            f"CRAFT: %tidy3_pipes registered: {'tidy3_pipes' in _lines}",
+            flush=True,
         )
+        _cleanup = getattr(ip, "input_transformers_cleanup", []) or []
+        _is_pipe = getattr(_tj, "_is_pipe_transformer", None)
+        if callable(_is_pipe):
+            _pos = next((i for i, t in enumerate(_cleanup) if _is_pipe(t)), None)
+        else:
+            _pos = next(
+                (
+                    i
+                    for i, t in enumerate(_cleanup)
+                    if getattr(t, "__name__", "") == "tidy3_input_transformer"
+                ),
+                None,
+            )
         print(
             f"CRAFT: pipe transformer "
             f"{'ON at cleanup[' + str(_pos) + ']' if _pos is not None else 'OFF'}",
             flush=True,
         )
+        if _pos is None:
+            print(
+                "  Multi-line >> without parentheses will SyntaxError until "
+                "transformer is ON.\n"
+                "  Workaround: ( tidy(cars) >> filter(...) >> ... )",
+                flush=True,
+            )
     except Exception as _ext_err:
         print(f"CRAFT: tidy3.jupyter setup FAILED: {_ext_err}", flush=True)
         traceback.print_exc()
