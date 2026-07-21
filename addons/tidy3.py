@@ -181,9 +181,20 @@ if ip is None:
 elif getattr(ip, "user_ns", None) is None:
     print("CRAFT: WARNING — no user_ns on IPython shell", flush=True)
 else:
+    # Force-overwrite (datar/pipda often already own mean/sum/filter on remotes).
     ip.user_ns.update(_PUBLIC)
     ip.user_ns["seed_tidy3_remote"] = seed_remote
-    print(f"CRAFT: injected {len(_PUBLIC)} names into user_ns", flush=True)
+    _clash = [
+        n
+        for n, v in _PUBLIC.items()
+        if n in ("mean", "sum", "min", "max", "filter", "n", "select")
+        and getattr(v, "__module__", "").startswith("tidy3")
+    ]
+    print(
+        f"CRAFT: injected {len(_PUBLIC)} names into user_ns "
+        f"(forced tidy3 API incl. {', '.join(_clash[:8])})",
+        flush=True,
+    )
 
     # Register pipe rewriter + %tidy3_pipes / %%tidy3_run
     try:
