@@ -12,16 +12,28 @@ Optional tools loaded with the **same pattern as core**:
 %gpu
 ```
 
-gpudev `addons/tidy3.py` / `addons/plot3.py` are thin wrappers that locate the
-clone and `%run` the package `tidy3.py` / `plot3.py` loaders.
+gpudev `addons/tidy3.py` / `addons/plot3.py` / `addons/sslive.py` are thin
+wrappers that locate the clone and run the package loaders.
 
 | Addon | In gpudev | Full code | Provides |
 |-------|-----------|-----------|----------|
 | **pcviz** | `addons/pcviz.py` | this repo | `%pointcloud` … |
 | **mojo** | `addons/mojo.py` | this repo | `%gpum` `%mojo_*` … |
-| **sslive** | `addons/sslive.py` (thin) + `addons/sslive` → link | [sslive](https://github.com/rleyvasal/sslive) | `%sslive` … |
+| **sslive** | `addons/sslive.py` + `addons/sslive` → link | [sslive](https://github.com/rleyvasal/sslive) | `%sslive` …; ▶ Run auto GPU/local |
 | **tidy3** | `addons/tidy3.py` + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run`; remote seed under `%gpu` |
 | **plot3** | `addons/plot3.py` + `addons/plot3` → link | [plot3](https://github.com/rleyvasal/plot3) | `ggplot` / `%plot3`; iframe + red-eye in SolveIt; remote seed under `%gpu` |
+
+### sslive (one command)
+
+```text
+%local
+%run /path/to/gpudev/addons/sslive.py
+# or: %run /path/to/sslive/sslive.py
+%sslive
+```
+
+CRAFT is optional. Load CRAFT + `%gpu` when you want remote ▶ Run; no second
+sslive recipe.
 
 ## SolveIt: tidy3 + plot3 together
 

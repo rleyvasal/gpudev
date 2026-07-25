@@ -1,51 +1,56 @@
-# sslive addon entry — separate repo, linked under addons/sslive/
+# sslive addon entry — thin wrapper around the package loader.
 #
-#   %local
+# Always the same one-liner (local *or* GPU)::
+#
 #   %run /path/to/gpudev/addons/sslive.py
-#   %gpu
-#   %sslive
-#
-# Or point at a clone elsewhere:
+#   # or directly:
 #   %run /path/to/sslive/sslive.py
+#
+# CRAFT is optional. sslive auto-detects CRAFT for slide ▶ Run (GPU when
+# connected, else host IPython). No second load recipe.
 
-import runpy
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
+if __name__ == "sslive":  # pragma: no cover
+    raise ImportError(
+        "addons/sslive.py was imported as module 'sslive' (sys.path shadowing); "
+        "load it with %run — the real file lives in the sslive clone"
+    )
+
 _HERE = Path(__file__).resolve().parent
 _CANDIDATES = [
-    _HERE / "sslive" / "sslive.py",  # symlink or submodule: addons/sslive/
+    _HERE / "sslive" / "sslive.py",  # symlink: addons/sslive/ → clone
+    _HERE / "sslive" / "load.py",
     _HERE.parent.parent / "sslive" / "sslive.py",
+    _HERE.parent.parent / "sslive" / "load.py",
+    Path("/app/data/gpudevd/sslive/sslive.py"),
+    Path("/app/data/gpudevd/sslive/load.py"),
     Path("/app/data/sslive/sslive.py"),
     Path.home() / "sslive" / "sslive.py",
+    Path("/home/gpudev/sslive/sslive.py"),
 ]
+
+print("sslive: addon searching for loader…", flush=True)
+for _p in _CANDIDATES:
+    print(f"  [{'ok' if _p.is_file() else '  '}] {_p}", flush=True)
 
 _target = next((p for p in _CANDIDATES if p.is_file()), None)
 if _target is None:
     raise FileNotFoundError(
-        "sslive.py not found. Clone the sslive repo and either:\n"
-        "  ln -s /path/to/sslive " + str(_HERE / "sslive") + "\n"
+        "sslive not found. Clone https://github.com/rleyvasal/sslive and either:\n"
+        f"  ln -s /path/to/sslive {_HERE / 'sslive'}\n"
         "or:\n"
         "  %run /path/to/sslive/sslive.py"
     )
 
-# Ensure package parent on path if needed
-root = str(_target.parent)
-if root not in sys.path:
-    sys.path.insert(0, root)
+root = str(_target.parent.resolve())
+while root in sys.path:
+    sys.path.remove(root)
+sys.path.insert(0, root)
 
-try:
-    from IPython import get_ipython
-
-    ip = get_ipython()
-    ns = ip.user_ns if ip is not None else None
-except Exception:
-    ns = None
-
-if ns is not None:
-    runpy.run_path(str(_target), init_globals=ns, run_name="sslive")
-else:
-    runpy.run_path(str(_target), run_name="sslive")
-
-print(f"CRAFT: sslive loaded from {_target}")
-print("  %sslive  %sslive_export")
+print(f"sslive: addon → {_target}", flush=True)
+# Execute as __main__ so bootstrap treats it like a direct %run.
+exec(compile(_target.read_text(encoding="utf-8"), str(_target), "exec"), globals())
