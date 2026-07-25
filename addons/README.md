@@ -4,14 +4,16 @@ Optional tools loaded with the **same pattern as core**:
 
 ```text
 %local
-%run /path/to/gpudev/CRAFT.py              # core (required first for GPU)
-%run /path/to/gpudev/addons/pcviz.py       # point clouds (in-tree)
-%run /path/to/gpudev/addons/mojo.py        # Mojo (in-tree)
-%run /path/to/gpudev/addons/sslive.py      # slides → linked sslive repo
-%run /path/to/gpudev/addons/tidy3.py       # dplyr prep → linked tidy3 repo
-%run /path/to/gpudev/addons/plot3.py       # grammar plots → linked plot3 repo
-%gpu                                       # then cells run on remote
+# Always the same loaders (CRAFT optional — auto-detected for %gpu seed):
+%run /path/to/gpudev/addons/tidy3.py       # or %run …/tidy3/tidy3.py
+%run /path/to/gpudev/addons/plot3.py       # or %run …/plot3/plot3.py
+# Only if you need GPU:
+%run /path/to/gpudev/CRAFT.py
+%gpu
 ```
+
+gpudev `addons/tidy3.py` / `addons/plot3.py` are thin wrappers that locate the
+clone and `%run` the package `tidy3.py` / `plot3.py` loaders.
 
 | Addon | In gpudev | Full code | Provides |
 |-------|-----------|-----------|----------|

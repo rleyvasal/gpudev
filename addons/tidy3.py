@@ -1,22 +1,18 @@
-# tidy3 addon entry — separate repo, linked under addons/tidy3/
+# tidy3 addon entry — thin wrapper around the package loader.
 #
-#   %local
-#   %run /path/to/gpudev/CRAFT.py
-#   %run /path/to/gpudev/addons/tidy3.py   # ← own cell preferred
-#   %gpu
+# Always the same one-liner (local *or* GPU)::
 #
-# IMPORTANT (SolveIt on the GPU host):
-#   Paths are /app/data/gpudevd/... on the *server*, not your Mac.
-#   git pull both gpudev and tidy3 on that host, then re-%run this file.
-#   You must see:  CRAFT: tidy3 … loaded (local) from …
+#   %run /path/to/gpudev/addons/tidy3.py
+#   # or directly:
+#   %run /path/to/tidy3/tidy3.py
+#
+# CRAFT is optional. The package loader auto-detects CRAFT and seeds the
+# remote under %gpu when connected; without CRAFT it is pure local.
 
 from __future__ import annotations
 
 import sys
-import traceback
 from pathlib import Path
-
-print("CRAFT: tidy3 addon starting…", flush=True)
 
 if __name__ == "tidy3":  # pragma: no cover
     raise ImportError(
@@ -27,262 +23,55 @@ if __name__ == "tidy3":  # pragma: no cover
 _HERE = Path(__file__).resolve().parent
 _CANDIDATES = [
     _HERE / "tidy3",  # symlink: addons/tidy3/ → tidy3 clone
-    _HERE.parent.parent / "tidy3",  # sibling …/gpudevd/tidy3
+    _HERE.parent.parent / "tidy3",
     Path("/app/data/gpudevd/tidy3"),
     Path("/app/data/tidy3"),
     Path.home() / "tidy3",
     Path("/home/gpudev/tidy3"),
 ]
 
-print("CRAFT: searching for tidy3 package…", flush=True)
+print("tidy3: addon searching for package…", flush=True)
 for _p in _CANDIDATES:
-    _ok = (_p / "src" / "tidy3").is_dir() or (_p / "tidy3").is_dir()
+    _ok = (_p / "tidy3.py").is_file() or (_p / "src" / "tidy3").is_dir()
     print(f"  [{'ok' if _ok else '  '}] {_p}", flush=True)
 
 _root = next(
-    (p for p in _CANDIDATES if (p / "src" / "tidy3").is_dir() or (p / "tidy3").is_dir()),
+    (
+        p
+        for p in _CANDIDATES
+        if (p / "tidy3.py").is_file()
+        or (p / "src" / "tidy3").is_dir()
+        or (p / "tidy3").is_dir()
+    ),
     None,
 )
-_pkg_dir = None
 if _root is None:
     try:
         import tidy3  # noqa: F401
-
-        print(f"CRAFT: using installed tidy3 at {tidy3.__file__}", flush=True)
     except ImportError as e:
         raise FileNotFoundError(
-            "tidy3 not found on this machine. On the SolveIt/GPU host run:\n"
-            "  cd /app/data/gpudevd && git clone https://github.com/rleyvasal/tidy3.git\n"
-            "  # or: ln -s /path/to/tidy3 /app/data/gpudevd/gpudev/addons/tidy3\n"
-            "  cd tidy3 && git pull && git checkout expand-dplyr-parity  # if needed\n"
+            "tidy3 not found. Clone https://github.com/rleyvasal/tidy3 and either:\n"
+            f"  ln -s /path/to/tidy3 {_HERE / 'tidy3'}\n"
+            "or:\n"
+            "  pip install -e /path/to/tidy3\n"
             "Then re-run this addon."
         ) from e
-else:
-    _root = _root.resolve()  # follow symlink → real clone (for git pull path)
-    src = _root / "src"
-    _pkg_dir = str(src if (src / "tidy3").is_dir() else _root)
-    while _pkg_dir in sys.path:
-        sys.path.remove(_pkg_dir)
-    sys.path.insert(0, _pkg_dir)
-    print(f"CRAFT: tidy3 root={_root}  pkg_path={_pkg_dir}", flush=True)
-
-try:
     from IPython import get_ipython
-except Exception:  # pragma: no cover
-    get_ipython = None
+    from tidy3.jupyter import ensure_ipython_integration, inject_api
 
-# Fresh import every %run so git pull takes effect without kernel restart.
-for _m in [m for m in list(sys.modules) if m == "tidy3" or m.startswith("tidy3.")]:
-    del sys.modules[_m]
-
-try:
-    import tidy3
-except Exception:
-    print("CRAFT: FAILED to import tidy3:", flush=True)
-    traceback.print_exc()
-    raise
-
-print(
-    f"CRAFT: imported tidy3 {getattr(tidy3, '__version__', '?')} "
-    f"from {Path(tidy3.__file__).resolve()}",
-    flush=True,
-)
-
-# Build user_ns from package __all__ only — never hard-require new symbols
-# (old clones must still load; missing names are simply omitted).
-_PUBLIC = {"tidy3": tidy3}
-for _name in getattr(tidy3, "__all__", []):
-    if _name.startswith("_"):
-        continue
-    try:
-        _PUBLIC[_name] = getattr(tidy3, _name)
-    except AttributeError:
-        pass
-# Always expose the entry helpers if present
-for _name in ("tidy", "TidyFrame", "col", "filter", "select", "mutate", "arrange"):
-    if hasattr(tidy3, _name):
-        _PUBLIC[_name] = getattr(tidy3, _name)
-
-_SEED_STATE = {"stamp": None, "kc_id": None, "ok": False}
-
-
-def seed_remote(*, force: bool = False, quiet: bool = False, style_polars: bool = True) -> bool:
-    """Ship tidy3 to the CRAFT remote kernel (idempotent)."""
-    try:
-        from tidy3 import craft
-    except ImportError:
-        if not quiet:
-            print(
-                "CRAFT: tidy3 remote seed unavailable (no craft module). "
-                "git pull the tidy3 clone on this host and re-run addons/tidy3.py",
-                flush=True,
-            )
-        return False
-
-    ip = get_ipython() if get_ipython else None
-    if ip is None:
-        return False
-    ns = ip.user_ns or {}
-    rr = ns.get("remote_run_")
-    mgr = ns.get("_exec_mgr")
-    if not callable(rr) or mgr is None:
-        if not quiet:
-            print(
-                "CRAFT: tidy3 local only (remote not connected yet — "
-                "will seed on first %gpu cell)",
-                flush=True,
-            )
-        return False
-
-    payload, stamp = craft.build_payload()
-    kc_id = id(getattr(mgr, "remote_kc", None))
-    if (
-        not force
-        and _SEED_STATE["stamp"] == stamp
-        and _SEED_STATE["kc_id"] == kc_id
-    ):
-        return _SEED_STATE["ok"]
-
-    ok, msg = craft.seed(rr, payload=payload, stamp=stamp, style_polars=style_polars)
-    _SEED_STATE.update(stamp=stamp, kc_id=kc_id, ok=ok)
-    if ok:
-        if not quiet:
-            print(f"CRAFT: {msg}", flush=True)
-    else:
-        print(
-            "CRAFT: tidy3 remote seed FAILED — %gpu cells won't know tidy3.\n"
-            + msg
-            + "\nRetry with seed_tidy3_remote(force=True)",
-            flush=True,
-        )
-    return ok
-
-
-def _maybe_seed_on_cell(_info=None):
-    try:
-        import gpudev_craft.core as _core
-
-        router = getattr(_core, "ROUTER", None)
-        py_be = getattr(_core, "PY_BACKEND", None)
-        if router is None or py_be is None or router.backend is not py_be:
-            return
-    except Exception:
-        return
-    seed_remote(quiet=True)
-
-
-ip = get_ipython() if get_ipython else None
-if ip is None:
-    print(
-        "CRAFT: WARNING — get_ipython() is None; magics/pipe rewriter not registered.\n"
-        "  Are you running this with %run inside SolveIt/IPython?",
-        flush=True,
-    )
-elif getattr(ip, "user_ns", None) is None:
-    print("CRAFT: WARNING — no user_ns on IPython shell", flush=True)
+    ip = get_ipython()
+    if ip is not None:
+        inject_api(ip, force=True)
+        ensure_ipython_integration(quiet=False)
+    print(f"tidy3: using installed package at {tidy3.__file__}", flush=True)
 else:
-    # Force-overwrite (datar/pipda often already own mean/sum/filter on remotes).
-    ip.user_ns.update(_PUBLIC)
-    ip.user_ns["seed_tidy3_remote"] = seed_remote
-    _clash = [
-        n
-        for n, v in _PUBLIC.items()
-        if n in ("mean", "sum", "min", "max", "filter", "n", "select")
-        and getattr(v, "__module__", "").startswith("tidy3")
-    ]
-    print(
-        f"CRAFT: injected {len(_PUBLIC)} names into user_ns "
-        f"(forced tidy3 API incl. {', '.join(_clash[:8])})",
-        flush=True,
-    )
-
-    # Register pipe rewriter + %tidy3_pipes / %%tidy3_run
-    try:
-        import tidy3.jupyter as _tj
-
-        # New clones: ensure_ipython_integration. Older clones: load_ext only.
-        if hasattr(_tj, "ensure_ipython_integration"):
-            _tj.ensure_ipython_integration(quiet=False)
-        else:
-            print(
-                "CRAFT: tidy3.jupyter is an older build (no ensure_ipython_integration).\n"
-                "  On this host run:\n"
-                f"    cd {_root or Path(tidy3.__file__).resolve().parents[1]}\n"
-                "    git fetch && git checkout expand-dplyr-parity && git pull\n"
-                "  Then re-%run addons/tidy3.py",
-                flush=True,
-            )
-            _em = ip.extension_manager
-            _loaded = getattr(_em, "loaded", set())
-            _loaded.discard("tidy3.jupyter")
-            try:
-                _em.load_extension("tidy3.jupyter")
-            except Exception as _le:
-                print(f"CRAFT: load_extension(tidy3.jupyter) failed: {_le}", flush=True)
-
-        if hasattr(_tj, "enable_pipe_transform"):
-            _tj.enable_pipe_transform(ip)
-
-        _lines = getattr(ip.magics_manager, "magics", {}).get("line", {})
-        print(
-            f"CRAFT: %tidy3_pipes registered: {'tidy3_pipes' in _lines}",
-            flush=True,
+    _root = _root.resolve()
+    loader = _root / "tidy3.py"
+    if not loader.is_file():
+        loader = _root / "load.py"
+    if not loader.is_file():
+        raise FileNotFoundError(
+            f"tidy3 clone at {_root} has no tidy3.py/load.py — git pull expand-dplyr-parity"
         )
-        _cleanup = getattr(ip, "input_transformers_cleanup", []) or []
-        _is_pipe = getattr(_tj, "_is_pipe_transformer", None)
-        if callable(_is_pipe):
-            _pos = next((i for i, t in enumerate(_cleanup) if _is_pipe(t)), None)
-        else:
-            _pos = next(
-                (
-                    i
-                    for i, t in enumerate(_cleanup)
-                    if getattr(t, "__name__", "") == "tidy3_input_transformer"
-                ),
-                None,
-            )
-        print(
-            f"CRAFT: pipe transformer "
-            f"{'ON at cleanup[' + str(_pos) + ']' if _pos is not None else 'OFF'}",
-            flush=True,
-        )
-        if _pos is None:
-            print(
-                "  Multi-line >> without parentheses will SyntaxError until "
-                "transformer is ON.\n"
-                "  Workaround: ( tidy(cars) >> filter(...) >> ... )",
-                flush=True,
-            )
-    except Exception as _ext_err:
-        print(f"CRAFT: tidy3.jupyter setup FAILED: {_ext_err}", flush=True)
-        traceback.print_exc()
-        print(
-            "  Workaround: wrap multi-line pipes in parentheses:\n"
-            "    ( tidy(cars) >> filter(...) >> summarise(...) )",
-            flush=True,
-        )
-
-    try:
-        _prev = ip.user_ns.get("_tidy3_seed_cb")
-        if _prev is not None:
-            try:
-                ip.events.unregister("pre_run_cell", _prev)
-            except Exception:
-                pass
-        ip.events.register("pre_run_cell", _maybe_seed_on_cell)
-        ip.user_ns["_tidy3_seed_cb"] = _maybe_seed_on_cell
-    except Exception:
-        pass
-    seed_remote(quiet=False)
-
-print(
-    f"CRAFT: tidy3 {tidy3.__version__} loaded (local) "
-    f"from {Path(tidy3.__file__).resolve().parent}",
-    flush=True,
-)
-print(
-    "  multi-line >> auto-rewritten when pipe transformer is ON\n"
-    "  fallback: ( tidy(df) >> filter(...) >> ... )\n"
-    "  %tidy3_pipes status | on | off     seed_tidy3_remote(force=True)",
-    flush=True,
-)
+    print(f"tidy3: addon → {_root.name}/{loader.name}", flush=True)
+    exec(compile(loader.read_text(encoding="utf-8"), str(loader), "exec"), globals())
