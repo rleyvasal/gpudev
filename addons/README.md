@@ -146,12 +146,16 @@ unregister_transform("tidy3")
 Rules:
 
 1. **`PythonBackend.passthru()` stays boring** — local vs remote only (core
-   magics, shell `!…`, `get_ipython()`, …). No syntax rewrite there.
+   magics, `get_ipython()`, router internals). No syntax rewrite there.
+   Under `%gpu`, notebook shell cells (`!ls`, `!whoami`, `!pip …`) route to
+   the remote kernel like any other cell — do **not** force-`!` passthru to
+   the host (that masks whether the GPU session is live).
 2. Transforms are registered only when the addon is loaded, enabled only while
    that package mode is active, and removed/bypassed on unload/disable.
 3. Prefer package-native forms that need no rewrite when possible (e.g. tidy3
    negation: use `~starts_with(...)`; optional `!` sugar only inside tidy3
-   verbs in Jupyter — never global `!` → `~`, so `!pip install` stays literal).
+   verbs in Jupyter — never global `!` → `~`, so shell `!pip` is not turned
+   into `~pip`).
 
 ## Order
 

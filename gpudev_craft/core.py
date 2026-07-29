@@ -1232,8 +1232,6 @@ class PythonBackend:
 
         return (
             s.startswith(tuple(_local_magic_set()))
-            # Jupyter shell escapes stay on the host (install, local tools).
-            or s.startswith("!")
             or "get_ipython()" in c
             or s.startswith(("await call_tool(", "_exec_mgr.", "remote_run_("))
         )
