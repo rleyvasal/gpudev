@@ -1060,6 +1060,77 @@ class RemoteExecutionManager:
 
 
 
+# ── Package transform registry ────────────────────────────────────────────────
+# CRAFT core never rewrites package syntax. Addons register optional source
+# transforms here; they run only while active, on the path:
+#
+#   raw_code → CRAFT router → active addon transforms → backend execute
+#
+# Default path (no addons / all inactive):
+#
+#   raw_code → CRAFT router → backend execute
+#
+# Transforms are not global language features: unloading or deactivating a
+# package removes/bypasses its rewrite. PythonBackend.passthru stays boring
+# (local vs remote only).
+
+_TRANSFORMS: dict = {}  # name -> {"fn": callable, "active": bool}
+
+
+def register_transform(name: str, fn, *, active: bool = True) -> None:
+    """Register a package source transform. Idempotent per *name*.
+
+    *fn* receives the full cell source ``str`` and returns a ``str``
+    (same text if nothing to rewrite). Only applied when ``active`` is true
+    and the cell is being routed to a backend (not passthru).
+    """
+    if not name or not callable(fn):
+        raise ValueError("register_transform(name, fn) requires a non-empty name and callable")
+    _TRANSFORMS[str(name)] = {"fn": fn, "active": bool(active)}
+
+
+def unregister_transform(name: str) -> bool:
+    """Remove a package transform. Returns True if it was present."""
+    return _TRANSFORMS.pop(str(name), None) is not None
+
+
+def set_transform_active(name: str, active: bool) -> bool:
+    """Enable/disable a registered transform without unregistering. Returns True if found."""
+    entry = _TRANSFORMS.get(str(name))
+    if entry is None:
+        return False
+    entry["active"] = bool(active)
+    return True
+
+
+def list_transforms():
+    """Return ``[(name, active), ...]`` for debugging / status magics."""
+    return [(n, bool(e.get("active"))) for n, e in _TRANSFORMS.items()]
+
+
+def _apply_active_transforms(code: str) -> str:
+    """Run active package transforms in registration order. Core is a no-op."""
+    if not _TRANSFORMS:
+        return code
+    out = code
+    for _name, entry in list(_TRANSFORMS.items()):
+        if not entry.get("active"):
+            continue
+        fn = entry.get("fn")
+        if not callable(fn):
+            continue
+        try:
+            rewritten = fn(out)
+        except Exception as e:
+            print(f"CRAFT: transform {_name!r} failed: {e}")
+            continue
+        if isinstance(rewritten, str):
+            out = rewritten
+        elif isinstance(rewritten, list):
+            out = "".join(rewritten)
+    return out
+
+
 # ── Mode Router ───────────────────────────────────────────────────────────────
 class ModeRouter:
     def __init__(self):
@@ -1071,9 +1142,12 @@ class ModeRouter:
 
         code = "".join(lines)
 
+        # passthru: host-local only — no package rewriting, no remote.
         if self.backend.passthru(code):
             return lines
 
+        # Package addons own syntax transforms; core only routes.
+        code = _apply_active_transforms(code)
         self.backend.pending = code
         return [self.backend.dispatch + "\n"]
 
@@ -1148,10 +1222,18 @@ class PythonBackend:
         _local_magic_set().update(value)
 
     def passthru(self, c):
+        """Host-local only — no syntax rewriting.
+
+        Decides whether a cell stays on the notebook kernel under ``%gpu``.
+        Package transforms (tidy3, plot3, …) must not live here; they register
+        via :func:`register_transform` and run only for non-passthru cells.
+        """
         s = c.lstrip()
 
         return (
             s.startswith(tuple(_local_magic_set()))
+            # Jupyter shell escapes stay on the host (install, local tools).
+            or s.startswith("!")
             or "get_ipython()" in c
             or s.startswith(("await call_tool(", "_exec_mgr.", "remote_run_("))
         )
@@ -1302,6 +1384,10 @@ _USER_NS_EXPORTS = (
     "CONFIG_PATH",
     "KERNEL_PORTS",
     "register_local_magic",
+    "register_transform",
+    "unregister_transform",
+    "set_transform_active",
+    "list_transforms",
     "remote_run_",
     "_exec_mgr",
     "_mojo_mgr",
@@ -1402,8 +1488,10 @@ def install_core(*, quiet: bool = False) -> bool:
         print("CRAFT core ready")
         print("  %gpu  %local  %kernel_status  %restart_kernel")
         print("  remote_run_(code)  register_local_magic('%name')")
+        print("  register_transform(name, fn)  # package syntax only; core has none")
         print("  Addons (%local + %run):")
         print("    addons/pcviz.py   addons/mojo.py   addons/sslive.py")
+        print("    addons/tidy3.py   addons/plot3.py")
         if not magics_ok:
             print("  warning: line magics may not have registered (not in IPython?)")
 

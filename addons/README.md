@@ -112,6 +112,47 @@ An addon must register its **entire public surface itself** via `get_ipython()`:
 
 Never rely on `%run` leaking module globals into the dialog namespace.
 
+## Two layers: CRAFT core vs package transforms
+
+CRAFT core only:
+
+- manages the SSH / kernel connection
+- switches `%local` / `%gpu`
+- routes the original cell text to the selected backend
+- knows its own host magics: `%gpu`, `%local`, `%kernel_status`, `%restart_kernel`
+- does **no** package-specific rewriting (`!`, tidyselect, ggplot, …)
+
+Package addons own their syntax:
+
+```text
+raw_code → CRAFT router → optional active addon transforms → backend execute
+```
+
+Default path (no package transforms active):
+
+```text
+raw_code → CRAFT router → backend execute
+```
+
+Register from the package (not from CRAFT core):
+
+```python
+register_transform("tidy3", tidy3_craft_transform, active=True)
+# later:
+set_transform_active("tidy3", False)
+unregister_transform("tidy3")
+```
+
+Rules:
+
+1. **`PythonBackend.passthru()` stays boring** — local vs remote only (core
+   magics, shell `!…`, `get_ipython()`, …). No syntax rewrite there.
+2. Transforms are registered only when the addon is loaded, enabled only while
+   that package mode is active, and removed/bypassed on unload/disable.
+3. Prefer package-native forms that need no rewrite when possible (e.g. tidy3
+   negation: use `~starts_with(...)`; optional `!` sugar only inside tidy3
+   verbs in Jupyter — never global `!` → `~`, so `!pip install` stays literal).
+
 ## Order
 
 1. Always load **CRAFT core** first if you need `%gpu` / `remote_run_`.
