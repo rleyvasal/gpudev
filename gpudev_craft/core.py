@@ -1131,6 +1131,56 @@ def _apply_active_transforms(code: str) -> str:
     return out
 
 
+def _restore_mangled_shell_cell(code: str) -> str:
+    """Undo ``!cmd`` → ``~cmd`` from global bang rewriters (stale tidy3, etc.).
+
+    Jupyter shell cells must reach the remote as ``!whoami`` / ``!pip …``.
+    A global ``!`` → ``~`` pass turns them into ``~whoami`` (NameError).
+    Leave real Python/tidy3 invert alone: ``~(x)``, ``~starts_with(...)``.
+    """
+    if "~" not in code:
+        return code
+    lines = code.splitlines(keepends=True)
+    if not lines:
+        return code
+    for i, ln in enumerate(lines):
+        stripped = ln.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("!"):
+            # Intact shell — nothing to restore.
+            return code
+        if not stripped.startswith("~"):
+            return code
+        rest = stripped[1:]
+        # ``~(expr)`` or ``~name(`` — real invert / tidy3 sugar, not shell.
+        if rest.startswith("("):
+            return code
+        j = 0
+        while j < len(rest) and (rest[j].isalnum() or rest[j] in "_.-"):
+            j += 1
+        if j == 0:
+            return code
+        # After the command token: shell has space/args/end; call has ``(``.
+        k = j
+        while k < len(rest) and rest[k] in " \t":
+            k += 1
+        if k < len(rest) and rest[k] == "(":
+            return code
+        indent = ln[: len(ln) - len(stripped)]
+        # Preserve ``!!cmd`` mangled as ``~~cmd``? only handle single ~.
+        lines[i] = indent + "!" + rest
+        return "".join(lines)
+    return code
+
+
+def _is_shell_escape_cell(code: str) -> bool:
+    s = code.lstrip(" \t")
+    while s.startswith("\n"):
+        s = s[1:].lstrip(" \t")
+    return s.startswith("!")
+
+
 # ── Mode Router ───────────────────────────────────────────────────────────────
 class ModeRouter:
     def __init__(self):
@@ -1146,8 +1196,20 @@ class ModeRouter:
         if self.backend.passthru(code):
             return lines
 
+        # Repair shell cells mangled by a global ``!`` → ``~`` preparser that
+        # ran earlier on input_transformers_cleanup (stale tidy3 masking).
+        code = _restore_mangled_shell_cell(code)
+
+        # Jupyter shell cells (``!cmd`` / ``!!cmd``): route raw to the remote
+        # kernel — never run package transforms that might rewrite ``!`` → ``~``.
+        if _is_shell_escape_cell(code):
+            self.backend.pending = code
+            return [self.backend.dispatch + "\n"]
+
         # Package addons own syntax transforms; core only routes.
         code = _apply_active_transforms(code)
+        # Transforms can re-mangle shell-like lines; restore again.
+        code = _restore_mangled_shell_cell(code)
         self.backend.pending = code
         return [self.backend.dispatch + "\n"]
 
