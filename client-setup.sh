@@ -138,17 +138,28 @@ p.write_text(content)
         log "Added ingress rule: $cf_hostname → localhost:$ssh_port"
     fi
 
-    # Reload the tunnel service so the new ingress rule takes effect
+    # Apply the new ingress rule WITHOUT tearing down the tunnel connection the
+    # admin session may be riding on. `gpudev client add` is usually run over
+    # `ssh gpudev`, which is carried by this very cloudflared connector — a hard
+    # restart here (the previous behaviour) killed that SSH session mid-command and
+    # SIGHUP'd client-setup.sh before the container was built, leaving a half-created
+    # client. cloudflared hot-reloads its config (ingress included) on SIGHUP and
+    # keeps existing connections up, so the admin session survives and the add
+    # completes. A restart is only needed when no connector is running yet.
     if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        sudo systemctl restart gpudev-tunnel
-        log "gpudev-tunnel service restarted."
+        if sudo systemctl kill -s HUP gpudev-tunnel 2>/dev/null; then
+            log "gpudev-tunnel reloaded (SIGHUP — existing connections kept)."
+        else
+            warn "Could not signal gpudev-tunnel; reload it manually so $cf_hostname routes."
+        fi
+    elif pgrep -f "cloudflared tunnel run ${tunnel_name}" >/dev/null 2>&1; then
+        pkill -HUP -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
+        log "Host tunnel reloaded (SIGHUP — existing connections kept)."
     else
-        # WSL2: kill and relaunch in background
-        pkill -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
-        sleep 1
+        # No connector running (initial setup or after a crash) — start one detached.
         nohup cloudflared tunnel run "${tunnel_name}" \
             >"${HOME}/.cloudflared/tunnel.log" 2>&1 &
-        log "Host tunnel restarted in background (pid $!)."
+        log "Host tunnel started in background (pid $!)."
     fi
 }
 
