@@ -215,6 +215,30 @@ PY
 
 # ── gpudev client add ─────────────────────────────────────────────────────────
 
+# Reload the cloudflared connector LAST and DETACHED. Any reload (restart or
+# SIGHUP) makes cloudflared re-dial its edge, which drops tunnel connections —
+# including the `ssh gpudev` session a client add/remove may ride on. Detaching
+# with a short delay lets the command finish and return first, so cleanup completes
+# and the operator sees full output before the brief drop; reconnect after.
+schedule_tunnel_reload() {
+    local tunnel_name="$1"
+    echo ""
+    log "Reloading the cloudflared connector to apply the tunnel change"
+    log "(detached, in a few seconds). This briefly drops tunnel connections — if you"
+    log "are connected via 'ssh gpudev', this shell will drop; just reconnect."
+    if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+        setsid bash -c 'sleep 3; sudo systemctl restart gpudev-tunnel' \
+            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
+    else
+        setsid bash -c "sleep 3
+pkill -f 'cloudflared tunnel run ${tunnel_name}' 2>/dev/null
+sleep 1
+nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log' 2>&1" \
+            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
+    fi
+    log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
+}
+
 cmd_client_add() {
     local name="${1:-}"
     [ -n "$name" ] || fail "Usage: gpudev client add <name>"
@@ -238,7 +262,7 @@ cmd_client_remove() {
     require_host_setup
     client_exists "$name" || fail "Client '$name' not found."
 
-    local ssh_port cf_domain tunnel_name
+    local ssh_port cf_domain tunnel_name _need_tunnel_reload=0
     ssh_port="$(client_get "$name" ssh_port)"
     cf_domain="$(host_get cf_domain)"
     tunnel_name="$(host_get linux_user)"
@@ -288,16 +312,10 @@ for line in lines:
 p.write_text(''.join(out))
 "
         log "Ingress rule for $cf_hostname removed from config.yml."
-
-        if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-            sudo systemctl restart gpudev-tunnel
-        else
-            pkill -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
-            sleep 1
-            nohup cloudflared tunnel run "${tunnel_name}" \
-                >"${HOME}/.cloudflared/tunnel.log" 2>&1 &
-            log "Host tunnel restarted."
-        fi
+        # Don't reload here — a connector reload drops the `ssh gpudev` session this
+        # command rides on, aborting the remove before DNS + registry cleanup. Defer
+        # it to the end, detached (schedule_tunnel_reload).
+        _need_tunnel_reload=1
     fi
 
     # Remove Cloudflare DNS record via API
@@ -342,6 +360,12 @@ p.write_text(''.join(out))
     log "Client '$name' removed from registry."
     echo ""
     echo "Client '$name' fully removed."
+
+    # Apply the ingress removal last and detached, so it can't drop this session
+    # before the cleanup above finished.
+    if [ "$_need_tunnel_reload" = "1" ]; then
+        schedule_tunnel_reload "$tunnel_name"
+    fi
 }
 
 # ── gpudev client start/stop/restart ─────────────────────────────────────────
