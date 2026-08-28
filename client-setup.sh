@@ -138,29 +138,42 @@ p.write_text(content)
         log "Added ingress rule: $cf_hostname → localhost:$ssh_port"
     fi
 
-    # Apply the new ingress rule WITHOUT tearing down the tunnel connection the
-    # admin session may be riding on. `gpudev client add` is usually run over
-    # `ssh gpudev`, which is carried by this very cloudflared connector — a hard
-    # restart here (the previous behaviour) killed that SSH session mid-command and
-    # SIGHUP'd client-setup.sh before the container was built, leaving a half-created
-    # client. cloudflared hot-reloads its config (ingress included) on SIGHUP and
-    # keeps existing connections up, so the admin session survives and the add
-    # completes. A restart is only needed when no connector is running yet.
+    # DO NOT reload the connector here. `gpudev client add` is usually run over
+    # `ssh gpudev`, carried by this very cloudflared connector; reloading it now —
+    # restart OR SIGHUP, cloudflared re-dials its edge either way — drops this
+    # session mid-setup and aborts the add before the container is built (that was
+    # the original bug, and SIGHUP proved no gentler). The connector only needs the
+    # new ingress once everything else is done, so we defer the reload to the very
+    # end of main() and run it DETACHED (schedule_tunnel_reload), where a dropped
+    # session can no longer interrupt anything.
+    NEED_TUNNEL_RELOAD=1
+    RELOAD_TUNNEL_NAME="$tunnel_name"
+    log "Ingress rule staged; tunnel reload deferred to the end (keeps this session alive during setup)."
+}
+
+# Reload the connector so the new ingress route takes effect — as the LAST thing,
+# and DETACHED. cloudflared re-dials its edge on reload, which drops tunnel
+# connections (including this SSH session if it rides the tunnel). Detaching with a
+# short delay lets `gpudev client add` fully finish and return first, so the client
+# is already created and the operator sees complete output before the brief drop.
+schedule_tunnel_reload() {
+    local tunnel_name="$1"
+    echo ""
+    step "Applying tunnel route"
+    log "The client is fully created. Reloading the cloudflared connector to route it"
+    log "(detached, in a few seconds). This briefly drops tunnel connections — if you"
+    log "are connected via 'ssh gpudev', this shell will drop; just reconnect."
     if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        if sudo systemctl kill -s HUP gpudev-tunnel 2>/dev/null; then
-            log "gpudev-tunnel reloaded (SIGHUP — existing connections kept)."
-        else
-            warn "Could not signal gpudev-tunnel; reload it manually so $cf_hostname routes."
-        fi
-    elif pgrep -f "cloudflared tunnel run ${tunnel_name}" >/dev/null 2>&1; then
-        pkill -HUP -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
-        log "Host tunnel reloaded (SIGHUP — existing connections kept)."
+        setsid bash -c 'sleep 3; sudo systemctl restart gpudev-tunnel' \
+            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
     else
-        # No connector running (initial setup or after a crash) — start one detached.
-        nohup cloudflared tunnel run "${tunnel_name}" \
-            >"${HOME}/.cloudflared/tunnel.log" 2>&1 &
-        log "Host tunnel started in background (pid $!)."
+        setsid bash -c "sleep 3
+pkill -f 'cloudflared tunnel run ${tunnel_name}' 2>/dev/null
+sleep 1
+nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log' 2>&1" \
+            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
     fi
+    log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
 }
 
 # ── Container init ────────────────────────────────────────────────────────────
@@ -519,6 +532,12 @@ main() {
     else
         log ""
         log "Next step: give the client their SSH config — run 'gpudev client info $CLIENT_NAME'"
+    fi
+
+    # Reload the connector LAST and detached, so applying the new route can't drop
+    # this session before the client is built (see schedule_tunnel_reload).
+    if [ "${NEED_TUNNEL_RELOAD:-0}" = "1" ]; then
+        schedule_tunnel_reload "$RELOAD_TUNNEL_NAME"
     fi
 }
 
