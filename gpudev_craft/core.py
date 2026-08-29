@@ -753,6 +753,16 @@ def _summarize_terminal_progress(value, percent):
     return " · ".join(parts)
 
 
+def _is_structured_terminal_progress(value):
+    """True only for terminal redraws CRAFT knows how to summarize safely."""
+    value = value.strip()
+    return bool(
+        _PIP_RAW_PROGRESS_RE.fullmatch(value)
+        or _parse_curl_progress(value)
+        or _PERCENT_PROGRESS_RE.search(value)
+    )
+
+
 class _HybridOutputRenderer:
     """Render remote IOPub output without flooding the SolveIt cell.
 
@@ -958,16 +968,23 @@ class _HybridOutputRenderer:
             self._set_byte_progress_locked(int(pip_match.group(1)), int(pip_match.group(2)))
             return None
         if had_carriage_return or len(revisions) > 1:
-            if candidate:
+            if candidate and _is_structured_terminal_progress(candidate):
                 self._set_terminal_progress_locked(candidate)
-            return None
+                return None
+            # Remote shell streams commonly use CRLF. Unknown carriage-return
+            # text is command output, not a progress protocol; preserve the
+            # final terminal revision instead of silently discarding it.
+            return candidate + "\n" if candidate else None
 
         if candidate:
             self._last_log_line = candidate
         return record + "\n"
 
     def _handle_stream(self, name, text):
-        text = _strip_ansi(text or "")
+        # Normalize complete CRLF records before interpreting bare carriage
+        # returns as terminal redraws. ``\r`` and ``\n`` can still arrive in
+        # separate IOPub messages; the buffering branch below handles that.
+        text = re.sub(r"\r+\n", "\n", _strip_ansi(text or ""))
         if not text:
             return
         name = name if name in self._stream_buffers else "stdout"
@@ -993,11 +1010,15 @@ class _HybridOutputRenderer:
                     (part.strip() for part in reversed(combined.split("\r")) if part.strip()),
                     "",
                 )
-                if candidate:
+                if candidate and _is_structured_terminal_progress(candidate):
                     self._set_terminal_progress_locked(candidate)
-                # Retain the CR marker so a later newline is recognized as the
-                # final redraw rather than printed as a duplicate log line.
-                self._stream_buffers[name] = f"\r{candidate}" if candidate else ""
+                    # Retain the CR marker so a later newline is recognized as
+                    # the final redraw rather than printed as a duplicate.
+                    self._stream_buffers[name] = f"\r{candidate}"
+                else:
+                    # Likely a CRLF split across messages. Wait for the newline
+                    # (or finish()) before deciding, so ordinary CLI text wins.
+                    self._stream_buffers[name] = combined
                 return
 
             stripped = combined.strip()

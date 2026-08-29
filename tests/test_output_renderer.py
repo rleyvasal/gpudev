@@ -23,6 +23,23 @@ class FakeIPython:
         self.display_pub = FakeDisplayPublisher()
 
 
+class FakeRemoteKernelClient:
+    def __init__(self):
+        self.last_result = None
+
+    def execute_interactive(self, code, output_hook):
+        renderer = output_hook.__self__
+        with renderer._lock:
+            renderer._publish_running_locked()
+        output_hook(
+            {
+                "msg_type": "stream",
+                "content": {"name": "stdout", "text": "gpudev\r\n"},
+            }
+        )
+        return {"content": {"status": "ok"}}
+
+
 class HybridOutputRendererTests(unittest.TestCase):
     def setUp(self):
         self.ip = FakeIPython()
@@ -53,7 +70,7 @@ class HybridOutputRendererTests(unittest.TestCase):
             renderer.handle(
                 {
                     "msg_type": "stream",
-                    "content": {"name": "stdout", "text": "gpudev\n"},
+                    "content": {"name": "stdout", "text": "gpudev\r\n"},
                 }
             )
             renderer.finish("completed")
@@ -62,6 +79,31 @@ class HybridOutputRendererTests(unittest.TestCase):
         published = [call["data"]["text/plain"] for call in self.ip.display_pub.calls]
         self.assertNotIn("GPU job completed", "\n".join(published))
         self.assertEqual(published[-1], "")
+
+    def test_cli_output_survives_crlf_split_across_messages(self):
+        renderer = core._HybridOutputRenderer(status_delay=60, code="!whoami")
+        with renderer._lock:
+            renderer._publish_running_locked()
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {"name": "stdout", "text": "gpudev\r"},
+                }
+            )
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {"name": "stdout", "text": "\n"},
+                }
+            )
+            renderer.finish("completed")
+
+        self.assertEqual(stdout.getvalue(), "gpudev\n")
+        published = [call["data"]["text/plain"] for call in self.ip.display_pub.calls]
+        self.assertNotIn("GPU job completed", "\n".join(published))
 
     def test_execute_result_suppresses_generic_completion_card(self):
         renderer = core._HybridOutputRenderer(status_delay=60, code="2 + 2")
@@ -82,6 +124,21 @@ class HybridOutputRendererTests(unittest.TestCase):
 
         published = [call["data"].get("text/plain", "") for call in self.ip.display_pub.calls]
         self.assertIn("4", published)
+        self.assertNotIn("GPU job completed", "\n".join(published))
+
+    def test_remote_manager_preserves_shell_output_after_status(self):
+        manager = core.RemoteExecutionManager()
+        manager.remote_kc = FakeRemoteKernelClient()
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(manager, "_ensure_live", return_value=True),
+            contextlib.redirect_stdout(stdout),
+        ):
+            manager.execute_remote("!whoami")
+
+        self.assertEqual(stdout.getvalue(), "gpudev\n")
+        published = [call["data"]["text/plain"] for call in self.ip.display_pub.calls]
         self.assertNotIn("GPU job completed", "\n".join(published))
 
     def test_pip_raw_bytes_become_one_live_progress_display(self):
