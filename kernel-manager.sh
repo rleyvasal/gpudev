@@ -226,6 +226,9 @@ launch_kernel() {
     export VIRTUAL_ENV="${VENV}"
     export UV_PROJECT_ENVIRONMENT="${VENV}"
     export PATH="${VENV}/bin:${PATH}"
+    # CRAFT turns pip's machine-readable byte counters into one live notebook
+    # progress bar. A user's explicit --progress-bar option still overrides it.
+    export PIP_PROGRESS_BAR="${PIP_PROGRESS_BAR:-raw}"
     nohup "${VENV}/bin/python" -m ipykernel_launcher -f "$CONNECTION_FILE" \
         >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"

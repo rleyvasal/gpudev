@@ -358,6 +358,8 @@ plotly>=5.24.0,<6
 # pillow: torch may already install a newer build; allow either
 pillow>=10.0.0
 tqdm>=4.66.0
+# 1.1+ pulls a web-framework stack; 1.0.x has the notebook bars CRAFT needs.
+fastprogress>=1.0.3,<1.1
 httpx>=0.27.0
 requests>=2.32.0
 transformers>=4.46.0,<4.50

@@ -8,7 +8,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 import os
 import shutil
@@ -648,6 +650,322 @@ def _diagnose_port_holders(ports):
 
 
 # ── Output Display ────────────────────────────────────────────────────────────
+_PIP_RAW_PROGRESS_RE = re.compile(r"^Progress\s+(\d+)\s+of\s+(\d+)\s*$", re.I)
+_PERCENT_PROGRESS_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|\d{1,2}(?:\.\d+)?)%")
+
+
+def _format_elapsed(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _format_bytes(value):
+    value = float(max(0, value))
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{value:.0f} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+class _HybridOutputRenderer:
+    """Render remote IOPub output without flooding the SolveIt cell.
+
+    Normal lines remain ordinary notebook output. Terminal-style progress
+    (carriage-return redraws and pip's ``--progress-bar=raw`` protocol) is
+    collapsed into one local HTML ``<progress>`` display. A delayed status
+    thread makes otherwise-silent remote work visibly alive.
+    """
+
+    def __init__(self, status_delay=1.0, status_interval=1.0):
+        self.status_delay = max(0, float(status_delay))
+        self.status_interval = max(0.1, float(status_interval))
+        self.started_at = time.monotonic()
+        self.last_activity_at = self.started_at
+        self.display_id = f"gpudev-progress-{uuid.uuid4().hex}"
+        self._stop = threading.Event()
+        self._lock = threading.RLock()
+        self._thread = None
+        self._status_visible = False
+        self._external_progress = False
+        self._native_progress = False
+        self._saw_error = False
+        self._finished = False
+        self._stream_buffers = {"stdout": "", "stderr": ""}
+        self._last_log_line = ""
+        self._progress_current = None
+        self._progress_total = None
+        self._progress_unit = None
+        self._progress_text = ""
+        self._rate = None
+        self._rate_sample = None
+
+    @property
+    def saw_error(self):
+        return self._saw_error
+
+    def start(self):
+        if get_ipython() is None:
+            return
+        self._thread = threading.Thread(
+            target=self._status_loop,
+            name="gpudev-output-status",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _status_loop(self):
+        if self._stop.wait(self.status_delay):
+            return
+        while not self._stop.is_set():
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                if not self._external_progress:
+                    self._publish_running_locked()
+            if self._stop.wait(self.status_interval):
+                return
+
+    def _publish(self, html_value, plain_value, update=None):
+        ip = get_ipython()
+        publisher = getattr(ip, "display_pub", None) if ip is not None else None
+        if publisher is None:
+            return False
+        if update is None:
+            update = self._status_visible
+        try:
+            publisher.publish(
+                data={"text/html": html_value, "text/plain": plain_value},
+                metadata={},
+                transient={"display_id": self.display_id},
+                update=bool(update),
+            )
+            self._status_visible = True
+            return True
+        except Exception:
+            # Progress UI must never turn a successful remote job into a local
+            # execution failure. Ordinary output still flows through below.
+            return False
+
+    def _progress_label(self):
+        if self._last_log_line.lower().startswith(("downloading", "collecting")):
+            return self._last_log_line[:240]
+        if self._progress_unit == "bytes":
+            return "Downloading packages on GPU"
+        return "GPU job in progress"
+
+    def _running_markup_locked(self):
+        now = time.monotonic()
+        elapsed = _format_elapsed(now - self.started_at)
+        idle = max(0, int(now - self.last_activity_at))
+        activity = "active now" if idle < 2 else f"last output {idle}s ago"
+        label = html.escape(self._progress_label())
+
+        progress_attrs = ""
+        detail = ""
+        if self._progress_current is not None and self._progress_total:
+            current = max(0, min(self._progress_current, self._progress_total))
+            total = self._progress_total
+            progress_attrs = f' value="{current}" max="{total}"'
+            percent = 100 * current / total
+            if self._progress_unit == "bytes":
+                detail = f"{_format_bytes(current)} / {_format_bytes(total)} · {percent:.1f}%"
+                if self._rate:
+                    detail += f" · {_format_bytes(self._rate)}/s"
+                    if current < total:
+                        detail += f" · ETA {_format_elapsed((total - current) / self._rate)}"
+            else:
+                detail = self._progress_text or f"{percent:.1f}%"
+        elif self._progress_text:
+            detail = self._progress_text
+
+        detail_html = f'<span style="margin-left:.65rem">{html.escape(detail)}</span>' if detail else ""
+        markup = (
+            '<div role="status" aria-live="polite" style="font:13px/1.4 system-ui,sans-serif;'
+            'padding:.45rem .65rem;border:1px solid #d0d7de;border-radius:6px;max-width:760px">'
+            f'<div style="display:flex;justify-content:space-between;gap:1rem;margin-bottom:.3rem">'
+            f'<strong>{label}</strong><span>{elapsed} · {activity}</span></div>'
+            f'<progress{progress_attrs} style="width:min(34rem,70%);vertical-align:middle"></progress>'
+            f'{detail_html}</div>'
+        )
+        plain = f"{self._progress_label()} — {detail or activity} ({elapsed})"
+        return markup, plain
+
+    def _publish_running_locked(self):
+        markup, plain = self._running_markup_locked()
+        self._publish(markup, plain)
+
+    def _hide_status_locked(self):
+        if self._status_visible:
+            self._publish("", "", update=True)
+            self._status_visible = False
+
+    def _set_byte_progress_locked(self, current, total):
+        now = time.monotonic()
+        sample = self._rate_sample
+        if sample and sample[2] == total and current >= sample[1]:
+            delta_t = now - sample[0]
+            if delta_t >= 0.05 and current > sample[1]:
+                instantaneous = (current - sample[1]) / delta_t
+                self._rate = instantaneous if self._rate is None else (0.7 * self._rate + 0.3 * instantaneous)
+        else:
+            self._rate = None
+        self._rate_sample = (now, current, total)
+        self._progress_current = current
+        self._progress_total = total
+        self._progress_unit = "bytes"
+        self._progress_text = ""
+        self._native_progress = True
+        self._publish_running_locked()
+
+    def _set_terminal_progress_locked(self, value):
+        value = value.strip()
+        percent_match = _PERCENT_PROGRESS_RE.search(value)
+        if percent_match:
+            percent = float(percent_match.group(1))
+            self._progress_current = percent
+            self._progress_total = 100.0
+            self._progress_unit = "percent"
+        else:
+            self._progress_current = None
+            self._progress_total = None
+            self._progress_unit = None
+        self._progress_text = value[-300:]
+        self._native_progress = True
+        self._publish_running_locked()
+
+    def _consume_record_locked(self, record, had_carriage_return=False):
+        revisions = record.split("\r")
+        candidate = next((part.strip() for part in reversed(revisions) if part.strip()), "")
+        pip_match = _PIP_RAW_PROGRESS_RE.fullmatch(candidate)
+        if pip_match:
+            self._set_byte_progress_locked(int(pip_match.group(1)), int(pip_match.group(2)))
+            return None
+        if had_carriage_return or len(revisions) > 1:
+            if candidate:
+                self._set_terminal_progress_locked(candidate)
+            return None
+
+        if candidate:
+            self._last_log_line = candidate
+        return record + "\n"
+
+    def _handle_stream(self, name, text):
+        text = _strip_ansi(text or "")
+        if not text:
+            return
+        name = name if name in self._stream_buffers else "stdout"
+        with self._lock:
+            self.last_activity_at = time.monotonic()
+            combined = self._stream_buffers[name] + text
+            self._stream_buffers[name] = ""
+            normal_output = []
+
+            while "\n" in combined:
+                record, combined = combined.split("\n", 1)
+                rendered = self._consume_record_locked(record, "\r" in record)
+                if rendered is not None:
+                    normal_output.append(rendered)
+
+            # One local write per remote IOPub message keeps large log bursts
+            # responsive without dropping their content.
+            if normal_output:
+                print("".join(normal_output), end="")
+
+            if "\r" in combined:
+                candidate = next(
+                    (part.strip() for part in reversed(combined.split("\r")) if part.strip()),
+                    "",
+                )
+                if candidate:
+                    self._set_terminal_progress_locked(candidate)
+                # Retain the CR marker so a later newline is recognized as the
+                # final redraw rather than printed as a duplicate log line.
+                self._stream_buffers[name] = f"\r{candidate}" if candidate else ""
+                return
+
+            stripped = combined.strip()
+            pip_match = _PIP_RAW_PROGRESS_RE.fullmatch(stripped)
+            if pip_match:
+                self._set_byte_progress_locked(int(pip_match.group(1)), int(pip_match.group(2)))
+            elif combined and ("Progress ".startswith(combined) or combined.startswith("Progress ")):
+                # Pip may split its raw protocol across IOPub messages.
+                self._stream_buffers[name] = combined
+            elif combined:
+                # Preserve the old immediate behavior for explicit flushes that
+                # do not end in a newline; only structured progress is buffered.
+                print(combined, end="")
+
+    def handle(self, msg):
+        msg_type = msg.get("msg_type", "")
+        content = msg.get("content", {})
+        self.last_activity_at = time.monotonic()
+
+        if msg_type == "stream":
+            self._handle_stream(content.get("name", "stdout"), content.get("text", ""))
+            return
+
+        if msg_type == "error":
+            self._saw_error = True
+
+        if msg_type == "clear_output":
+            with self._lock:
+                self._status_visible = False
+
+        if msg_type in ("display_data", "update_display_data"):
+            data = content.get("data", {})
+            rich_html = str(data.get("text/html", "")).lower()
+            if "<progress" in rich_html:
+                with self._lock:
+                    self._external_progress = True
+                    if not self._native_progress:
+                        self._hide_status_locked()
+
+        _handle_output(msg)
+
+    def finish(self, outcome="completed"):
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            self._stop.set()
+            for name, pending in self._stream_buffers.items():
+                if not pending:
+                    continue
+                if _PIP_RAW_PROGRESS_RE.fullmatch(pending.strip()) or "\r" in pending:
+                    rendered = self._consume_record_locked(pending, "\r" in pending)
+                    if rendered is not None:
+                        print(rendered, end="")
+                else:
+                    print(pending, end="")
+                self._stream_buffers[name] = ""
+
+            if self._external_progress and not self._native_progress:
+                return
+            if not self._status_visible:
+                return
+
+            elapsed = _format_elapsed(time.monotonic() - self.started_at)
+            styles = {
+                "completed": ("#1a7f37", "GPU job completed"),
+                "failed": ("#cf222e", "GPU job failed"),
+                "interrupted": ("#9a6700", "GPU job interrupted"),
+            }
+            color, label = styles.get(outcome, styles["completed"])
+            markup = (
+                f'<div role="status" style="font:13px/1.4 system-ui,sans-serif;color:{color};'
+                f'padding:.35rem .65rem;border-left:4px solid {color}"><strong>{label}</strong>'
+                f' · {elapsed}</div>'
+            )
+            self._publish(markup, f"{label} — {elapsed}", update=True)
+
+
 def _handle_output(msg):
     msg_type = msg["msg_type"]
     content = msg.get("content", {})
@@ -1024,17 +1342,30 @@ class RemoteExecutionManager:
                 "Check %kernel_status, or run %restart_kernel for a fresh kernel."
             )
 
+        renderer = _HybridOutputRenderer()
+        renderer.start()
         try:
             reply = self.remote_kc.execute_interactive(
                 code=code,
-                output_hook=self._output_hook,
+                output_hook=renderer.handle,
             )
         except KeyboardInterrupt:
             print("Interrupted — stopping remote job...")
             msg = self.remote_kc.session.msg("interrupt_request")
             self.remote_kc.control_channel.send(msg)
             print("Remote job interrupted.")
+            renderer.finish("interrupted")
             raise
+        except Exception:
+            renderer.finish("failed")
+            raise
+
+        outcome = (
+            "failed"
+            if renderer.saw_error or reply.get("content", {}).get("status") == "error"
+            else "completed"
+        )
+        renderer.finish(outcome)
 
         self.remote_kc.last_result = reply
 

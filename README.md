@@ -518,6 +518,46 @@ point on, every cell runs on the GPU container; `%local` flips back to the
 notebook. A different notebook kernel can simultaneously use `%gpu bob`; the
 client selection is kept only in that notebook kernel's memory.
 
+### Long downloads, installs, and training progress
+
+CRAFT uses a hybrid output renderer for remote cells:
+
+- A silent job gets a local **GPU job in progress** display after one second,
+  including elapsed time and time since the last remote output.
+- Pip's byte counters become one determinate progress bar with transferred size,
+  percentage, rate, and ETA. Newly created or rebuilt clients set
+  `PIP_PROGRESS_BAR=raw` in the remote kernel automatically; an explicit pip
+  `--progress-bar` option still wins.
+- Terminal bars that redraw with carriage returns (including normal `tqdm`
+  output) update one display rather than flooding the cell.
+- Ordinary stdout/stderr lines are preserved and batched per remote message.
+- Native HTML progress displays are forwarded unchanged. CRAFT detects them and
+  suppresses its generic status so the notebook shows only one bar.
+
+`fastprogress` is included in newly rebuilt base images. In SolveIt, explicitly
+use its notebook renderer—the automatic selection may choose console mode:
+
+```python
+from fastprogress.fastprogress import NBProgressBar
+
+for batch in NBProgressBar(range(100)):
+    train_batch(batch)
+```
+
+For an existing host, pull and rebuild the base plus the clients that should get
+`fastprogress`:
+
+```bash
+cd ~/gpudev && git pull --ff-only
+bash linux-setup.sh
+gpudev client rebuild --all
+```
+
+To deploy only the CRAFT renderer, update the repository in SolveIt and re-run
+`CRAFT.py`; that part does not require rebuilding the GPU image. Rebuilding a
+client is required for its next remote kernel to inherit pip's raw-progress
+setting.
+
 ### One kernel per client (important)
 
 Each client container runs **one** long-lived Jupyter kernel. Every notebook that
