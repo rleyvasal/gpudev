@@ -26,13 +26,13 @@ gpudev/
 %run /path/to/gpudev/addons/mojo.py
 %run /path/to/gpudev/addons/sslive.py
 %run /path/to/gpudev/addons/tidy3.py
-%gpu
+%gpu alice
 %sslive
 ```
 
 | Load | Provides |
 |------|----------|
-| `CRAFT.py` | `%gpu` `%local` `%kernel_status` `remote_run_` |
+| `CRAFT.py` | `%gpu <client>` `%gpu_setup` `%local` `%kernel_status` `remote_run_` |
 | `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
 | `addons/sslive.py` | `%sslive` `%sslive_export` (link `addons/sslive` → sslive clone) |
@@ -66,7 +66,7 @@ The system has three roles. They are physically and cryptographically separated.
 |---|---|---|---|
 | **Admin** | your laptop | admin SSH private key | provision/remove clients, reboot/sleep host, update host software, view all logs |
 | **Host** | Windows + WSL2 (this guide) or bare Linux | Docker, the gpudev CLI, all client containers, Cloudflare connector | runs everything; no outbound calls except cloudflared |
-| **Client** | a notebook machine (e.g. SolveIt cloud VM) | client SSH private key + `craft.json` | runs CRAFT.py, routes cells to *its own* container; cannot reach the host or other clients |
+| **Client** | a notebook machine (e.g. SolveIt cloud VM) | one locally generated SSH private key per client identity | runs CRAFT.py, routes each notebook kernel to the container named by `%gpu <client>`; cannot reach the host or other clients |
 
 A client cannot become an admin: it gets its own SSH key (scoped to its
 container's port-mapped sshd), no access to the host's admin port (52100), no
@@ -442,57 +442,58 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 | Prompt after SSH | `gpudev@gpudev-alice:~$` | tells you "you are user gpudev on the gpudev box for alice" |
 | DNS hostname | `alice.<domain>` | unchanged (the alias / HostName mismatch is fine — that's what `Host` is for) |
 
-### On the admin laptop
+### Create an invitation on the host
 
 ```bash
-ssh gpudev                          # opens admin shell on the host
-gpudev client add alice                  # provisions container 'alice'
-# When prompted, paste alice's PUBLIC SSH key
-gpudev client info alice                 # prints SSH stanza + craft.json to share
+ssh gpudev                         # opens admin shell on the host
+gpudev client invite alice         # makes no changes; prints the SolveIt bootstrap
 ```
 
-`gpudev client info` outputs both blocks the notebook user needs:
-
-```sshconfig
-Host gpudev-alice
-  HostName alice.example.com
-  User gpudev
-  IdentityFile ~/.ssh/gpudev-alice
-  IdentitiesOnly yes
-  ProxyCommand bash -c 'p=$(command -v cloudflared 2>/dev/null || echo "$HOME/.local/bin/cloudflared"); exec "$p" access tcp --hostname %h'
-  ServerAliveInterval 30
-  ServerAliveCountMax 3
-```
-
-```json
-{
-  "client_name": "alice"
-}
-```
-
-CRAFT.py derives the SSH alias as `gpudev-alice` automatically — the same
-pattern `client-setup.sh` uses for the container hostname and `gpudev client
-info` uses for the SSH stanza. One value, one source of truth.
-
-### On the notebook machine
-
-Hand the notebook user:
-- alice's **private** SSH key → `~/.ssh/gpudev-alice` (chmod 600)
-- the SSH stanza → append to `~/.ssh/config`
-- the JSON above → `~/.config/gpudev/craft.json`
-- `cloudflared` installed and on PATH
-
-Then in a notebook cell:
+Give the printed bootstrap to the SolveIt user. It contains two cells. The first
+installs or updates this repository in SolveIt's persistent storage:
 
 ```python
-%run CRAFT.py
-%gpu          # send subsequent cells to the GPU container
+%%bash
+set -e
+mkdir -p /app/data/gpudevd
+if [ -d /app/data/gpudevd/gpudev/.git ]; then
+  git -C /app/data/gpudevd/gpudev pull --ff-only
+else
+  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
+fi
 ```
 
-The first `%gpu` triggers an SSH to `gpudev-alice`, lands as user `gpudev` on
+The second loads CRAFT and performs idempotent local setup:
+
+```python
+%run /app/data/gpudevd/gpudev/CRAFT.py
+%gpu_setup alice --hostname alice.example.com
+```
+
+`%gpu_setup` installs/checks `cloudflared`, generates
+`~/.ssh/gpudev-alice`, and installs a marked `Host gpudev-alice` SSH stanza.
+It never replaces an existing private key. The private key stays in SolveIt;
+the output contains only the public key to return to the administrator.
+
+### Enroll the public key on the host
+
+On the host, provision the container and paste the public key when prompted:
+
+```bash
+gpudev client add alice
+```
+
+The user can now connect any SolveIt notebook kernel independently:
+
+```python
+%gpu alice     # send subsequent cells to alice's GPU container
+```
+
+The first `%gpu alice` triggers an SSH to `gpudev-alice`, lands as user `gpudev` on
 hostname `gpudev-alice`, attaches the kernel, and starts routing. From that
 point on, every cell runs on the GPU container; `%local` flips back to the
-notebook.
+notebook. A different notebook kernel can simultaneously use `%gpu bob`; the
+client selection is kept only in that notebook kernel's memory.
 
 ### One kernel per client (important)
 
@@ -550,6 +551,7 @@ All on the host (via `ssh gpudev`):
 ```
 gpudev status                         # dashboard — also auto-shows on login
 gpudev client list                    # all clients with status + uptime
+gpudev client invite <name>           # complete SolveIt bootstrap (no host changes)
 gpudev client add <name>              # new client (prompts for pubkey)
 gpudev client info <name>             # SSH stanza for an existing client
 gpudev client restart <name>          # restart a stuck container

@@ -25,6 +25,12 @@ fail() { echo "Error: $*" >&2; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+sanitize_client_name() {
+    printf '%s' "$1" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
 # Resolve a usable nvidia-smi. On WSL2 the NVIDIA driver lives on Windows and
 # its Linux-side stub is at /usr/lib/wsl/lib/nvidia-smi — which isn't always on
 # PATH (Ubuntu only adds it via libnvidia-container packaging). Try PATH first,
@@ -593,6 +599,66 @@ cmd_client_logs() {
 
 # ── gpudev client info ────────────────────────────────────────────────────────
 
+print_solveit_bootstrap() {
+    local name="$1" hostname="$2"
+
+    echo "── SolveIt bootstrap ──"
+    echo ""
+    echo "Paste Cell 1 into SolveIt to install or update CRAFT:"
+    echo ""
+    cat <<'EOF'
+%%bash
+set -e
+mkdir -p /app/data/gpudevd
+if [ -d /app/data/gpudevd/gpudev/.git ]; then
+  git -C /app/data/gpudevd/gpudev pull --ff-only
+else
+  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
+fi
+EOF
+    echo ""
+    echo "Then paste Cell 2 to create/reuse the local key and SSH connection:"
+    echo ""
+    cat <<EOF
+%run /app/data/gpudevd/gpudev/CRAFT.py
+%gpu_setup ${name} --hostname ${hostname}
+EOF
+    echo ""
+    echo "The private key stays in SolveIt. The setup prints the PUBLIC key to"
+    echo "paste into: gpudev client add ${name}"
+    echo "After enrollment, each notebook connects independently with: %gpu ${name}"
+    echo ""
+}
+
+cmd_client_invite() {
+    local raw_name="${1:-}"
+    [ -n "$raw_name" ] || fail "Usage: gpudev client invite <name>"
+    require_host_setup
+
+    local name cf_domain hostname
+    name="$(sanitize_client_name "$raw_name")"
+    [ -n "$name" ] || fail "Invalid client name '$raw_name'."
+    if [ "$name" != "$raw_name" ]; then
+        log "Normalized client name '$raw_name' → '$name'."
+    fi
+    cf_domain="$(host_get cf_domain)"
+    [ -n "$cf_domain" ] || fail "cf_domain is missing from host.json."
+    hostname="${name}.${cf_domain}"
+
+    echo ""
+    echo "gpudev Client Invitation"
+    echo ""
+    echo "  Client:   $name"
+    echo "  Endpoint: $hostname"
+    if client_exists "$name"; then
+        echo "  Host:     already provisioned"
+    else
+        echo "  Host:     not provisioned yet (this invitation makes no host changes)"
+    fi
+    echo ""
+    print_solveit_bootstrap "$name" "$hostname"
+}
+
 cmd_client_info() {
     local name="${1:-}"
     [ -n "$name" ] || fail "Usage: gpudev client info <name>"
@@ -643,15 +709,7 @@ EOF
     echo "  gpudev client remove deletes the volume → new keys on re-add."
     echo "  CRAFT auto-clears a stale known_hosts entry once if a key did change."
     echo ""
-    echo "── craft.json (notebook side) ──"
-    echo ""
-    cat <<EOF
-{
-  "client_name": "${name}"
-}
-EOF
-    echo "  (CRAFT derives the SSH alias as gpudev-${name} automatically)"
-    echo ""
+    print_solveit_bootstrap "$name" "$hostname"
     echo "── Connect ──"
     echo ""
     echo "  ssh gpudev-${name}"
@@ -770,6 +828,7 @@ cmd_status() {
     echo " COMMANDS"
     echo "  gpudev client list           list all client containers"
     echo "  gpudev client add <name>     add a new client container"
+    echo "  gpudev client invite <name>  print complete SolveIt onboarding"
     echo "  gpudev client info <name>    print SSH config stanza for a client"
     echo "  gpudev client restart <name> restart a client container"
     echo "  gpudev client logs <name>    tail a client's container logs"
@@ -1199,6 +1258,7 @@ Host:
 Clients:
   gpudev client list
   gpudev client add <name>
+  gpudev client invite <name>
   gpudev client remove <name> [--yes]
   gpudev client start <name>
   gpudev client stop <name>
@@ -1243,6 +1303,7 @@ main() {
             case "${2:-}" in
                 list)    cmd_client_list ;;
                 add)     cmd_client_add "${3:-}" ;;
+                invite)  cmd_client_invite "${3:-}" ;;
                 remove)  cmd_client_remove "${3:-}" "${4:-}" ;;
                 start)   cmd_client_start "${3:-}" ;;
                 stop)    cmd_client_stop "${3:-}" ;;

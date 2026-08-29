@@ -15,7 +15,7 @@ gpudev/
 ```text
 %local
 %run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu
+%gpu solveite
 ```
 
 ## Optional addons (all under `%local`, same as core)
@@ -26,7 +26,7 @@ gpudev/
 %run /app/data/gpudevd/gpudev/addons/mojo.py
 %run /app/data/gpudevd/gpudev/addons/sslive.py
 %run /app/data/gpudevd/gpudev/addons/tidy3.py
-%gpu
+%gpu solveite
 %sslive
 ```
 
@@ -34,7 +34,7 @@ gpudev/
 
 | After load | Magics |
 |------------|--------|
-| core | `%gpu` `%local` `%kernel_status` `%restart_kernel` |
+| core | `%gpu <client>` `%gpu_setup` `%local` `%kernel_status` `%restart_kernel` |
 | pcviz | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | mojo | `%gpum` `%mojo_*` `%bench` |
 | sslive | `%sslive` `%sslive_export` |

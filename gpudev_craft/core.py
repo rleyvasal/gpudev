@@ -1,6 +1,8 @@
 import html
 import json
+import platform
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -10,6 +12,8 @@ import time
 from pathlib import Path
 import os
 import shutil
+
+from .client_setup import normalize_client_name, setup_client
 try:
     from IPython.core.magic import register_line_magic
     from IPython.display import HTML, display, clear_output
@@ -48,34 +52,11 @@ def get_ipython():  # type: ignore[misc]
         return None
 
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-CONFIG_PATH = Path.home() / ".config" / "gpudev" / "craft.json"
-_cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-
-# Must match host sanitize_name / DNS labels (gpudev client add).
-_CLIENT_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-
-
-def _normalize_client_name(raw) -> str:
-    """Return validated client name, or '' if unset. Raises ValueError if invalid."""
-    name = (raw or "").strip().lower()
-    if not name:
-        return ""
-    if len(name) > 63 or not _CLIENT_NAME_RE.fullmatch(name):
-        raise ValueError(
-            f"invalid client_name {raw!r}: use lowercase letters, digits, "
-            f"hyphens (e.g. 'alice', 'solveit') — same as gpudev client add"
-        )
-    return name
-
-
-try:
-    CLIENT_NAME = _normalize_client_name(_cfg.get("client_name", ""))
-except ValueError as e:
-    CLIENT_NAME = ""
-    _CLIENT_NAME_ERROR = str(e)
-else:
-    _CLIENT_NAME_ERROR = ""
+# ── Notebook-local client selection ──────────────────────────────────────────
+# Each SolveIt notebook has its own Python kernel, so these values are naturally
+# scoped to that notebook. ``%gpu <name>`` sets them for the life of the kernel;
+# no shared craft.json/default is needed or consulted.
+CLIENT_NAME = ""
 
 # Inside every gpudev container the UNIX user is the fixed `gpudev`; the client
 # identity lives in the container name and tunnel hostname. Paths are stable.
@@ -84,7 +65,7 @@ KERNEL_RUNTIME = "/home/gpudev/.local/share/jupyter/runtime/kernel.json"
 
 # SSH alias is derived from client_name — must match what `gpudev client info`
 # prints and what client-setup.sh sets as the container hostname.
-SSH_HOST = f"gpudev-{CLIENT_NAME}" if CLIENT_NAME else ""
+SSH_HOST = ""
 
 # Remote ports inside the gpudev container.
 REMOTE_KERNEL_PORTS = {
@@ -133,15 +114,36 @@ _cf_dir = str(CLOUDFLARED_PATH.parent)
 if _cf_dir not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _cf_dir + os.pathsep + os.environ.get("PATH", "")
 
-del _cfg
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[[0-9;]*$|\x1b$")
 
 
 def _strip_ansi(text):
     return ANSI_RE.sub("", text)
+
+
+def select_client(raw_name: str) -> str:
+    """Select one remote identity for this notebook kernel."""
+    global CLIENT_NAME, SSH_HOST, _exec_mgr
+
+    name = normalize_client_name(raw_name)
+    if name == CLIENT_NAME:
+        return name
+
+    if _exec_mgr is not None:
+        try:
+            _exec_mgr.shutdown_remote()
+        except Exception:
+            pass
+
+    if ROUTER is not None and ROUTER.backend is not None:
+        ROUTER.set(None)
+
+    CLIENT_NAME = name
+    SSH_HOST = f"gpudev-{name}"
+    _inject_user_ns()
+    print(f"Selected gpudev client '{name}' for this notebook")
+    return name
 
 
 # Shell helper only for non-SSH one-liners (e.g. cloudflared install).
@@ -274,10 +276,9 @@ def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
     """
     if not SSH_HOST:
         raise RuntimeError(
-            "SSH_HOST is empty — set client_name in craft.json and re-load CRAFT"
+            "No gpudev client selected — use %gpu <client-name>"
         )
-    if not CLIENT_NAME or not _CLIENT_NAME_RE.fullmatch(CLIENT_NAME):
-        raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
+    normalize_client_name(CLIENT_NAME)
 
     # Use ``export …; cmd`` so compound scripts (if/then, &&) work.
     # ``GPUDEV_CLIENT=x if …`` is a bash syntax error (Mojo pixi seed path).
@@ -322,9 +323,8 @@ def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
 def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
     """SSH with stdin payload (Mojo source upload). Host-key auto-clear once."""
     if not SSH_HOST:
-        raise RuntimeError("SSH_HOST is empty")
-    if not CLIENT_NAME or not _CLIENT_NAME_RE.fullmatch(CLIENT_NAME):
-        raise RuntimeError("CLIENT_NAME failed validation — refusing SSH")
+        raise RuntimeError("No gpudev client selected — use %gpu <client-name>")
+    normalize_client_name(CLIENT_NAME)
     # Same export prefix as _ssh (compound remote commands + client env)
     wrapped = f"export GPUDEV_CLIENT={CLIENT_NAME}; {remote_cmd}"
     result = subprocess.run(
@@ -368,13 +368,35 @@ def install_cloudflared():
         print("  https://developers.cloudflare.com/cloudflared/install/")
         return False
 
-    print("cloudflared not found — downloading a local copy...")
+    machine = platform.machine().lower()
+    arch = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine)
+    if not arch:
+        print(f"cloudflared auto-install does not support architecture {machine!r}.")
+        print("Install it manually: https://developers.cloudflare.com/cloudflared/install/")
+        return False
+
+    print(f"cloudflared not found — downloading a local {arch} copy...")
     CLOUDFLARED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    url = (
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+        f"cloudflared-linux-{arch}"
+    )
+    tmp_path = CLOUDFLARED_PATH.with_name(CLOUDFLARED_PATH.name + ".download")
 
     try:
-        _run_shell(f"curl -fsSL {url} -o {CLOUDFLARED_PATH} && chmod +x {CLOUDFLARED_PATH}")
+        subprocess.run(["curl", "-fsSL", url, "-o", str(tmp_path)], check=True)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, CLOUDFLARED_PATH)
     except Exception as e:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
         print(f"Could not install cloudflared automatically: {e}")
         print("Install it manually: https://developers.cloudflare.com/cloudflared/install/")
         return False
@@ -785,18 +807,9 @@ class RemoteExecutionManager:
                 pass
             self.remote_kc = None
 
-        if not CONFIG_PATH.exists():
-            print(f"Config not found at {CONFIG_PATH}")
-            print('Create it with: {"client_name": "<your-name>"}')
-            return False
-
         if not CLIENT_NAME:
-            if _CLIENT_NAME_ERROR:
-                print(f"Invalid craft.json: {_CLIENT_NAME_ERROR}")
-                print(f"Edit {CONFIG_PATH} and re-run CRAFT.")
-                return False
-            print(f'No "client_name" set in {CONFIG_PATH}')
-            print('Set it like: {"client_name": "<your-name>"}')
+            print("No gpudev client selected for this notebook.")
+            print("Use: %gpu <client-name>")
             return False
 
         if not install_cloudflared():
@@ -1237,6 +1250,7 @@ class ModeRouter:
 # Core host magics only — Mojo lives in addons/mojo.py
 _DEFAULT_LOCAL_MAGICS = (
     "%gpu",
+    "%gpu_setup",
     "%local",
     "%restart_kernel",
     "%kernel_status",
@@ -1377,7 +1391,83 @@ def _ensure_connected():
     return False
 
 
+def _parse_gpu_setup_args(line: str) -> tuple[str, str]:
+    tokens = shlex.split(line or "")
+    if not tokens:
+        raise ValueError("Usage: %gpu_setup <client-name> --hostname <client.domain>")
+
+    name = tokens.pop(0)
+    hostname = ""
+    while tokens:
+        token = tokens.pop(0)
+        if token == "--hostname" and tokens:
+            hostname = tokens.pop(0)
+        elif token.startswith("--hostname="):
+            hostname = token.split("=", 1)[1]
+        else:
+            raise ValueError(
+                f"Unknown argument {token!r}. Usage: %gpu_setup <client-name> "
+                "--hostname <client.domain>"
+            )
+    if not hostname:
+        raise ValueError("Missing --hostname. Usage: %gpu_setup <name> --hostname <host>")
+    return name, hostname
+
+
+def gpu_setup(line):
+    """One-time, idempotent SolveIt-side SSH/key setup for a client."""
+    try:
+        name, hostname = _parse_gpu_setup_args(line)
+        name = normalize_client_name(name)
+    except ValueError as e:
+        print(e)
+        return False
+
+    if not install_cloudflared():
+        return False
+
+    try:
+        result = setup_client(name, hostname)
+    except Exception as e:
+        print(f"gpudev client setup failed: {e}")
+        return False
+
+    select_client(result.name)
+    print("Local gpudev client setup is ready")
+    print(f"  SSH alias:   {result.ssh_alias}")
+    print(f"  Endpoint:    {result.hostname}")
+    print(f"  Private key: {result.private_key} (kept only on this client)")
+    print("")
+    print("Give this PUBLIC key to the gpudev administrator:")
+    print(result.public_key_text)
+    print("")
+    print("Administrator: run this on the gpudev host, then paste the public key:")
+    print(f"  gpudev client add {result.name}")
+    print("")
+    print("After the administrator finishes, connect from this notebook with:")
+    print(f"  %gpu {result.name}")
+    return True
+
+
 def gpu(line):
+    try:
+        tokens = shlex.split(line or "")
+    except ValueError as e:
+        print(f"Invalid %gpu arguments: {e}")
+        return
+    if len(tokens) > 1:
+        print("Usage: %gpu <client-name>")
+        return
+    if tokens:
+        try:
+            select_client(tokens[0])
+        except ValueError as e:
+            print(e)
+            return
+    elif not CLIENT_NAME:
+        print("No client selected. Use: %gpu <client-name>")
+        return
+
     if _ensure_connected():
         ROUTER.set(PY_BACKEND)
 
@@ -1387,6 +1477,9 @@ def local(line):
 
 
 def restart_kernel(line):
+    if not CLIENT_NAME:
+        print("No client selected. Use: %gpu <client-name>")
+        return
     _exec_mgr.restart_kernel()
 
 
@@ -1417,7 +1510,7 @@ def kernel_status(line):
         except Exception:
             print("Tunnel ports:   unknown")
 
-    gpus = gpu_status()
+    gpus = gpu_status() if CLIENT_NAME else None
 
     if gpus:
         print("GPU:")
@@ -1431,6 +1524,7 @@ def kernel_status(line):
 
 _CORE_MAGIC_FUNCS = (
     ("gpu", gpu),
+    ("gpu_setup", gpu_setup),
     ("local", local),
     ("restart_kernel", restart_kernel),
     ("kernel_status", kernel_status),
@@ -1441,8 +1535,8 @@ _USER_NS_EXPORTS = (
     "SSH_HOST",
     "SSH_OPTS",
     "CLIENT_NAME",
-    "CONFIG_PATH",
     "KERNEL_PORTS",
+    "select_client",
     "register_local_magic",
     "register_transform",
     "unregister_transform",
@@ -1546,7 +1640,8 @@ def install_core(*, quiet: bool = False) -> bool:
 
     if not quiet:
         print("CRAFT core ready")
-        print("  %gpu  %local  %kernel_status  %restart_kernel")
+        print("  %gpu <client>  %gpu_setup <client> --hostname <host>")
+        print("  %local  %kernel_status  %restart_kernel")
         print("  remote_run_(code)  register_local_magic('%name')")
         print("  register_transform(name, fn)  # package syntax only; core has none")
         print("  Addons (%local + %run):")
