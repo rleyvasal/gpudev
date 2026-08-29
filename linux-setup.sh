@@ -374,6 +374,7 @@ write_dockerfile() {
     write_base_requirements
 
     cat > "$dockerfile" <<'DOCKERFILE'
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 # System deps
@@ -391,6 +392,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Dockerfile ENV below — and sshd login sessions DON'T inherit that ENV.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
+# CUDA wheels are large and the NVIDIA package index can respond slowly.
+# Keep completed downloads across failed/retried builds and tolerate slow reads.
+ENV UV_HTTP_TIMEOUT=300 \
+    UV_HTTP_RETRIES=5 \
+    UV_LINK_MODE=copy
+
 # SSH: pubkey auth only, no passwords
 RUN mkdir -p /run/sshd \
     && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
@@ -403,11 +410,13 @@ RUN mkdir -p /run/sshd \
 # Pins live in requirements-*.txt next to this Dockerfile (written by linux-setup.sh).
 # Per-client venvs are created on their data volumes by client-setup.sh and persist indefinitely.
 COPY requirements-torch.txt requirements-base.txt /tmp/gpudev-req/
-RUN uv venv /opt/venv --python 3.12 --seed \
-    && uv pip install --python /opt/venv/bin/python \
+RUN uv venv /opt/venv --python 3.12 --seed
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python \
         --index-url https://download.pytorch.org/whl/cu124 \
-        -r /tmp/gpudev-req/requirements-torch.txt \
-    && uv pip install --python /opt/venv/bin/python \
+        -r /tmp/gpudev-req/requirements-torch.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python \
         -r /tmp/gpudev-req/requirements-base.txt
 
 ENV VIRTUAL_ENV=/opt/venv

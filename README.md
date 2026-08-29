@@ -603,6 +603,13 @@ gpudev cloudflare              # shows whether token is present
 into `~/.config/gpudev/` when building `gpudev-base`. Edit those files and
 re-run setup to bump versions after testing `torch.cuda` on your driver.
 
+CUDA packages contain large wheels. The generated Dockerfile gives uv a
+five-minute read timeout, retries failed requests five times, and keeps uv's
+download cache across build attempts. If an upstream package server still times
+out, pull the latest gpudev revision and rerun `bash linux-setup.sh`; completed
+downloads are reused. After the base image succeeds, run the requested
+`gpudev client rebuild <name>` command again.
+
 ### Mojo packages
 
 The image seeds Mojo at `/opt/mojo-proj`. Each client copies that seed once to
