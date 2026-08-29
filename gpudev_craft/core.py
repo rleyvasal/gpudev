@@ -763,6 +763,21 @@ def _is_structured_terminal_progress(value):
     )
 
 
+def _is_curl_meter_header(value):
+    """Recognize curl's two heading rows so they do not become orphaned output."""
+    words = value.split()
+    return (
+        words == ["Dload", "Upload", "Total", "Spent", "Left", "Speed"]
+        or (
+            "% Total" in value
+            and "% Received" in value
+            and "% Xferd" in value
+            and "Average Speed" in value
+            and "Current" in value
+        )
+    )
+
+
 class _HybridOutputRenderer:
     """Render remote IOPub output without flooding the SolveIt cell.
 
@@ -790,6 +805,7 @@ class _HybridOutputRenderer:
         self._stream_buffers = {"stdout": "", "stderr": ""}
         self._last_log_line = ""
         self._job_label = _infer_job_label(code)
+        self._is_curl_job = bool(re.search(r"(?:^|\s)!?curl(?:\s|$)", code or ""))
         self._progress_current = None
         self._progress_total = None
         self._progress_unit = None
@@ -869,8 +885,8 @@ class _HybridOutputRenderer:
             percent = 100 * current / total
             if self._progress_unit == "bytes":
                 detail = (
-                    f"Downloaded: {_format_bytes(current)} / {_format_bytes(total)} "
-                    f"({percent:.1f}%)"
+                    f"Progress: {percent:.1f}% · "
+                    f"Downloaded: {_format_bytes(current)} / {_format_bytes(total)}"
                 )
                 if self._rate:
                     detail += f" · Speed: {_format_bytes(self._rate)}/s"
@@ -881,13 +897,17 @@ class _HybridOutputRenderer:
         elif self._progress_text:
             detail = self._progress_text
 
-        detail_html = f'<span style="margin-left:.65rem">{html.escape(detail)}</span>' if detail else ""
+        detail_html = (
+            f'<div style="margin-top:.3rem">{html.escape(detail)}</div>'
+            if detail
+            else ""
+        )
         markup = (
             '<div role="status" aria-live="polite" style="font:13px/1.4 system-ui,sans-serif;'
             'padding:.45rem .65rem;border:1px solid #d0d7de;border-radius:6px;max-width:760px">'
             f'<div style="display:flex;justify-content:space-between;gap:1rem;margin-bottom:.3rem">'
             f'<strong>{label}</strong><span>Elapsed: {elapsed} · {activity}</span></div>'
-            f'<progress{progress_attrs} style="width:min(34rem,70%);vertical-align:middle"></progress>'
+            f'<progress{progress_attrs} style="width:100%;vertical-align:middle"></progress>'
             f'{detail_html}</div>'
         )
         plain = f"{self._progress_label()} — {detail or activity} ({elapsed})"
@@ -937,8 +957,9 @@ class _HybridOutputRenderer:
             self._progress_total = 100.0
             self._progress_unit = "percent"
             self._progress_text = (
-                f'Downloaded: {curl_progress["downloaded"]} / {curl_progress["total"]} '
-                f'({curl_progress["percent"]}%) · Speed: {curl_progress["speed"]}/s · '
+                f'Progress: {curl_progress["percent"]}% · '
+                f'Downloaded: {curl_progress["downloaded"]} / {curl_progress["total"]} · '
+                f'Speed: {curl_progress["speed"]}/s · '
                 f'Remaining: {curl_progress["remaining"]}'
             )
             self._native_progress = True
@@ -963,6 +984,8 @@ class _HybridOutputRenderer:
     def _consume_record_locked(self, record, had_carriage_return=False):
         revisions = record.split("\r")
         candidate = next((part.strip() for part in reversed(revisions) if part.strip()), "")
+        if self._is_curl_job and _is_curl_meter_header(candidate):
+            return None
         pip_match = _PIP_RAW_PROGRESS_RE.fullmatch(candidate)
         if pip_match:
             self._set_byte_progress_locked(int(pip_match.group(1)), int(pip_match.group(2)))

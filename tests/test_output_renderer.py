@@ -166,7 +166,8 @@ class HybridOutputRendererTests(unittest.TestCase):
         data = self.ip.display_pub.calls[0]["data"]
         self.assertIn('value="524288" max="1048576"', data["text/html"])
         self.assertIn("Installing Python packages", data["text/html"])
-        self.assertIn("Downloaded: 512.0 KB / 1.0 MB (50.0%)", data["text/html"])
+        self.assertIn("Progress: 50.0%", data["text/html"])
+        self.assertIn("Downloaded: 512.0 KB / 1.0 MB", data["text/html"])
         renderer.finish()
 
     def test_curl_meter_becomes_a_labeled_download_summary(self):
@@ -180,6 +181,18 @@ class HybridOutputRendererTests(unittest.TestCase):
             renderer.handle(
                 {
                     "msg_type": "stream",
+                    "content": {
+                        "name": "stderr",
+                        "text": (
+                            "  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n"
+                            "                                 Dload  Upload   Total   Spent    Left  Speed\n"
+                        ),
+                    },
+                }
+            )
+            renderer.handle(
+                {
+                    "msg_type": "stream",
                     "content": {"name": "stderr", "text": f"\r{raw_meter}\r"},
                 }
             )
@@ -188,10 +201,12 @@ class HybridOutputRendererTests(unittest.TestCase):
         html = self.ip.display_pub.calls[-1]["data"]["text/html"]
         self.assertIn("Downloading v1.0-mini.tgz", html)
         self.assertIn("Elapsed:", html)
-        self.assertIn("Downloaded: 351.0 MB / 3.9 GB (8%)", html)
+        self.assertIn("Progress: 8%", html)
+        self.assertIn("Downloaded: 351.0 MB / 3.9 GB", html)
         self.assertIn("Speed: 9.5 MB/s", html)
         self.assertIn("Remaining: 6m 1s", html)
         self.assertNotIn("8 3974M", html)
+        self.assertNotIn("% Total", html)
         renderer.finish()
 
     def test_split_pip_raw_record_is_buffered_until_complete(self):

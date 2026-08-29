@@ -530,7 +530,8 @@ CRAFT uses a hybrid output renderer for remote cells:
   `--progress-bar` option still wins.
 - Curl's numeric meter becomes a labeled view showing the filename, downloaded
   amount, total size, speed, remaining time, and elapsed time. Its raw,
-  unlabeled columns are hidden.
+  unlabeled columns and orphaned column headings are hidden. Progress, Downloaded,
+  Speed, and Remaining values appear together beneath the bar.
 - Terminal bars that redraw with carriage returns (including normal `tqdm`
   output) update one display rather than flooding the cell. Percentages and
   item counts are shown with explicit labels.
