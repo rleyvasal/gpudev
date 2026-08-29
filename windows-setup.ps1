@@ -23,7 +23,8 @@
          passthrough requires the Windows driver, not a Linux one).
       3. Run `wsl --update` to keep the WSL kernel current.
       4. Configure Windows power settings (no auto-sleep on AC).
-      5. Write %USERPROFILE%\.wslconfig (vmIdleTimeout=-1 so the WSL2 VM stays up).
+      5. Write %USERPROFILE%\.wslconfig (instanceIdleTimeout=-1 keeps the
+         distro alive; vmIdleTimeout=-1 keeps the shared WSL2 VM alive).
       6. Ensure the WSL2 platform is enabled (--no-distribution; reboots+resumes
          once only if the feature was just turned on), then `wsl --import` the
          distro from an Ubuntu rootfs tarball (no OOBE) and provision the Linux
@@ -285,32 +286,44 @@ function Set-PowerSettings {
     }
 }
 
-# ── Keep WSL2 alive (Layer 1: VM doesn't auto-idle-shutdown) ──────────────────
+# ── Keep WSL2 alive (Layer 1: distro + VM don't auto-idle-shutdown) ───────────
 function Set-WslGlobalConfig {
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
-    $want = 'vmIdleTimeout=-1  # gpudev: keep the WSL2 VM alive between SSH sessions'
+    $instanceWant = 'instanceIdleTimeout=-1'
+    $vmWant = 'vmIdleTimeout=-1'
 
     if (-not (Test-Path $wslconfig)) {
-        Set-Content -Path $wslconfig -Value "[wsl2]`r`n$want" -Encoding ASCII
+        $content = "[general]`r`n$instanceWant`r`n`r`n[wsl2]`r`n$vmWant`r`n"
+        Set-Content -Path $wslconfig -Value $content -Encoding ASCII -NoNewline
         Log "Wrote $wslconfig"
         return
     }
 
-    # Normalize idempotently: drop EVERY existing vmIdleTimeout line (collapsing any
-    # duplicates left by earlier runs — the previous version short-circuited on a
-    # 'gpudev' marker and never cleaned them, so `wsl` warned about a duplicate key
-    # on stderr and aborted the install), ensure a [wsl2] section, then add exactly
-    # one vmIdleTimeout right after it. Other settings are preserved.
-    $lines = @(Get-Content $wslconfig | Where-Object { $_ -notmatch '^[ \t]*vmIdleTimeout[ \t]*=' })
-    if (-not ($lines -match '^\[wsl2\]')) { $lines = @('[wsl2]') + $lines }
+    # Normalize idempotently: drop every existing instance/VM timeout line,
+    # ensure both sections exist, then insert one unambiguous value under each.
+    # Keep comments on their own lines: malformed .wslconfig files are silently
+    # ignored by WSL, so generated values intentionally have no inline comments.
+    $lines = @(Get-Content $wslconfig | Where-Object {
+        $_ -notmatch '^[ \t]*(?:instanceIdleTimeout|vmIdleTimeout)[ \t]*='
+    })
+    if (-not ($lines -match '^[ \t]*\[general\][ \t]*$')) { $lines = @('[general]') + $lines }
+    if (-not ($lines -match '^[ \t]*\[wsl2\][ \t]*$')) { $lines = @('[wsl2]') + $lines }
     $out = New-Object System.Collections.Generic.List[string]
-    $inserted = $false
+    $instanceInserted = $false
+    $vmInserted = $false
     foreach ($l in $lines) {
         $out.Add($l)
-        if (-not $inserted -and $l -match '^\[wsl2\]') { $out.Add($want); $inserted = $true }
+        if (-not $instanceInserted -and $l -match '^[ \t]*\[general\][ \t]*$') {
+            $out.Add($instanceWant)
+            $instanceInserted = $true
+        }
+        if (-not $vmInserted -and $l -match '^[ \t]*\[wsl2\][ \t]*$') {
+            $out.Add($vmWant)
+            $vmInserted = $true
+        }
     }
     [System.IO.File]::WriteAllText($wslconfig, ($out -join "`r`n") + "`r`n", [System.Text.Encoding]::ASCII)
-    Log "Normalized .wslconfig (single vmIdleTimeout=-1 under [wsl2])."
+    Log "Normalized .wslconfig (distro + VM idle shutdown disabled)."
 }
 
 # ── Install WSL2 + distro (OOBE-free via wsl --import) ─────────────────────────
@@ -537,21 +550,16 @@ function Register-KeepaliveTask {
     #   - WSL VM crash
     #   - Background Windows update restarting wslservice
     #   - Memory pressure killing the WSL VM
-    # Runs every 5 min, checks if the distro is in `wsl -l --running --quiet`,
-    # and wakes it if not. No-op when WSL is healthy; cheap (~ms) when it is.
+    # Runs every 5 min and invokes /bin/true in the distro. When WSL is healthy
+    # this is a cheap no-op; when it is down, wsl.exe starts it. Using wsl.exe
+    # directly avoids a fragile nested PowerShell -Command action (whose quoting
+    # previously failed with LastTaskResult=1).
     # Runs as the OPERATOR (LogonType Interactive) for the same per-user reason as
     # the boot task — a SYSTEM instance can't see or wake the operator's distro.
     # With autologin the operator is logged on after boot, so this fires; the
     # AtLogon boot task covers the brief pre-logon window.
-    $cmd = @"
-`$running = & wsl.exe -l --running --quiet 2>`$null
-`$names = (`$running -join "``n") -replace "``0", "" -split "``r?``n" | ForEach-Object { `$_.Trim() }
-if (-not (`$names -contains '$script:Distro')) {
-    & wsl.exe -d $script:Distro --exec /bin/true | Out-Null
-}
-"@
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -WindowStyle Hidden -Command `"$cmd`""
+    $action = New-ScheduledTaskAction -Execute 'wsl.exe' `
+        -Argument "-d $script:Distro --exec /bin/true"
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
         -RepetitionInterval (New-TimeSpan -Minutes 5)
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
@@ -560,7 +568,23 @@ if (-not (`$names -contains '$script:Distro')) {
     try {
         Register-ScheduledTask -TaskName $KeepaliveTaskName -Action $action -Trigger $trigger `
             -Principal $principal -Settings $settings -Force | Out-Null
-        Log "Registered keepalive task '$KeepaliveTaskName' (re-wakes WSL every 5 min if it exits)."
+        Start-ScheduledTask -TaskName $KeepaliveTaskName
+        # Give the first run a moment to finish so Phase A can report a real
+        # action result instead of merely confirming that a task object exists.
+        $deadline = (Get-Date).AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 250
+            $task = Get-ScheduledTask -TaskName $KeepaliveTaskName
+        } while ($task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+
+        $info = Get-ScheduledTaskInfo -TaskName $KeepaliveTaskName
+        if ($task.State -eq 'Running') {
+            Log "Registered keepalive task '$KeepaliveTaskName'; first wake is still starting."
+        } elseif ($info.LastTaskResult -eq 0) {
+            Log "Registered and verified keepalive task '$KeepaliveTaskName' (re-wakes WSL every 5 min if it exits)."
+        } else {
+            Warn "Keepalive task registered but its first run failed (result $($info.LastTaskResult))."
+        }
     } catch {
         Warn "Could not register keepalive task: $_"
         Warn "WSL won't be auto-re-woken on mid-session crash; impact is the gpudev tunnel goes down until next Windows reboot."
@@ -627,8 +651,18 @@ function Invoke-HealthCheck {
         Log "  Boot task (wake on boot):  OK ($BootTaskName)"
     } else { Warn "  Boot task (wake on boot):  not registered" }
 
-    if (Get-ScheduledTask -TaskName $KeepaliveTaskName -ErrorAction SilentlyContinue) {
-        Log "  Keepalive task (5 min):    OK ($KeepaliveTaskName)"
+    $keepaliveTask = Get-ScheduledTask -TaskName $KeepaliveTaskName -ErrorAction SilentlyContinue
+    if ($keepaliveTask) {
+        $keepaliveInfo = Get-ScheduledTaskInfo -TaskName $KeepaliveTaskName
+        if ($keepaliveTask.State -eq 'Disabled') {
+            Warn "  Keepalive task (5 min):    DISABLED"
+        } elseif ($keepaliveTask.State -eq 'Running') {
+            Log "  Keepalive task (5 min):    OK (wake in progress)"
+        } elseif ($keepaliveInfo.LastRunTime.Year -gt 1900 -and $keepaliveInfo.LastTaskResult -ne 0) {
+            Warn "  Keepalive task (5 min):    FAILED (result $($keepaliveInfo.LastTaskResult))"
+        } else {
+            Log "  Keepalive task (5 min):    OK ($KeepaliveTaskName)"
+        }
     } else { Warn "  Keepalive task (5 min):    not registered" }
 
     $autologin = Test-Autologon
@@ -637,9 +671,16 @@ function Invoke-HealthCheck {
     } else { Warn "  Autologin (unattended boot): NOT set — WSL won't auto-start after a reboot (manual step below)" }
 
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
-    if ((Test-Path $wslconfig) -and ((Get-Content $wslconfig -Raw) -match 'gpudev')) {
-        Log "  .wslconfig (idle=disabled): OK"
-    } else { Warn "  .wslconfig (idle=disabled): MISSING" }
+    if (Test-Path $wslconfig) {
+        $wslconfigText = Get-Content $wslconfig -Raw
+        $hasInstanceTimeout = $wslconfigText -match '(?m)^[ \t]*instanceIdleTimeout[ \t]*=[ \t]*-1[ \t]*$'
+        $hasVmTimeout = $wslconfigText -match '(?m)^[ \t]*vmIdleTimeout[ \t]*=[ \t]*-1[ \t]*$'
+        if ($hasInstanceTimeout -and $hasVmTimeout) {
+            Log "  .wslconfig (distro + VM idle): OK"
+        } else {
+            Warn "  .wslconfig (distro + VM idle): INCOMPLETE"
+        }
+    } else { Warn "  .wslconfig (distro + VM idle): MISSING" }
 
     if (-not $autologin) { Show-AutologinHelp }
 

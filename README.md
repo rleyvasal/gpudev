@@ -205,8 +205,10 @@ What the script does, in order:
 3. Runs `wsl --update` to keep the WSL kernel current.
 4. Configures Windows power settings (`powercfg`): disables auto-sleep /
    hibernate / disk-spindown on AC, sets High Performance.
-5. Writes `%USERPROFILE%\.wslconfig` with `vmIdleTimeout=-1` so the WSL2 VM
-   doesn't auto-shut-down between sessions.
+5. Writes `%USERPROFILE%\.wslconfig` with both `instanceIdleTimeout=-1` and
+   `vmIdleTimeout=-1`, keeping the gpudev distribution and its shared WSL2 VM
+   alive between sessions. The values are written without inline comments so
+   WSL cannot silently ignore them as malformed configuration.
 6. Ensures the WSL2 **platform** is enabled (`wsl --install --no-distribution`).
    On a truly fresh machine that needs a reboot to turn the feature on, the
    script registers a logon scheduled task and reboots automatically, resuming
@@ -220,7 +222,8 @@ What the script does, in order:
    (that's the classic "nothing comes back after a reboot" failure). Phase B's
    systemd inside WSL then auto-starts ssh, docker, and the tunnel.
 8. Registers a **keepalive task** (`gpudev-wsl-keepalive`, also as your user):
-   every 5 min, checks if the distro is running and wakes it if not.
+   every 5 min, runs a cheap `/bin/true` inside the distro, which wakes it if
+   needed. The task invokes `wsl.exe` directly to avoid nested-shell quoting.
    Belt-and-suspenders against WSL crashes / background Windows updates.
 
 > **Manual step — enable autologin (required for unattended reboot recovery).**
@@ -247,7 +250,7 @@ Linux user (gpudev):       OK (default user, sudo)
 Boot task (wake on boot):  OK (gpudev-wsl-boot)
 Keepalive task (5 min):    OK (gpudev-wsl-keepalive)
 Autologin (unattended boot): OK
-.wslconfig (idle=disabled): OK
+.wslconfig (distro + VM idle): OK
 ```
 
 If `NVIDIA driver (Windows)` is `MISSING`, install/update the driver before
@@ -618,6 +621,34 @@ Diagnose with `curl -I https://gpudev.<domain>`:
     `linux-setup.sh` now passes `--overwrite-dns` so a fresh install/rename can't
     leave the route pointing at a dead tunnel.
 
+If **every hostname** returns `530 / 1033` after a Windows restart, check the
+Windows-side WSL lifecycle from an elevated PowerShell:
+
+```powershell
+wsl -l --running
+wsl -d gpudev -- bash -lc "systemctl is-active docker ssh gpudev-tunnel"
+Get-ScheduledTaskInfo gpudev-wsl-boot
+Get-ScheduledTaskInfo gpudev-wsl-keepalive
+```
+
+If `wsl -d gpudev --exec /bin/true` restores HTTP `200`, WSL was not staying
+up. Ensure `%USERPROFILE%\.wslconfig` contains both settings, preserving any
+other settings already present:
+
+```ini
+[general]
+instanceIdleTimeout=-1
+
+[wsl2]
+vmIdleTimeout=-1
+```
+
+Apply changes with `wsl --shutdown` (this stops every WSL distribution), then
+run `wsl -d gpudev --exec /bin/true`. A scheduled task result of `0` is success;
+re-run the current `windows-setup.ps1` if either gpudev task is missing,
+disabled, failing, or has a stale `NextRunTime`. Setup recreates and verifies
+the keepalive task.
+
 ### `Permission denied (publickey)`
 
 Tunnel works (sshd is responding) but your admin key isn't authorized.
@@ -668,7 +699,7 @@ What comes back on its own, and what needs a hand:
 | Event | Auto-recovers | Why |
 | --- | --- | --- |
 | **Windows restart** | ✅ everything *(if autologin is on)* | At logon the `gpudev-wsl-boot` task (runs as your user) wakes WSL; systemd auto-starts `ssh` + `gpudev-tunnel`; DNS is unchanged. **Requires Windows autologin** (above) so the logon happens unattended — without it, WSL stays down until you sign in or run `wsl`. |
-| **WSL `--shutdown`** | ✅ everything | `gpudev-wsl-keepalive` re-wakes WSL within 5 min (or next access); systemd restarts the services. |
+| **WSL `--shutdown`** | ✅ everything *(while the Windows user is logged in)* | `gpudev-wsl-keepalive` re-wakes WSL within 5 min; systemd restarts the services. |
 | **Distro reinstall** | ⚠️ mostly | Re-run `linux-setup.sh`: it re-creates the tunnel + credentials, re-points DNS with `--overwrite-dns`, and re-adds your admin key. The **one** manual step is the host-key trust on the admin side (`ssh-keygen -R`, above). |
 
 The stale-DNS 530 that this was all about can no longer happen after a restart:
