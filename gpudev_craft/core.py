@@ -652,6 +652,8 @@ def _diagnose_port_holders(ports):
 # ── Output Display ────────────────────────────────────────────────────────────
 _PIP_RAW_PROGRESS_RE = re.compile(r"^Progress\s+(\d+)\s+of\s+(\d+)\s*$", re.I)
 _PERCENT_PROGRESS_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|\d{1,2}(?:\.\d+)?)%")
+_CLOCK_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
+_URL_RE = re.compile(r"https?://[^\s'\"]+")
 
 
 def _format_elapsed(seconds):
@@ -674,6 +676,83 @@ def _format_bytes(value):
         value /= 1024
 
 
+def _format_clock_label(value):
+    match = _CLOCK_RE.fullmatch(value.strip())
+    if not match:
+        return value
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _curl_quantity(value):
+    """Convert curl meter quantities such as 351M or 9759k to readable bytes."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kMGT]?)", value.strip())
+    if not match:
+        return value
+    amount = float(match.group(1))
+    multiplier = {"": 1, "k": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    return _format_bytes(amount * multiplier[match.group(2)])
+
+
+def _parse_curl_progress(value):
+    """Parse curl's 12-column transfer meter into a small labeled summary."""
+    fields = value.split()
+    if len(fields) != 12:
+        return None
+    try:
+        percentages = [int(fields[index]) for index in (0, 2, 4)]
+    except ValueError:
+        return None
+    if any(percent < 0 or percent > 100 for percent in percentages):
+        return None
+    if not all(_CLOCK_RE.fullmatch(fields[index]) for index in (8, 9, 10)):
+        return None
+    return {
+        "percent": percentages[1],
+        "total": _curl_quantity(fields[1]),
+        "downloaded": _curl_quantity(fields[3]),
+        "speed": _curl_quantity(fields[11]),
+        "remaining": _format_clock_label(fields[10]),
+    }
+
+
+def _infer_job_label(code):
+    code = code or ""
+    url_match = _URL_RE.search(code)
+    if url_match:
+        filename = url_match.group(0).split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if filename:
+            return f"Downloading {filename}"
+    if re.search(
+        r"(?:^|\s)(?:!?pip|%pip|!?python\s+-m\s+pip)\s+install\b",
+        code,
+    ):
+        return "Installing Python packages"
+    return ""
+
+
+def _summarize_terminal_progress(value, percent):
+    parts = [f"Progress: {percent:g}%"]
+    count_match = re.search(r"(?<![\d:])(\d[\d,]*)/(\d[\d,]*)(?![\d:])", value)
+    if count_match:
+        parts.append(f"Items: {count_match.group(1)} / {count_match.group(2)}")
+    timing_match = re.search(r"\[([0-9:]+)<([0-9:]+)(?:,\s*([^\]]+))?\]", value)
+    if timing_match:
+        parts.append(f"Remaining: {_format_clock_label(timing_match.group(2))}")
+        if timing_match.group(3):
+            parts.append(f"Rate: {timing_match.group(3).strip()}")
+    return " · ".join(parts)
+
+
 class _HybridOutputRenderer:
     """Render remote IOPub output without flooding the SolveIt cell.
 
@@ -683,7 +762,7 @@ class _HybridOutputRenderer:
     thread makes otherwise-silent remote work visibly alive.
     """
 
-    def __init__(self, status_delay=1.0, status_interval=1.0):
+    def __init__(self, status_delay=1.0, status_interval=1.0, code=""):
         self.status_delay = max(0, float(status_delay))
         self.status_interval = max(0.1, float(status_interval))
         self.started_at = time.monotonic()
@@ -699,6 +778,7 @@ class _HybridOutputRenderer:
         self._finished = False
         self._stream_buffers = {"stdout": "", "stderr": ""}
         self._last_log_line = ""
+        self._job_label = _infer_job_label(code)
         self._progress_current = None
         self._progress_total = None
         self._progress_unit = None
@@ -754,6 +834,8 @@ class _HybridOutputRenderer:
             return False
 
     def _progress_label(self):
+        if self._job_label:
+            return self._job_label
         if self._last_log_line.lower().startswith(("downloading", "collecting")):
             return self._last_log_line[:240]
         if self._progress_unit == "bytes":
@@ -764,7 +846,7 @@ class _HybridOutputRenderer:
         now = time.monotonic()
         elapsed = _format_elapsed(now - self.started_at)
         idle = max(0, int(now - self.last_activity_at))
-        activity = "active now" if idle < 2 else f"last output {idle}s ago"
+        activity = "Last output: now" if idle < 2 else f"Last output: {idle}s ago"
         label = html.escape(self._progress_label())
 
         progress_attrs = ""
@@ -775,11 +857,14 @@ class _HybridOutputRenderer:
             progress_attrs = f' value="{current}" max="{total}"'
             percent = 100 * current / total
             if self._progress_unit == "bytes":
-                detail = f"{_format_bytes(current)} / {_format_bytes(total)} · {percent:.1f}%"
+                detail = (
+                    f"Downloaded: {_format_bytes(current)} / {_format_bytes(total)} "
+                    f"({percent:.1f}%)"
+                )
                 if self._rate:
-                    detail += f" · {_format_bytes(self._rate)}/s"
+                    detail += f" · Speed: {_format_bytes(self._rate)}/s"
                     if current < total:
-                        detail += f" · ETA {_format_elapsed((total - current) / self._rate)}"
+                        detail += f" · Remaining: {_format_elapsed((total - current) / self._rate)}"
             else:
                 detail = self._progress_text or f"{percent:.1f}%"
         elif self._progress_text:
@@ -790,7 +875,7 @@ class _HybridOutputRenderer:
             '<div role="status" aria-live="polite" style="font:13px/1.4 system-ui,sans-serif;'
             'padding:.45rem .65rem;border:1px solid #d0d7de;border-radius:6px;max-width:760px">'
             f'<div style="display:flex;justify-content:space-between;gap:1rem;margin-bottom:.3rem">'
-            f'<strong>{label}</strong><span>{elapsed} · {activity}</span></div>'
+            f'<strong>{label}</strong><span>Elapsed: {elapsed} · {activity}</span></div>'
             f'<progress{progress_attrs} style="width:min(34rem,70%);vertical-align:middle"></progress>'
             f'{detail_html}</div>'
         )
@@ -826,17 +911,32 @@ class _HybridOutputRenderer:
 
     def _set_terminal_progress_locked(self, value):
         value = value.strip()
+        curl_progress = _parse_curl_progress(value)
+        if curl_progress:
+            self._progress_current = float(curl_progress["percent"])
+            self._progress_total = 100.0
+            self._progress_unit = "percent"
+            self._progress_text = (
+                f'Downloaded: {curl_progress["downloaded"]} / {curl_progress["total"]} '
+                f'({curl_progress["percent"]}%) · Speed: {curl_progress["speed"]}/s · '
+                f'Remaining: {curl_progress["remaining"]}'
+            )
+            self._native_progress = True
+            self._publish_running_locked()
+            return
+
         percent_match = _PERCENT_PROGRESS_RE.search(value)
         if percent_match:
             percent = float(percent_match.group(1))
             self._progress_current = percent
             self._progress_total = 100.0
             self._progress_unit = "percent"
+            self._progress_text = _summarize_terminal_progress(value, percent)
         else:
             self._progress_current = None
             self._progress_total = None
             self._progress_unit = None
-        self._progress_text = value[-300:]
+            self._progress_text = "Receiving data; total size is not available"
         self._native_progress = True
         self._publish_running_locked()
 
@@ -1342,7 +1442,7 @@ class RemoteExecutionManager:
                 "Check %kernel_status, or run %restart_kernel for a fresh kernel."
             )
 
-        renderer = _HybridOutputRenderer()
+        renderer = _HybridOutputRenderer(code=code)
         renderer.start()
         try:
             reply = self.remote_kc.execute_interactive(

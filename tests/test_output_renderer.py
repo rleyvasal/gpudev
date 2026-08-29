@@ -44,7 +44,10 @@ class HybridOutputRendererTests(unittest.TestCase):
         self.assertEqual(self.ip.display_pub.calls, [])
 
     def test_pip_raw_bytes_become_one_live_progress_display(self):
-        renderer = core._HybridOutputRenderer(status_delay=60)
+        renderer = core._HybridOutputRenderer(
+            status_delay=60,
+            code="!pip install torch",
+        )
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             renderer.handle(
@@ -64,7 +67,33 @@ class HybridOutputRendererTests(unittest.TestCase):
         self.assertEqual(len(self.ip.display_pub.calls), 1)
         data = self.ip.display_pub.calls[0]["data"]
         self.assertIn('value="524288" max="1048576"', data["text/html"])
-        self.assertIn("512.0 KB / 1.0 MB", data["text/html"])
+        self.assertIn("Installing Python packages", data["text/html"])
+        self.assertIn("Downloaded: 512.0 KB / 1.0 MB (50.0%)", data["text/html"])
+        renderer.finish()
+
+    def test_curl_meter_becomes_a_labeled_download_summary(self):
+        renderer = core._HybridOutputRenderer(
+            status_delay=60,
+            code="!curl -LO https://www.nuscenes.org/data/v1.0-mini.tgz",
+        )
+        stdout = io.StringIO()
+        raw_meter = "  8 3974M 8 351M 0 0 10.0M 0 0:06:36 0:00:35 0:06:01 9759k"
+        with contextlib.redirect_stdout(stdout):
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {"name": "stderr", "text": f"\r{raw_meter}\r"},
+                }
+            )
+
+        self.assertEqual(stdout.getvalue(), "")
+        html = self.ip.display_pub.calls[-1]["data"]["text/html"]
+        self.assertIn("Downloading v1.0-mini.tgz", html)
+        self.assertIn("Elapsed:", html)
+        self.assertIn("Downloaded: 351.0 MB / 3.9 GB (8%)", html)
+        self.assertIn("Speed: 9.5 MB/s", html)
+        self.assertIn("Remaining: 6m 1s", html)
+        self.assertNotIn("8 3974M", html)
         renderer.finish()
 
     def test_split_pip_raw_record_is_buffered_until_complete(self):
@@ -104,7 +133,9 @@ class HybridOutputRendererTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         html = self.ip.display_pub.calls[-1]["data"]["text/html"]
         self.assertIn('value="50.0" max="100.0"', html)
-        self.assertIn("2/4", html)
+        self.assertIn("Progress: 50%", html)
+        self.assertIn("Items: 2 / 4", html)
+        self.assertNotIn("█", html)
         renderer.finish()
 
     def test_silent_job_gets_elapsed_status_then_completion(self):

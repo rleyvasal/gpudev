@@ -528,8 +528,12 @@ CRAFT uses a hybrid output renderer for remote cells:
   percentage, rate, and ETA. Newly created or rebuilt clients set
   `PIP_PROGRESS_BAR=raw` in the remote kernel automatically; an explicit pip
   `--progress-bar` option still wins.
+- Curl's numeric meter becomes a labeled view showing the filename, downloaded
+  amount, total size, speed, remaining time, and elapsed time. Its raw,
+  unlabeled columns are hidden.
 - Terminal bars that redraw with carriage returns (including normal `tqdm`
-  output) update one display rather than flooding the cell.
+  output) update one display rather than flooding the cell. Percentages and
+  item counts are shown with explicit labels.
 - Ordinary stdout/stderr lines are preserved and batched per remote message.
 - Native HTML progress displays are forwarded unchanged. CRAFT detects them and
   suppresses its generic status so the notebook shows only one bar.
