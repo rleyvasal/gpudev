@@ -604,7 +604,7 @@ print_solveit_bootstrap() {
 
     echo "── SolveIt bootstrap ──"
     echo ""
-    echo "Paste Cell 1 into SolveIt to install or update CRAFT:"
+    echo "Step 2 of 4 — paste Cell 1 into SolveIt to install or update CRAFT:"
     echo ""
     cat <<'EOF'
 %%bash
@@ -617,16 +617,17 @@ else
 fi
 EOF
     echo ""
-    echo "Then paste Cell 2 to create/reuse the local key and SSH connection:"
+    echo "Still Step 2 — paste Cell 2 to create/reuse the key and SSH connection:"
     echo ""
     cat <<EOF
 %run /app/data/gpudevd/gpudev/CRAFT.py
 %gpu_setup ${name} --hostname ${hostname}
 EOF
     echo ""
-    echo "The private key stays in SolveIt. The setup prints the PUBLIC key to"
-    echo "paste into: gpudev client add ${name}"
-    echo "After enrollment, each notebook connects independently with: %gpu ${name}"
+    echo "Step 3 of 4 — the private key stays in SolveIt. Paste only the PUBLIC"
+    echo "key printed by setup into: gpudev client add ${name}"
+    echo "Step 4 of 4 — connect each notebook independently with: %gpu ${name}"
+    echo "No JSON file, manual SSH edit, terminal login, or host-key prompt is needed."
     echo ""
 }
 

@@ -427,6 +427,20 @@ That's it — the host is ready.
 A "client" is an isolated Linux container with its own SSH key, its own home
 volume, and the gpudev base image's Python environment.
 
+### Four-step setup
+
+1. **Admin creates an invitation:** `gpudev client invite <name>`.
+2. **User pastes the two printed SolveIt cells:** the first installs/updates
+   CRAFT; the second runs `%gpu_setup` to install `cloudflared`, generate the
+   local key, and update `~/.ssh/config`.
+3. **Admin enrolls the printed public key:** run `gpudev client add <name>` and
+   paste it when prompted.
+4. **User connects from their notebook:** `%gpu <name>`.
+
+No `craft.json`, manual SSH-config editing, terminal login, private-key transfer,
+or first-connect confirmation is required. New host fingerprints are accepted
+and recorded automatically; unexpectedly changed fingerprints remain blocked.
+
 ### Naming convention
 
 The client *name* (e.g. `alice`) is the internal identity — the Docker container
@@ -442,12 +456,14 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 | Prompt after SSH | `gpudev@gpudev-alice:~$` | tells you "you are user gpudev on the gpudev box for alice" |
 | DNS hostname | `alice.<domain>` | unchanged (the alias / HostName mismatch is fine — that's what `Host` is for) |
 
-### Create an invitation on the host
+### Step 1 — Create an invitation on the host
 
 ```bash
 ssh gpudev                         # opens admin shell on the host
 gpudev client invite alice         # makes no changes; prints the SolveIt bootstrap
 ```
+
+### Step 2 — Run the two-cell SolveIt bootstrap
 
 Give the printed bootstrap to the SolveIt user. It contains two cells. The first
 installs or updates this repository in SolveIt's persistent storage:
@@ -477,13 +493,15 @@ the output contains only the public key to return to the administrator. New SSH
 host fingerprints are accepted and recorded automatically; changed fingerprints
 remain blocked and trigger CRAFT's targeted stale-key recovery.
 
-### Enroll the public key on the host
+### Step 3 — Enroll the public key on the host
 
 On the host, provision the container and paste the public key when prompted:
 
 ```bash
 gpudev client add alice
 ```
+
+### Step 4 — Connect the notebook
 
 The user can now connect any SolveIt notebook kernel independently:
 
