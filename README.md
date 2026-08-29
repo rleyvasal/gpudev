@@ -610,6 +610,12 @@ out, pull the latest gpudev revision and rerun `bash linux-setup.sh`; completed
 downloads are reused. After the base image succeeds, run the requested
 `gpudev client rebuild <name>` command again.
 
+It is safe to rerun `linux-setup.sh` through `ssh gpudev`. Step 8 keeps an
+active Cloudflare connector running when its configuration is unchanged. If a
+configuration change requires a restart, setup finishes first and schedules the
+restart afterward; the SSH session may then disconnect briefly and can be
+reconnected normally.
+
 ### Mojo packages
 
 The image seeds Mojo at `/opt/mojo-proj`. Each client copies that seed once to

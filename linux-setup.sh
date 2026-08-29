@@ -682,6 +682,11 @@ setup_host_cf_tunnel() {
     local tunnel_name="${LINUX_USER}"
     local cf_hostname="${LINUX_USER}.${CF_DOMAIN}"
     local config_yml="${HOME}/.cloudflared/config.yml"
+    local unit_file="/etc/systemd/system/gpudev-tunnel.service"
+    local config_before="missing" unit_before="missing"
+
+    [ -f "$config_yml" ] && config_before="$(sha256sum "$config_yml" | awk '{print $1}')"
+    [ -f "$unit_file" ] && unit_before="$(sha256sum "$unit_file" | awk '{print $1}')"
 
     # Authenticate with Cloudflare if cert.pem is missing.
     # This prints a browser URL — the operator must visit it and authorise the
@@ -758,10 +763,8 @@ print(f"config.yml: {len(rules)} hostname rule(s) kept (host + {len(rules)-1} cl
 PY
     chmod 600 "$config_yml"
 
-    # systemd is guaranteed PID 1 here (require_systemd_pid1 in main()). Kill
-    # any orphan from a prior nohup run before systemd takes ownership.
-    pkill -f "cloudflared tunnel run ${tunnel_name}" 2>/dev/null || true
-    sudo tee /etc/systemd/system/gpudev-tunnel.service >/dev/null <<EOF
+    # systemd is guaranteed PID 1 here (require_systemd_pid1 in main()).
+    sudo tee "$unit_file" >/dev/null <<EOF
 [Unit]
 Description=gpudev host Cloudflare tunnel
 After=network.target
@@ -779,9 +782,32 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
+
+    local config_after unit_after config_changed=0 unit_changed=0
+    config_after="$(sha256sum "$config_yml" | awk '{print $1}')"
+    unit_after="$(sha256sum "$unit_file" | awk '{print $1}')"
+    [ "$config_before" = "$config_after" ] || config_changed=1
+    [ "$unit_before" = "$unit_after" ] || unit_changed=1
+
+    if [ "$unit_changed" -eq 1 ]; then
+        sudo systemctl daemon-reload
+    fi
     sudo systemctl enable gpudev-tunnel
-    sudo systemctl restart gpudev-tunnel
+
+    if systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+        if [ "$config_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ]; then
+            # This SSH session may use the connector itself. Restart only after
+            # every setup step and the health report have completed.
+            NEED_HOST_TUNNEL_RESTART=1
+            log "Tunnel configuration changed; connector restart deferred until setup completes."
+        else
+            log "Tunnel configuration unchanged; keeping the active connector (SSH stays connected)."
+        fi
+    else
+        # Starting a missing systemd connector does not disturb an existing
+        # setup-run SSH session. Do not pkill a possible legacy connector here.
+        sudo systemctl start gpudev-tunnel
+    fi
     log "Host tunnel is persistent via systemd (auto-starts on boot)."
 
     log "Host tunnel:  $cf_hostname → localhost:${HOST_SSH_PORT}"
@@ -813,6 +839,17 @@ p.write_text(json.dumps(d, indent=2))
             warn "  (zone = your CF_DOMAIN only)."
         fi
     fi
+}
+
+schedule_host_tunnel_restart() {
+    local restart_unit="gpudev-tunnel-restart-$(date +%s)"
+    echo ""
+    log "Setup is complete. Applying the changed Cloudflare tunnel configuration"
+    log "in five seconds. Tunnel SSH sessions will briefly disconnect; reconnect normally."
+    sudo systemd-run --quiet \
+        --unit="$restart_unit" \
+        --on-active=5s \
+        /bin/systemctl restart gpudev-tunnel
 }
 
 # ── Step 8: Install gpudev CLI ────────────────────────────────────────────────
@@ -1066,6 +1103,7 @@ main() {
     CF_DOMAIN="${CF_DOMAIN:-}"
     ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-}"
     NEED_DOCKER_RELOGIN=false
+    NEED_HOST_TUNNEL_RESTART=0
     DOCKER="docker"
 
     step "gpudev Step 1: Configure"
@@ -1114,6 +1152,10 @@ main() {
         echo ""
         echo "NOTE: You were added to the docker group."
         echo "      Run 'newgrp docker' or re-login before using Docker without sudo."
+    fi
+
+    if [ "$NEED_HOST_TUNNEL_RESTART" -eq 1 ]; then
+        schedule_host_tunnel_restart
     fi
 }
 
