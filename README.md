@@ -473,7 +473,9 @@ The second loads CRAFT and performs idempotent local setup:
 `%gpu_setup` installs/checks `cloudflared`, generates
 `~/.ssh/gpudev-alice`, and installs a marked `Host gpudev-alice` SSH stanza.
 It never replaces an existing private key. The private key stays in SolveIt;
-the output contains only the public key to return to the administrator.
+the output contains only the public key to return to the administrator. New SSH
+host fingerprints are accepted and recorded automatically; changed fingerprints
+remain blocked and trigger CRAFT's targeted stale-key recovery.
 
 ### Enroll the public key on the host
 

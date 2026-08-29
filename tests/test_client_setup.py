@@ -48,6 +48,7 @@ class ClientSetupTests(unittest.TestCase):
             self.assertEqual(config.count("Host gpudev-solveite"), 1)
             self.assertIn("HostName solveite.example.com", config)
             self.assertIn("IdentityFile ~/.ssh/gpudev-solveite", config)
+            self.assertIn("StrictHostKeyChecking accept-new", config)
 
     @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
     def test_managed_stanza_updates_hostname_without_replacing_key(self):

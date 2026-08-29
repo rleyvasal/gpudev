@@ -168,6 +168,7 @@ def ensure_ssh_config(
         "  User gpudev\n"
         f"  IdentityFile {identity}\n"
         "  IdentitiesOnly yes\n"
+        "  StrictHostKeyChecking accept-new\n"
         "  ProxyCommand bash -c 'p=$(command -v cloudflared 2>/dev/null || echo "
         "\"$HOME/.local/bin/cloudflared\"); exec \"$p\" access tcp --hostname %h'\n"
         "  ServerAliveInterval 30\n"
