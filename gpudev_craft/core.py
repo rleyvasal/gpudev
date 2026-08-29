@@ -774,6 +774,7 @@ class _HybridOutputRenderer:
         self._status_visible = False
         self._external_progress = False
         self._native_progress = False
+        self._saw_normal_output = False
         self._saw_error = False
         self._finished = False
         self._stream_buffers = {"stdout": "", "stderr": ""}
@@ -891,6 +892,15 @@ class _HybridOutputRenderer:
             self._publish("", "", update=True)
             self._status_visible = False
 
+    def _emit_normal_stream_locked(self, value):
+        """Show ordinary command output after dismissing a generic status card."""
+        if not value:
+            return
+        self._saw_normal_output = True
+        if not self._native_progress:
+            self._hide_status_locked()
+        print(value, end="")
+
     def _set_byte_progress_locked(self, current, total):
         now = time.monotonic()
         sample = self._rate_sample
@@ -976,7 +986,7 @@ class _HybridOutputRenderer:
             # One local write per remote IOPub message keeps large log bursts
             # responsive without dropping their content.
             if normal_output:
-                print("".join(normal_output), end="")
+                self._emit_normal_stream_locked("".join(normal_output))
 
             if "\r" in combined:
                 candidate = next(
@@ -1000,7 +1010,7 @@ class _HybridOutputRenderer:
             elif combined:
                 # Preserve the old immediate behavior for explicit flushes that
                 # do not end in a newline; only structured progress is buffered.
-                print(combined, end="")
+                self._emit_normal_stream_locked(combined)
 
     def handle(self, msg):
         msg_type = msg.get("msg_type", "")
@@ -1026,6 +1036,17 @@ class _HybridOutputRenderer:
                     self._external_progress = True
                     if not self._native_progress:
                         self._hide_status_locked()
+            else:
+                with self._lock:
+                    self._saw_normal_output = True
+                    if not self._native_progress:
+                        self._hide_status_locked()
+
+        if msg_type == "execute_result":
+            with self._lock:
+                self._saw_normal_output = True
+                if not self._native_progress:
+                    self._hide_status_locked()
 
         _handle_output(msg)
 
@@ -1041,12 +1062,22 @@ class _HybridOutputRenderer:
                 if _PIP_RAW_PROGRESS_RE.fullmatch(pending.strip()) or "\r" in pending:
                     rendered = self._consume_record_locked(pending, "\r" in pending)
                     if rendered is not None:
-                        print(rendered, end="")
+                        self._emit_normal_stream_locked(rendered)
                 else:
-                    print(pending, end="")
+                    self._emit_normal_stream_locked(pending)
                 self._stream_buffers[name] = ""
 
             if self._external_progress and not self._native_progress:
+                return
+            if (
+                outcome == "completed"
+                and self._saw_normal_output
+                and not self._native_progress
+            ):
+                # For CLI/print/result cells, their output is the useful final
+                # state. A completion card can obscure it in SolveIt's display
+                # update model, so reserve the card for silent/progress jobs.
+                self._hide_status_locked()
                 return
             if not self._status_visible:
                 return

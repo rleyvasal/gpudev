@@ -43,6 +43,47 @@ class HybridOutputRendererTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "one\ntwo\n")
         self.assertEqual(self.ip.display_pub.calls, [])
 
+    def test_cli_output_replaces_generic_status_not_the_command_result(self):
+        renderer = core._HybridOutputRenderer(status_delay=60, code="!whoami")
+        with renderer._lock:
+            renderer._publish_running_locked()
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {"name": "stdout", "text": "gpudev\n"},
+                }
+            )
+            renderer.finish("completed")
+
+        self.assertEqual(stdout.getvalue(), "gpudev\n")
+        published = [call["data"]["text/plain"] for call in self.ip.display_pub.calls]
+        self.assertNotIn("GPU job completed", "\n".join(published))
+        self.assertEqual(published[-1], "")
+
+    def test_execute_result_suppresses_generic_completion_card(self):
+        renderer = core._HybridOutputRenderer(status_delay=60, code="2 + 2")
+        with renderer._lock:
+            renderer._publish_running_locked()
+
+        renderer.handle(
+            {
+                "msg_type": "execute_result",
+                "content": {
+                    "data": {"text/plain": "4"},
+                    "metadata": {},
+                    "transient": {},
+                },
+            }
+        )
+        renderer.finish("completed")
+
+        published = [call["data"].get("text/plain", "") for call in self.ip.display_pub.calls]
+        self.assertIn("4", published)
+        self.assertNotIn("GPU job completed", "\n".join(published))
+
     def test_pip_raw_bytes_become_one_live_progress_display(self):
         renderer = core._HybridOutputRenderer(
             status_delay=60,

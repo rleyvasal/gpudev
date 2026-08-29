@@ -535,6 +535,9 @@ CRAFT uses a hybrid output renderer for remote cells:
   output) update one display rather than flooding the cell. Percentages and
   item counts are shown with explicit labels.
 - Ordinary stdout/stderr lines are preserved and batched per remote message.
+  When real command or Python output arrives, it dismisses the generic activity
+  card and remains the cell's final output; it is not replaced by a completion
+  badge.
 - Native HTML progress displays are forwarded unchanged. CRAFT detects them and
   suppresses its generic status so the notebook shows only one bar.
 
