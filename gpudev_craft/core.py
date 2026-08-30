@@ -891,6 +891,7 @@ class _HybridOutputRenderer:
         self._is_import_only = _is_import_only_code(code)
         self._epoch_total = _infer_epoch_total(code)
         self._epoch_current = None
+        self._epoch_progress_visible = False
         self._is_epoch_job = self._epoch_total is not None or bool(
             re.search(r"\bepochs?\b", code or "", re.IGNORECASE)
         )
@@ -908,10 +909,13 @@ class _HybridOutputRenderer:
     def start(self):
         if get_ipython() is None:
             return
-        # A generic indeterminate bar is misleading for epoch loops. Their
-        # ordinary loss/metric lines remain visible, and finish() adds one
-        # determinate summary with the actual epoch count and total time.
+        # A generic indeterminate bar is misleading for epoch loops. Start one
+        # determinate bar at 0/N, advance it from printed Epoch lines, and turn
+        # it into the final elapsed-time summary in finish().
         if self._is_epoch_job:
+            if self._epoch_total:
+                with self._lock:
+                    self._publish_epoch_progress_locked()
             return
         self._thread = threading.Thread(
             target=self._status_loop,
@@ -1020,7 +1024,7 @@ class _HybridOutputRenderer:
         if not value:
             return
         self._saw_normal_output = True
-        if not self._native_progress:
+        if not self._native_progress and not self._epoch_progress_visible:
             self._hide_status_locked()
         print(value, end="")
 
@@ -1093,6 +1097,7 @@ class _HybridOutputRenderer:
             self._epoch_current = int(epoch_match.group(1))
             if epoch_match.group(2):
                 self._epoch_total = int(epoch_match.group(2))
+            self._publish_epoch_progress_locked()
         if had_carriage_return or len(revisions) > 1:
             if candidate and _is_structured_terminal_progress(candidate):
                 self._set_terminal_progress_locked(candidate)
@@ -1159,7 +1164,7 @@ class _HybridOutputRenderer:
                 # do not end in a newline; only structured progress is buffered.
                 self._emit_normal_stream_locked(combined)
 
-    def _publish_epoch_summary_locked(self, outcome):
+    def _publish_epoch_progress_locked(self, outcome=None):
         elapsed = _format_elapsed(time.monotonic() - self.started_at)
         current = self._epoch_current or 0
         total = self._epoch_total
@@ -1169,12 +1174,12 @@ class _HybridOutputRenderer:
             elif current:
                 total = total or current
 
-        labels = {
+        final_labels = {
             "completed": ("#1a7f37", "Training complete"),
             "failed": ("#cf222e", "Training failed"),
             "interrupted": ("#9a6700", "Training interrupted"),
         }
-        color, label = labels.get(outcome, labels["completed"])
+        color, label = final_labels.get(outcome, ("#0969da", "Training epochs"))
         progress = ""
         epoch_detail = ""
         if total:
@@ -1198,14 +1203,16 @@ class _HybridOutputRenderer:
             'padding:.45rem .65rem;border:1px solid #d0d7de;border-radius:6px;max-width:760px">'
             f'<strong style="color:{color}">{label}</strong>'
             f'{progress}{detail}'
-            f'<div style="margin-top:.2rem">Total elapsed: {elapsed}</div></div>'
+            f'<div style="margin-top:.2rem">'
+            f'{"Total elapsed" if outcome else "Elapsed"}: {elapsed}</div></div>'
         )
         plain_detail = f" — {epoch_detail}" if epoch_detail else ""
         self._publish(
             markup,
-            f"{label}{plain_detail} — Total elapsed: {elapsed}",
-            update=False,
+            f'{label}{plain_detail} — {"Total elapsed" if outcome else "Elapsed"}: {elapsed}',
+            update=self._epoch_progress_visible,
         )
+        self._epoch_progress_visible = True
 
     def handle(self, msg):
         msg_type = msg.get("msg_type", "")
@@ -1263,8 +1270,7 @@ class _HybridOutputRenderer:
                 self._stream_buffers[name] = ""
 
             if self._is_epoch_job:
-                self._hide_status_locked()
-                self._publish_epoch_summary_locked(outcome)
+                self._publish_epoch_progress_locked(outcome)
                 return
             if self._external_progress and not self._native_progress:
                 return

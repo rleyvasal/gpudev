@@ -263,7 +263,7 @@ class HybridOutputRendererTests(unittest.TestCase):
         renderer.finish("completed")
         self.assertIn("GPU job completed", self.ip.display_pub.calls[-1]["data"]["text/plain"])
 
-    def test_epoch_job_uses_one_final_progress_summary(self):
+    def test_epoch_job_streams_progress_and_finishes_with_summary(self):
         renderer = core._HybridOutputRenderer(
             status_delay=0.01,
             status_interval=0.01,
@@ -275,7 +275,10 @@ class HybridOutputRendererTests(unittest.TestCase):
         )
         renderer.start()
         time.sleep(0.03)
-        self.assertEqual(self.ip.display_pub.calls, [])
+        self.assertEqual(len(self.ip.display_pub.calls), 1)
+        initial = self.ip.display_pub.calls[0]
+        self.assertFalse(initial["update"])
+        self.assertIn('value="0" max="3"', initial["data"]["text/html"])
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -284,7 +287,23 @@ class HybridOutputRendererTests(unittest.TestCase):
                     "msg_type": "stream",
                     "content": {
                         "name": "stdout",
-                        "text": "Epoch 1: 1.6925\nEpoch 2: 0.7232\nEpoch 3: 0.6716\n",
+                        "text": "Epoch 1: 1.6925\n",
+                    },
+                }
+            )
+            live = self.ip.display_pub.calls[-1]
+            self.assertTrue(live["update"])
+            self.assertIn('value="1" max="3"', live["data"]["text/html"])
+            self.assertIn("Training epochs", live["data"]["text/html"])
+            self.assertIn("Elapsed:", live["data"]["text/html"])
+            self.assertNotIn("Total elapsed:", live["data"]["text/html"])
+
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {
+                        "name": "stdout",
+                        "text": "Epoch 2: 0.7232\nEpoch 3: 0.6716\n",
                     },
                 }
             )
@@ -294,8 +313,9 @@ class HybridOutputRendererTests(unittest.TestCase):
             stdout.getvalue(),
             "Epoch 1: 1.6925\nEpoch 2: 0.7232\nEpoch 3: 0.6716\n",
         )
-        self.assertEqual(len(self.ip.display_pub.calls), 1)
-        data = self.ip.display_pub.calls[0]["data"]
+        self.assertEqual(len(self.ip.display_pub.calls), 5)
+        self.assertTrue(all(call["update"] for call in self.ip.display_pub.calls[1:]))
+        data = self.ip.display_pub.calls[-1]["data"]
         self.assertIn('value="3" max="3"', data["text/html"])
         self.assertIn("Epochs completed: 3 / 3", data["text/html"])
         self.assertIn("Total elapsed:", data["text/html"])
