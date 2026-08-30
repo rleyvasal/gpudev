@@ -263,6 +263,39 @@ class HybridOutputRendererTests(unittest.TestCase):
         renderer.finish("completed")
         self.assertIn("GPU job completed", self.ip.display_pub.calls[-1]["data"]["text/plain"])
 
+    def test_successful_import_only_cell_removes_temporary_status(self):
+        renderer = core._HybridOutputRenderer(
+            status_delay=60,
+            code=(
+                "# imports\n"
+                "from PIL import Image\n"
+                "import numpy as np\n"
+                "import torch\n"
+            ),
+        )
+        with renderer._lock:
+            renderer._publish_running_locked()
+
+        self.assertIn(
+            "Loading Python packages",
+            self.ip.display_pub.calls[-1]["data"]["text/plain"],
+        )
+        renderer.finish("completed")
+
+        published = [call["data"]["text/plain"] for call in self.ip.display_pub.calls]
+        self.assertNotIn("GPU job completed", "\n".join(published))
+        self.assertEqual(published[-1], "")
+
+    def test_failed_import_keeps_failure_status(self):
+        renderer = core._HybridOutputRenderer(status_delay=60, code="import missing_package")
+        with renderer._lock:
+            renderer._publish_running_locked()
+        renderer.finish("failed")
+        self.assertIn(
+            "GPU job failed",
+            self.ip.display_pub.calls[-1]["data"]["text/plain"],
+        )
+
     def test_native_html_progress_suppresses_duplicate_status(self):
         renderer = core._HybridOutputRenderer(status_delay=60)
         with renderer._lock:

@@ -1,3 +1,4 @@
+import ast
 import html
 import json
 import platform
@@ -737,7 +738,18 @@ def _infer_job_label(code):
         code,
     ):
         return "Installing Python packages"
+    if _is_import_only_code(code):
+        return "Loading Python packages"
     return ""
+
+
+def _is_import_only_code(code):
+    """Whether a cell contains only Python import statements and comments."""
+    try:
+        body = ast.parse(code or "").body
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    return bool(body) and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in body)
 
 
 def _summarize_terminal_progress(value, percent):
@@ -806,6 +818,7 @@ class _HybridOutputRenderer:
         self._last_log_line = ""
         self._job_label = _infer_job_label(code)
         self._is_curl_job = bool(re.search(r"(?:^|\s)!?curl(?:\s|$)", code or ""))
+        self._is_import_only = _is_import_only_code(code)
         self._progress_current = None
         self._progress_total = None
         self._progress_unit = None
@@ -1112,6 +1125,12 @@ class _HybridOutputRenderer:
                 self._stream_buffers[name] = ""
 
             if self._external_progress and not self._native_progress:
+                return
+            if outcome == "completed" and self._is_import_only:
+                # Successful imports are conventionally silent notebook cells.
+                # A slow import may show temporary activity, but it should not
+                # leave an artificial completion result behind.
+                self._hide_status_locked()
                 return
             if (
                 outcome == "completed"

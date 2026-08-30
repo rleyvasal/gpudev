@@ -539,6 +539,9 @@ CRAFT uses a hybrid output renderer for remote cells:
   When real command or Python output arrives, it dismisses the generic activity
   card and remains the cell's final output; it is not replaced by a completion
   badge.
+- Import-only Python cells remain silent when successful, like normal notebook
+  imports. Slow imports can show a temporary **Loading Python packages** status,
+  which disappears when loading finishes; import failures remain visible.
 - Native HTML progress displays are forwarded unchanged. CRAFT detects them and
   suppresses its generic status so the notebook shows only one bar.
 
