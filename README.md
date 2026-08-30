@@ -527,6 +527,11 @@ CRAFT uses a hybrid output renderer for remote cells:
 
 - A silent job gets a local **GPU job in progress** display after one second,
   including elapsed time and time since the last remote output.
+- Epoch loops such as `for epoch in range(5)` do not get a misleading
+  indeterminate gray bar. CRAFT preserves each printed loss/metric line, infers
+  fixed epoch totals when possible, and appends one completed training bar with
+  **Epochs completed** and **Total elapsed** beneath it. If training code emits a
+  real `tqdm`, fastprogress, or HTML bar, that live progress is still forwarded.
 - Pip's byte counters become one determinate progress bar with transferred size,
   percentage, rate, and ETA. Newly created or rebuilt clients set
   `PIP_PROGRESS_BAR=raw` in the remote kernel automatically; an explicit pip

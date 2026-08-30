@@ -263,6 +263,56 @@ class HybridOutputRendererTests(unittest.TestCase):
         renderer.finish("completed")
         self.assertIn("GPU job completed", self.ip.display_pub.calls[-1]["data"]["text/plain"])
 
+    def test_epoch_job_uses_one_final_progress_summary(self):
+        renderer = core._HybridOutputRenderer(
+            status_delay=0.01,
+            status_interval=0.01,
+            code=(
+                "num_epochs = 3\n"
+                "for epoch in range(num_epochs):\n"
+                "    print(f'Epoch {epoch + 1}: 0.5')\n"
+            ),
+        )
+        renderer.start()
+        time.sleep(0.03)
+        self.assertEqual(self.ip.display_pub.calls, [])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            renderer.handle(
+                {
+                    "msg_type": "stream",
+                    "content": {
+                        "name": "stdout",
+                        "text": "Epoch 1: 1.6925\nEpoch 2: 0.7232\nEpoch 3: 0.6716\n",
+                    },
+                }
+            )
+            renderer.finish("completed")
+
+        self.assertEqual(
+            stdout.getvalue(),
+            "Epoch 1: 1.6925\nEpoch 2: 0.7232\nEpoch 3: 0.6716\n",
+        )
+        self.assertEqual(len(self.ip.display_pub.calls), 1)
+        data = self.ip.display_pub.calls[0]["data"]
+        self.assertIn('value="3" max="3"', data["text/html"])
+        self.assertIn("Epochs completed: 3 / 3", data["text/html"])
+        self.assertIn("Total elapsed:", data["text/html"])
+        self.assertNotIn("GPU job in progress", data["text/plain"])
+
+    def test_epoch_total_supports_range_start_stop_step(self):
+        self.assertEqual(
+            core._infer_epoch_total("for epoch in range(2, 10, 2):\n    pass\n"),
+            4,
+        )
+        self.assertEqual(
+            core._infer_epoch_total(
+                "epochs: int = 3\nfor epoch in range(1, epochs + 1):\n    pass\n"
+            ),
+            3,
+        )
+
     def test_successful_import_only_cell_removes_temporary_status(self):
         renderer = core._HybridOutputRenderer(
             status_delay=60,

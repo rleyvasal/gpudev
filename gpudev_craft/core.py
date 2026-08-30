@@ -743,6 +743,76 @@ def _infer_job_label(code):
     return ""
 
 
+def _infer_epoch_total(code):
+    """Infer a fixed epoch count from common ``for epoch in range(...)`` cells."""
+    try:
+        tree = ast.parse(code or "")
+    except (SyntaxError, ValueError, TypeError):
+        return None
+
+    constants = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and (
+                isinstance(node.value.value, int) and not isinstance(node.value.value, bool)
+            ):
+                constants[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, int)
+            and not isinstance(node.value.value, bool)
+        ):
+            constants[node.target.id] = node.value.value
+
+    def integer_value(node):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+        ):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = integer_value(node.operand)
+            if value is not None:
+                return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+            left = integer_value(node.left)
+            right = integer_value(node.right)
+            if left is not None and right is not None:
+                return left + right if isinstance(node.op, ast.Add) else left - right
+        return None
+
+    totals = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.For, ast.AsyncFor)):
+            continue
+        if not isinstance(node.target, ast.Name) or "epoch" not in node.target.id.lower():
+            continue
+        iterator = node.iter
+        if not (
+            isinstance(iterator, ast.Call)
+            and isinstance(iterator.func, ast.Name)
+            and iterator.func.id == "range"
+            and 1 <= len(iterator.args) <= 3
+        ):
+            continue
+        values = [integer_value(arg) for arg in iterator.args]
+        if any(value is None for value in values):
+            continue
+        try:
+            total = len(range(*values))
+        except (TypeError, ValueError):
+            continue
+        if total > 0:
+            totals.append(total)
+    return max(totals) if totals else None
+
+
 def _is_import_only_code(code):
     """Whether a cell contains only Python import statements and comments."""
     try:
@@ -819,6 +889,11 @@ class _HybridOutputRenderer:
         self._job_label = _infer_job_label(code)
         self._is_curl_job = bool(re.search(r"(?:^|\s)!?curl(?:\s|$)", code or ""))
         self._is_import_only = _is_import_only_code(code)
+        self._epoch_total = _infer_epoch_total(code)
+        self._epoch_current = None
+        self._is_epoch_job = self._epoch_total is not None or bool(
+            re.search(r"\bepochs?\b", code or "", re.IGNORECASE)
+        )
         self._progress_current = None
         self._progress_total = None
         self._progress_unit = None
@@ -832,6 +907,11 @@ class _HybridOutputRenderer:
 
     def start(self):
         if get_ipython() is None:
+            return
+        # A generic indeterminate bar is misleading for epoch loops. Their
+        # ordinary loss/metric lines remain visible, and finish() adds one
+        # determinate summary with the actual epoch count and total time.
+        if self._is_epoch_job:
             return
         self._thread = threading.Thread(
             target=self._status_loop,
@@ -1003,6 +1083,16 @@ class _HybridOutputRenderer:
         if pip_match:
             self._set_byte_progress_locked(int(pip_match.group(1)), int(pip_match.group(2)))
             return None
+        epoch_match = re.match(
+            r"^\s*Epoch\s+(\d+)(?:\s*/\s*(\d+))?\s*(?::|-)",
+            candidate,
+            re.IGNORECASE,
+        )
+        if epoch_match:
+            self._is_epoch_job = True
+            self._epoch_current = int(epoch_match.group(1))
+            if epoch_match.group(2):
+                self._epoch_total = int(epoch_match.group(2))
         if had_carriage_return or len(revisions) > 1:
             if candidate and _is_structured_terminal_progress(candidate):
                 self._set_terminal_progress_locked(candidate)
@@ -1069,6 +1159,54 @@ class _HybridOutputRenderer:
                 # do not end in a newline; only structured progress is buffered.
                 self._emit_normal_stream_locked(combined)
 
+    def _publish_epoch_summary_locked(self, outcome):
+        elapsed = _format_elapsed(time.monotonic() - self.started_at)
+        current = self._epoch_current or 0
+        total = self._epoch_total
+        if outcome == "completed":
+            if total and not current:
+                current = total
+            elif current:
+                total = total or current
+
+        labels = {
+            "completed": ("#1a7f37", "Training complete"),
+            "failed": ("#cf222e", "Training failed"),
+            "interrupted": ("#9a6700", "Training interrupted"),
+        }
+        color, label = labels.get(outcome, labels["completed"])
+        progress = ""
+        epoch_detail = ""
+        if total:
+            bounded = max(0, min(current, total))
+            progress = (
+                f'<progress value="{bounded}" max="{total}" '
+                'style="display:block;width:100%;margin-top:.4rem;vertical-align:middle;accent-color:'
+                f'{color}"></progress>'
+            )
+            epoch_detail = f"Epochs completed: {bounded} / {total}"
+        elif current:
+            epoch_detail = f"Epochs completed: {current}"
+
+        detail = (
+            f'<div style="margin-top:.35rem">{html.escape(epoch_detail)}</div>'
+            if epoch_detail
+            else ""
+        )
+        markup = (
+            '<div role="status" style="font:13px/1.4 system-ui,sans-serif;'
+            'padding:.45rem .65rem;border:1px solid #d0d7de;border-radius:6px;max-width:760px">'
+            f'<strong style="color:{color}">{label}</strong>'
+            f'{progress}{detail}'
+            f'<div style="margin-top:.2rem">Total elapsed: {elapsed}</div></div>'
+        )
+        plain_detail = f" — {epoch_detail}" if epoch_detail else ""
+        self._publish(
+            markup,
+            f"{label}{plain_detail} — Total elapsed: {elapsed}",
+            update=False,
+        )
+
     def handle(self, msg):
         msg_type = msg.get("msg_type", "")
         content = msg.get("content", {})
@@ -1124,6 +1262,10 @@ class _HybridOutputRenderer:
                     self._emit_normal_stream_locked(pending)
                 self._stream_buffers[name] = ""
 
+            if self._is_epoch_job:
+                self._hide_status_locked()
+                self._publish_epoch_summary_locked(outcome)
+                return
             if self._external_progress and not self._native_progress:
                 return
             if outcome == "completed" and self._is_import_only:
