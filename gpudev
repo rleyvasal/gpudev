@@ -855,7 +855,9 @@ cmd_status() {
     echo "  gpudev gpu                   full nvidia-smi"
     echo "  gpudev cloudflare            tunnel + ingress + edge check"
     echo "  gpudev disk                  disk usage breakdown"
-    echo "  gpudev power reboot|sleep    reboot or sleep the host"
+    echo "  gpudev power sleep [60m]     sleep now or schedule it"
+    echo "  gpudev power reboot [15m]    reboot now or schedule it"
+    echo "  gpudev power status|cancel   manage scheduled power jobs"
     echo "  gpudev self-update           pull latest CLI into ~/bin"
     echo "  gpudev help                  full command reference"
     echo "═══════════════════════════════════════════════════════════════════"
@@ -1148,13 +1150,8 @@ ensure_wsl_interop() {
     return 0
 }
 
-cmd_power() {
-    local action="${1:-}"
-    case "$action" in
-        reboot|sleep) ;;
-        *) fail "Usage: gpudev power <reboot|sleep>" ;;
-    esac
-
+execute_power_action() {
+    local action="$1"
     require_host_setup
     local host_env
     host_env="$(host_get host_env)"
@@ -1197,6 +1194,165 @@ cmd_power() {
     esac
 }
 
+power_duration_seconds() {
+    local duration="$1" amount unit multiplier
+    if [[ ! "$duration" =~ ^([1-9][0-9]*)([smhd])$ ]]; then
+        return 1
+    fi
+    amount="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        s) multiplier=1 ;;
+        m) multiplier=60 ;;
+        h) multiplier=3600 ;;
+        d) multiplier=86400 ;;
+    esac
+    printf '%s' "$((amount * multiplier))"
+}
+
+ensure_power_timer_manager() {
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    systemctl --user show-environment >/dev/null 2>&1 || fail "The gpudev user systemd manager is unavailable.
+Run 'gpudev power setup' once to enable persistent scheduled power operations."
+}
+
+setup_power_management() {
+    require_host_setup
+    command_exists loginctl || fail "loginctl is required to configure scheduled power operations."
+    log "Enabling persistent scheduled power operations for $(whoami)..."
+    sudo loginctl enable-linger "$(whoami)"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    local dispatcher="${HOME}/bin/gpudev-ssh-dispatch"
+    if [ ! -x "$dispatcher" ] && [ -f "${REPO_DIR}/gpudev-ssh-dispatch" ]; then
+        mkdir -p "${HOME}/bin"
+        cp "${REPO_DIR}/gpudev-ssh-dispatch" "$dispatcher"
+        chmod +x "$dispatcher"
+    fi
+    [ -x "$dispatcher" ] || fail "SSH dispatcher is missing. Run 'gpudev self-update', then repeat this command."
+    "$dispatcher" --install "$HOST_CONFIG"
+
+    echo "Remote power commands are ready:"
+    echo "  ssh gpudev sleep"
+    echo "  ssh gpudev sleep 60m"
+    echo "  ssh gpudev reboot 15m"
+    echo "  ssh gpudev power status"
+}
+
+schedule_power_action() {
+    local action="$1" duration="$2" seconds unit gpudev_bin target_time
+    seconds="$(power_duration_seconds "$duration")" || fail "Invalid duration '$duration'. Use an explicit unit, for example: 30s, 60m, 2h, or 1d."
+    ensure_power_timer_manager
+
+    unit="gpudev-power-${action}-$(date +%s%N)"
+    gpudev_bin="${HOME}/bin/gpudev"
+    [ -x "$gpudev_bin" ] || gpudev_bin="$(realpath "${BASH_SOURCE[0]}")"
+    target_time="$(date -d "+${seconds} seconds" '+%Y-%m-%d %H:%M:%S %Z')"
+
+    if [ -n "${GPUDEV_POWER_DRYRUN:-}" ]; then
+        echo "[dry-run] systemd-run --user --on-active=${seconds}s ${gpudev_bin} power ${action} now"
+    else
+        systemd-run --user \
+            --unit "$unit" \
+            --on-active="${seconds}s" \
+            --timer-property=AccuracySec=1s \
+            --collect \
+            "$gpudev_bin" power "$action" now >/dev/null
+    fi
+
+    echo "Scheduled power action: ${action}"
+    echo "  When:  ${target_time} (in ${duration})"
+    echo "  Job:   ${unit}"
+    echo "  View:  ssh gpudev power status"
+    echo "  Cancel: ssh gpudev power cancel ${unit}"
+}
+
+power_timer_units() {
+    local pattern="${1:-gpudev-power-*}"
+    ensure_power_timer_manager
+    systemctl --user list-units --all --type=timer --no-legend "${pattern}.timer" 2>/dev/null \
+        | awk '{sub(/\.timer$/, "", $1); print $1}'
+}
+
+power_status() {
+    ensure_power_timer_manager
+    local timers unit action next
+    timers="$(power_timer_units)"
+    echo "Scheduled gpudev power operations"
+    echo ""
+    if [ -z "$timers" ]; then
+        echo "  None."
+    else
+        printf "  %-49s %-8s %s\n" "JOB" "ACTION" "WHEN"
+        while IFS= read -r unit; do
+            [ -n "$unit" ] || continue
+            action="${unit#gpudev-power-}"
+            action="${action%%-*}"
+            next="$(systemctl --user show "${unit}.timer" --property=NextElapseUSecRealtime --value 2>/dev/null || true)"
+            [ -n "$next" ] || next="pending"
+            printf "  %-49s %-8s %s\n" "$unit" "$action" "$next"
+        done <<< "$timers"
+    fi
+}
+
+cancel_power_timers() {
+    local selector="${1:-all}" pattern timers unit count=0
+    case "$selector" in
+        all) pattern="gpudev-power-*" ;;
+        sleep|reboot) pattern="gpudev-power-${selector}-*" ;;
+        *)
+            if [[ "$selector" =~ ^gpudev-power-(sleep|reboot)-[0-9]+$ ]]; then
+                pattern="$selector"
+            else
+                fail "Unknown scheduled job '$selector'. Use all, sleep, reboot, or the job ID shown by power status."
+            fi
+            ;;
+    esac
+
+    timers="$(power_timer_units "$pattern")"
+    if [ -z "$timers" ]; then
+        echo "No matching scheduled power operations."
+        return 0
+    fi
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        systemctl --user stop "${unit}.timer" >/dev/null
+        echo "Cancelled: ${unit}"
+        count=$((count + 1))
+    done <<< "$timers"
+    echo "Cancelled ${count} scheduled operation(s)."
+}
+
+cmd_power() {
+    local action="${1:-}" when="${2:-}" extra="${3:-}"
+    [ -z "$extra" ] || fail "Too many arguments. Use: gpudev power <sleep|reboot> [now|duration]"
+    case "$action" in
+        setup)
+            [ -z "$when" ] || fail "Usage: gpudev power setup"
+            setup_power_management
+            ;;
+        sleep|reboot)
+            case "$when" in
+                ""|now) execute_power_action "$action" ;;
+                *) schedule_power_action "$action" "$when" ;;
+            esac
+            ;;
+        status)
+            [ -z "$when" ] || fail "Usage: gpudev power status"
+            power_status
+            ;;
+        cancel)
+            cancel_power_timers "${when:-all}"
+            ;;
+        *)
+            fail "Usage: gpudev power <sleep|reboot> [now|30s|60m|2h|1d]
+       gpudev power setup
+       gpudev power status
+       gpudev power cancel [all|sleep|reboot|job-id]"
+            ;;
+    esac
+}
+
 # ── gpudev self-update ────────────────────────────────────────────────────────
 
 cmd_self_update() {
@@ -1217,7 +1373,7 @@ cmd_self_update() {
         log "Downloading latest host scripts from ${repo_raw}..."
         command_exists curl || fail "curl is required for self-update on non-git installs."
         local f tmp
-        for f in linux-setup.sh gpudev client-setup.sh kernel-manager.sh; do
+        for f in linux-setup.sh gpudev gpudev-ssh-dispatch client-setup.sh kernel-manager.sh; do
             tmp="$(mktemp)"
             if curl -fsSL "${repo_raw}/${f}" -o "$tmp"; then
                 chmod +x "$tmp"
@@ -1236,7 +1392,7 @@ cmd_self_update() {
     # swaps the directory entry while the old inode stays open for any
     # process still reading it (including this one).
     local script tmp
-    for script in gpudev client-setup.sh kernel-manager.sh; do
+    for script in gpudev gpudev-ssh-dispatch client-setup.sh kernel-manager.sh; do
         if [ -f "${repo_dir}/${script}" ]; then
             tmp="$(mktemp "${HOME}/bin/.${script}.XXXXXX")"
             cp "${repo_dir}/${script}" "$tmp"
@@ -1247,6 +1403,10 @@ cmd_self_update() {
             warn "${script} not found in ${repo_dir} — skipped."
         fi
     done
+
+    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] && [ -f "$HOST_CONFIG" ]; then
+        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG"
+    fi
 
     # Ensure the interactive-login dashboard hook is in ~/.bashrc so existing
     # hosts get it on `gpudev self-update` (not just fresh linux-setup.sh runs).
@@ -1297,8 +1457,11 @@ Status:
   gpudev disk
 
 Power:
-  gpudev power reboot
-  gpudev power sleep
+  gpudev power setup
+  gpudev power sleep [now|30s|60m|2h|1d]
+  gpudev power reboot [now|30s|60m|2h|1d]
+  gpudev power status
+  gpudev power cancel [all|sleep|reboot|job-id]
 
 Other:
   gpudev self-update
@@ -1346,7 +1509,7 @@ main() {
             cmd_disk
             ;;
         power)
-            cmd_power "${2:-}"
+            cmd_power "${2:-}" "${3:-}" "${4:-}"
             ;;
         self-update)
             cmd_self_update

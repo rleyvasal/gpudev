@@ -149,13 +149,15 @@ Gather these **before** starting setup. Only needed for Phase B (`linux-setup.sh
 After the Windows host setup finishes you'll be able to, from the admin laptop:
 
 ```bash
-ssh gpudev          # opens the host dashboard automatically
-gpudev client add alice  # provisions a new client container
-gpudev power sleep       # remotely sleep the Windows machine
+ssh gpudev                    # open the host dashboard
+ssh gpudev sleep              # sleep the Windows machine now
+ssh gpudev sleep 60m          # sleep it in 60 minutes
+ssh gpudev reboot 15m         # reboot it in 15 minutes
 ```
 
-…and any notebook you onboard gets a per-client container with its own SSH key
-and GPU access.
+The setup keeps normal SSH commands working, so after opening the dashboard you
+can still run `gpudev client add alice` to provision a client container. Each
+notebook you onboard gets its own SSH key, container, and GPU access.
 
 ---
 
@@ -357,11 +359,26 @@ compatible official PyTorch backend, and locks the exact PyTorch package set.
 12. **Installs the `gpudev` CLI** into `~/bin` and adds an interactive-login
     hook to `~/.bashrc` so `gpudev status` (the dashboard) renders
     automatically when you SSH in.
-13. **Configures power management** for `gpudev power reboot|sleep`.
+13. **Configures remote power management** and the admin SSH shortcuts. An
+    immediate command is simply `ssh gpudev sleep` or `ssh gpudev reboot`;
+    adding an explicit duration such as `60m` creates a persistent timer that
+    survives the SSH disconnect.
 
 Steps 4–13 only run when systemd is already PID 1, so on a fresh WSL
 install you'll see steps 1–3 the first time and steps 1–2, 4–13 the second
 time. On a bare Linux host (where systemd is already PID 1) it is a single pass.
+
+For an existing gpudev host, install the shortcuts without rebuilding the base
+image:
+
+```bash
+ssh gpudev
+gpudev self-update
+gpudev power setup       # one-time; may request the host sudo password
+exit
+```
+
+Fresh installations perform this configuration automatically.
 
 #### B.4 — Phase B health check
 
@@ -672,6 +689,27 @@ there survive `gpudev client rebuild` (but not `client remove`).
 
 ## Day-to-day admin operations
 
+From the admin computer, power commands do not require opening an interactive
+host shell first:
+
+```bash
+ssh gpudev sleep                       # sleep now
+ssh gpudev sleep 60m                   # sleep in 60 minutes
+ssh gpudev reboot                      # reboot now
+ssh gpudev reboot 15m                  # reboot in 15 minutes
+ssh gpudev power status                # list pending timers
+ssh gpudev power cancel                # cancel all pending timers
+ssh gpudev power cancel sleep          # cancel only sleep timers
+ssh gpudev power cancel <job-id>       # cancel one timer
+```
+
+Durations require a unit: `s` (seconds), `m` (minutes), `h` (hours), or `d`
+(days). A bare value such as `sleep 60` is rejected to avoid an ambiguous or
+accidental power action. `now` is also accepted but optional. The scheduled
+jobs use the host user's systemd timer manager, so they keep running after the
+SSH command exits. An immediate sleep or reboot normally closes the SSH
+connection as the host powers down.
+
 All on the host (via `ssh gpudev`):
 
 ```
@@ -687,8 +725,10 @@ gpudev gpu                            # full nvidia-smi
 gpudev cloudflare                     # tunnel + ingress + edge HTTP check
 gpudev cloudflare token-set           # store Zone.DNS Edit token for client remove
 gpudev disk                           # host + Docker volume usage
-gpudev power reboot                   # reboot the Windows host (via WSL interop)
-gpudev power sleep                    # sleep the Windows host
+gpudev power reboot [15m]             # reboot now or schedule it
+gpudev power sleep [60m]              # sleep now or schedule it
+gpudev power status                   # list scheduled power jobs
+gpudev power cancel [all|sleep|reboot|job-id]
 gpudev self-update                    # pull latest CLI into ~/bin
 gpudev help                           # full reference
 ```
@@ -839,6 +879,7 @@ gpudev/
 ├── client-setup.sh       ← per-client container provisioning (`gpudev client add`)
 ├── kernel-manager.sh     ← in-container Jupyter kernel lifecycle
 ├── gpudev                ← admin CLI (deployed to ~/bin on the host)
+├── gpudev-ssh-dispatch   ← managed admin SSH shortcuts and command routing
 ├── CRAFT.py              ← notebook cell-routing magics (SolveIt craft / %run)
 └── pcviz.py              ← local FastHTML + three.js point-cloud viewer magics
 ```
@@ -852,5 +893,5 @@ Configuration on the host:
 ~/.config/gpudev/pylock.gpudev-torch.toml
 ~/.cloudflared/config.yml       ← tunnel ingress rules (one entry per client + the host)
 /etc/systemd/system/gpudev-tunnel.service
-~/bin/{gpudev,client-setup.sh,kernel-manager.sh}
+~/bin/{gpudev,gpudev-ssh-dispatch,client-setup.sh,kernel-manager.sh}
 ```

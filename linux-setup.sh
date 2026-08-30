@@ -27,7 +27,7 @@ REPO_RAW_URL="${GPUDEV_REPO_RAW:-https://raw.githubusercontent.com/rleyvasal/gpu
 
 # Host-side scripts (NOT CRAFT.py, NOT windows-setup.ps1 — those don't belong
 # on the host). gpudev self-update fetches the same set.
-HOST_SCRIPTS=(linux-setup.sh gpudev client-setup.sh kernel-manager.sh)
+HOST_SCRIPTS=(linux-setup.sh gpudev gpudev-ssh-dispatch client-setup.sh kernel-manager.sh)
 
 log()  { echo "$*"; }
 step() { echo ""; echo "=== $1 ==="; }
@@ -1189,7 +1189,7 @@ install_gpudev_cli() {
     # Source scripts from REPO_DIR (populated by fetch_companions or a git
     # checkout) — not from BASH_SOURCE-relative, since with `bash <(curl …)`
     # BASH_SOURCE is /dev/fd/* and has no companions next to it.
-    for script in gpudev client-setup.sh kernel-manager.sh; do
+    for script in gpudev gpudev-ssh-dispatch client-setup.sh kernel-manager.sh; do
         if [ -f "${REPO_DIR}/${script}" ]; then
             cp "${REPO_DIR}/${script}" "${HOME}/bin/${script}"
             chmod +x "${HOME}/bin/${script}"
@@ -1198,6 +1198,10 @@ install_gpudev_cli() {
             warn "${script} not found at ${REPO_DIR}/${script} — install manually."
         fi
     done
+
+    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ]; then
+        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG"
+    fi
 }
 
 # ── Step 10: Power management ─────────────────────────────────────────────────
@@ -1207,6 +1211,11 @@ install_gpudev_cli() {
 # targets the *Windows* host via interop — gpudev handles that itself, so there
 # is nothing to configure on the Linux side beyond a sanity check.
 configure_power_management() {
+    # Scheduled sleep/reboot operations use the user's transient systemd
+    # timers. Linger keeps that manager and its timers alive after SSH logout.
+    sudo loginctl enable-linger "$LINUX_USER"
+    log "User systemd timer manager: persistent after logout."
+
     if [ "$HOST_ENV" = "wsl2" ]; then
         if [ -x /mnt/c/Windows/System32/shutdown.exe ] || command_exists shutdown.exe; then
             log "WSL2 interop OK — 'gpudev power' will drive the Windows host."
@@ -1330,6 +1339,10 @@ run_health_check() {
     command_exists gpudev \
         && log "  gpudev CLI:               OK" \
         || warn "  gpudev CLI:               not found in PATH yet (re-login or: source ~/.bashrc)"
+
+    [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] \
+        && log "  admin SSH shortcuts:      OK (sleep/reboot scheduling)" \
+        || warn "  admin SSH shortcuts:      MISSING"
 
     if [ "$HOST_ENV" = "wsl2" ]; then
         { [ -x /mnt/c/Windows/System32/shutdown.exe ] || command_exists shutdown.exe; } \

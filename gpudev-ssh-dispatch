@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Forced-command dispatcher for the managed gpudev admin SSH key.
+# SSH_ORIGINAL_COMMAND contains exactly what follows `ssh gpudev ...`.
+
+install_managed_key() {
+    local host_config="${1:-${HOME}/.config/gpudev/host.json}"
+    local authorized_keys="${2:-${HOME}/.ssh/authorized_keys}"
+    [ -f "$host_config" ] || { echo "Error: host config not found: $host_config" >&2; exit 1; }
+
+    mkdir -p "$(dirname "$authorized_keys")"
+    touch "$authorized_keys"
+    chmod 700 "$(dirname "$authorized_keys")"
+    chmod 600 "$authorized_keys"
+
+    local dispatcher
+    dispatcher="$(realpath "${BASH_SOURCE[0]}")"
+    python3 - "$host_config" "$authorized_keys" "$dispatcher" <<'PY'
+import json, pathlib, sys
+
+config_path = pathlib.Path(sys.argv[1])
+keys_path = pathlib.Path(sys.argv[2])
+dispatcher = sys.argv[3]
+key = json.loads(config_path.read_text()).get("admin_ssh_key", "").strip()
+parts = key.split()
+if len(parts) < 2 or not parts[0].startswith(("ssh-", "ecdsa-")):
+    raise SystemExit("Error: host.json has no valid admin_ssh_key")
+
+key_type, blob = parts[:2]
+quoted_dispatcher = dispatcher.replace("\\", "\\\\").replace('"', '\\"')
+managed = f'command="{quoted_dispatcher}" {key}'
+lines = keys_path.read_text().splitlines() if keys_path.exists() else []
+
+# Replace every occurrence of this configured key, including the old raw line,
+# while preserving unrelated keys and comments.
+kept = [line for line in lines if not (key_type in line and blob in line)]
+kept.append(managed)
+keys_path.write_text("\n".join(kept) + "\n")
+PY
+    chmod 600 "$authorized_keys"
+    echo "Managed admin SSH shortcuts installed."
+}
+
+run_gpudev() {
+    local gpudev_bin="${HOME}/bin/gpudev"
+    [ -x "$gpudev_bin" ] || gpudev_bin="$(command -v gpudev 2>/dev/null || true)"
+    [ -n "$gpudev_bin" ] || { echo "Error: gpudev CLI not installed." >&2; exit 127; }
+    if [ "${GPUDEV_SSH_DISPATCH_DRYRUN:-0}" = "1" ]; then
+        printf 'gpudev'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    exec "$gpudev_bin" "$@"
+}
+
+run_shell() {
+    local command="$1"
+    if [ "${GPUDEV_SSH_DISPATCH_DRYRUN:-0}" = "1" ]; then
+        printf 'shell: %s\n' "$command"
+        return 0
+    fi
+    exec "${SHELL:-/bin/bash}" -lc "$command"
+}
+
+run_sftp() {
+    local server
+    for server in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server; do
+        if [ -x "$server" ]; then
+            exec "$server"
+        fi
+    done
+    echo "Error: OpenSSH SFTP server executable not found." >&2
+    exit 127
+}
+
+if [ "${1:-}" = "--install" ]; then
+    install_managed_key "${2:-}" "${3:-}"
+    exit 0
+fi
+
+original="${SSH_ORIGINAL_COMMAND:-}"
+case "$original" in
+    "")
+        if [ "${GPUDEV_SSH_DISPATCH_DRYRUN:-0}" = "1" ]; then
+            echo "login-shell"
+            exit 0
+        fi
+        exec "${SHELL:-/bin/bash}" -l
+        ;;
+    sleep|"sleep now")
+        run_gpudev power sleep now
+        ;;
+    reboot|"reboot now")
+        run_gpudev power reboot now
+        ;;
+    "sleep "*)
+        delay="${original#sleep }"
+        [[ "$delay" =~ ^[1-9][0-9]*[smhd]$ ]] \
+            || { echo "Usage: ssh gpudev sleep [now|<duration: 30s, 60m, 2h>]" >&2; exit 2; }
+        run_gpudev power sleep "$delay"
+        ;;
+    "reboot "*)
+        delay="${original#reboot }"
+        [[ "$delay" =~ ^[1-9][0-9]*[smhd]$ ]] \
+            || { echo "Usage: ssh gpudev reboot [now|<duration: 30s, 60m, 2h>]" >&2; exit 2; }
+        run_gpudev power reboot "$delay"
+        ;;
+    "power status")
+        run_gpudev power status
+        ;;
+    "power setup")
+        run_gpudev power setup
+        ;;
+    "power cancel")
+        run_gpudev power cancel
+        ;;
+    "power cancel "*)
+        run_gpudev power cancel "${original#power cancel }"
+        ;;
+    internal-sftp)
+        run_sftp
+        ;;
+    *)
+        # Preserve ordinary admin SSH commands, scp, and automation.
+        run_shell "$original"
+        ;;
+esac
