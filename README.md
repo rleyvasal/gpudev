@@ -610,6 +610,13 @@ gpudev cloudflare              # shows whether token is present
 into `~/.config/gpudev/` when building `gpudev-base`. Edit those files and
 re-run setup to bump versions after testing `torch.cuda` on your driver.
 
+The default GPU stack is PyTorch 2.10.0 with CUDA 12.8 (`torchvision` 0.25.0,
+`torchaudio` 2.10.0). CUDA 12.8 or newer is required for RTX 50-series Blackwell
+GPUs (`sm_120`); the previous PyTorch 2.5.1/CUDA 12.4 image could detect these
+GPUs but could not execute kernels on them. Setup now validates a real CUDA
+tensor operation and synchronization so this incompatibility fails during setup
+instead of during the first training epoch.
+
 CUDA packages contain large wheels. The generated Dockerfile gives uv a
 five-minute read timeout, retries failed requests five times, and keeps uv's
 download cache across build attempts. If an upstream package server still times

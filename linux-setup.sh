@@ -332,18 +332,19 @@ To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 write_base_requirements() {
     # Pinned top-level ML stack for reproducible base images.
     # Bump intentionally after re-testing torch.cuda on your driver.
-    # Last reviewed: 2026-07.
+    # Last reviewed: 2026-08.
     #
-    # Order in Dockerfile: torch (cu124 index) first, then this base file.
+    # Order in Dockerfile: torch (cu128 index) first, then this base file.
+    # CUDA 12.8 wheels are required for RTX 50-series / Blackwell (sm_120).
     # Do NOT pin numpy here — torch pulls a compatible numpy (often 2.x).
     # numba must support that numpy: 0.60.x only allows numpy<2.1 → use >=0.61.
     mkdir -p "$CONFIG_DIR"
     cat > "${CONFIG_DIR}/requirements-torch.txt" <<'REQ'
-# Installed with: uv pip install --index-url https://download.pytorch.org/whl/cu124 -r …
+# Installed with: uv pip install --index-url https://download.pytorch.org/whl/cu128 -r …
 # If resolve fails for your platform, relax pins and re-run linux-setup.sh.
-torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
 REQ
     cat > "${CONFIG_DIR}/requirements-base.txt" <<'REQ'
 ipykernel==6.29.5
@@ -413,7 +414,7 @@ COPY requirements-torch.txt requirements-base.txt /tmp/gpudev-req/
 RUN uv venv /opt/venv --python 3.12 --seed
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python \
-        --index-url https://download.pytorch.org/whl/cu124 \
+        --index-url https://download.pytorch.org/whl/cu128 \
         -r /tmp/gpudev-req/requirements-torch.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python \
@@ -483,8 +484,9 @@ build_base_image() {
     log "Base image built: ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}"
 }
 
-# Confirm the base image's torch build can actually see a GPU. nvidia-smi in a
-# CUDA base image can pass while /opt/venv still has CPU-only torch wheels.
+# Confirm the base image's torch build can execute a real GPU kernel. Merely
+# checking is_available() is insufficient: an old wheel reports True for an RTX
+# 5080, then fails at runtime because it has no sm_120 kernel image.
 verify_torch_cuda() {
     if [ "${SKIP_GPU_CHECK:-}" = "1" ]; then
         warn "SKIP_GPU_CHECK=1 — skipping torch.cuda check"
@@ -495,16 +497,28 @@ verify_torch_cuda() {
         fail "Base image missing; cannot verify torch.cuda."
     fi
 
-    log "Verifying torch.cuda.is_available() inside ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}..."
+    log "Verifying a real torch CUDA operation inside ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}..."
     if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
-        python -c "import torch; assert torch.cuda.is_available(), (torch.__version__, getattr(torch.version, 'cuda', None)); print('torch', torch.__version__, 'cuda', torch.version.cuda)"; then
-        log "torch.cuda.is_available(): OK"
+        python -c '
+import torch
+assert torch.cuda.is_available(), (torch.__version__, torch.version.cuda)
+device = torch.cuda.current_device()
+x = torch.arange(4, device=device, dtype=torch.float32)
+result = (x * x).sum()
+torch.cuda.synchronize(device)
+assert result.item() == 14.0, result
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+print("gpu", torch.cuda.get_device_name(device), "capability", torch.cuda.get_device_capability(device))
+print("architectures", " ".join(torch.cuda.get_arch_list()))
+'; then
+        log "torch CUDA kernel execution: OK"
         return 0
     fi
 
-    fail "torch cannot see a GPU inside the base image.
-Passthrough may work (nvidia-smi) while wheels are CPU-only, or the driver is too old for this CUDA build.
-Fix: confirm NVIDIA driver, re-run linux-setup.sh after updating the torch index if needed.
+fail "torch cannot execute a GPU kernel inside the base image.
+Passthrough may work (and torch.cuda.is_available() may be True) while the wheel lacks your GPU architecture.
+RTX 50-series / Blackwell requires a CUDA 12.8+ PyTorch wheel with sm_120 support.
+Fix: confirm the NVIDIA driver is current, then re-run linux-setup.sh.
 To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 }
 
@@ -1027,11 +1041,11 @@ run_health_check() {
 
     if $DOCKER image inspect "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
         if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
-            python -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" \
+            python -c "import torch; assert torch.cuda.is_available(); x=torch.ones(1, device='cuda'); x.add_(1); torch.cuda.synchronize(); assert x.item() == 2" \
             >/dev/null 2>&1; then
-            log "  torch.cuda:               OK"
+            log "  torch.cuda kernel:        OK"
         else
-            warn "  torch.cuda:               FAIL (rebuild base image / check GPU)"
+            warn "  torch.cuda kernel:        FAIL (wheel may not support this GPU architecture)"
         fi
     fi
 

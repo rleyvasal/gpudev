@@ -33,6 +33,16 @@ class LinuxSetupTests(unittest.TestCase):
         between = SCRIPT[torch_install:base_install]
         self.assertIn("RUN --mount=type=cache,target=/root/.cache/uv", between)
 
+    def test_torch_build_supports_blackwell_and_runs_a_cuda_kernel(self):
+        self.assertIn("torch==2.10.0", SCRIPT)
+        self.assertIn("torchvision==0.25.0", SCRIPT)
+        self.assertIn("torchaudio==2.10.0", SCRIPT)
+        self.assertIn("download.pytorch.org/whl/cu128", SCRIPT)
+        self.assertNotIn("download.pytorch.org/whl/cu124", SCRIPT)
+        verify = function_body("verify_torch_cuda")
+        self.assertIn("torch.arange(4, device=device", verify)
+        self.assertIn("torch.cuda.synchronize(device)", verify)
+
     def test_active_unchanged_tunnel_is_not_restarted(self):
         body = function_body("setup_host_cf_tunnel")
         self.assertIn("Tunnel configuration unchanged", body)
