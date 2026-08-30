@@ -342,24 +342,26 @@ In order:
    `ssh-ed25519 AAAA... comment` value and Enter.
 6. **Installs Docker + NVIDIA Container Toolkit + `cloudflared`.**
 7. **Verifies GPU passthrough** by running `nvidia-smi` inside a test container.
-8. **Builds the gpudev base image** (`gpudev-base:latest`): Python 3.12 +
+8. **Detects every GPU and the NVIDIA driver**, automatically selects a
+compatible official PyTorch backend, and locks the exact PyTorch package set.
+9. **Builds the gpudev base image** (`gpudev-base:latest`): Python 3.12 +
    PyTorch + CUDA libs + transformers + datasets in `/opt/venv`. **~10–20 min
    on first run** — most of the install time. Subsequent client containers
-   reuse this image.
-9. **Configures host sshd** on port 52100 (pubkey-only, your admin key
+   reuse this image. Setup runs a real CUDA operation on **each installed GPU**
+   before accepting the image.
+10. **Configures host sshd** on port 52100 (pubkey-only, your admin key
    authorized). Persistent via systemd.
-10. **Creates the host Cloudflare tunnel.** When `cloudflared` prints an auth
+11. **Creates the host Cloudflare tunnel.** When `cloudflared` prints an auth
     URL, complete the browser flow (see "Before you start" §5 for the exact
     click-by-click steps). Persistent via `systemd` (`gpudev-tunnel.service`).
-11. **Installs the `gpudev` CLI** into `~/bin` and adds an interactive-login
+12. **Installs the `gpudev` CLI** into `~/bin` and adds an interactive-login
     hook to `~/.bashrc` so `gpudev status` (the dashboard) renders
     automatically when you SSH in.
-12. **Configures power management** for `gpudev power reboot|sleep`.
+13. **Configures power management** for `gpudev power reboot|sleep`.
 
-Steps 4–12 only run when systemd is already PID 1, so on a fresh WSL
-install you'll see steps 1–3 the first time and steps 1–2, 4–12 the second
-time. On a bare Linux host (where systemd is already PID 1) it's a single
-pass through all twelve steps.
+Steps 4–13 only run when systemd is already PID 1, so on a fresh WSL
+install you'll see steps 1–3 the first time and steps 1–2, 4–13 the second
+time. On a bare Linux host (where systemd is already PID 1) it is a single pass.
 
 #### B.4 — Phase B health check
 
@@ -370,6 +372,7 @@ docker:                   OK (29.x.x)
 cloudflared (host):       OK
 host tunnel:              active (persistent via systemd)
 base image:               OK (gpudev-base:latest)
+torch.cuda kernels:       OK (2 GPU(s))
 host sshd:                OK (port 52100, persistent via systemd)
 host.json:                OK
 gpudev CLI:               OK
@@ -604,18 +607,41 @@ gpudev cloudflare token-set    # paste token from dash.cloudflare.com → API To
 gpudev cloudflare              # shows whether token is present
 ```
 
-### Base image package pins
+### Automatic PyTorch selection and locking
 
-`linux-setup.sh` writes pinned `requirements-torch.txt` + `requirements-base.txt`
-into `~/.config/gpudev/` when building `gpudev-base`. Edit those files and
-re-run setup to bump versions after testing `torch.cuda` on your driver.
+No GPU model, CUDA toolkit, or PyTorch version needs to be entered during normal
+setup. `linux-setup.sh` reads each card's model and compute capability plus the
+NVIDIA driver version from inside Docker. uv then selects a compatible official
+PyTorch backend and writes the exact result to
+`~/.config/gpudev/pylock.gpudev-torch.toml`. The selected backend,
+versions, hardware fingerprint, and validation result are also saved under
+`ml_profile` in `host.json` and shown by `gpudev status`.
 
-The default GPU stack is PyTorch 2.10.0 with CUDA 12.8 (`torchvision` 0.25.0,
-`torchaudio` 2.10.0). CUDA 12.8 or newer is required for RTX 50-series Blackwell
-GPUs (`sm_120`); the previous PyTorch 2.5.1/CUDA 12.4 image could detect these
-GPUs but could not execute kernels on them. Setup now validates a real CUDA
-tensor operation and synchronization so this incompatibility fails during setup
-instead of during the first training epoch.
+The lock is reused while the GPU/driver fingerprint is unchanged. Replacing a
+card or updating the driver automatically triggers a new resolution on the next
+setup run. To deliberately check for newer compatible packages without changing
+hardware, run:
+
+```bash
+GPUDEV_ML_REFRESH=1 bash linux-setup.sh
+```
+
+Automatic selection should be used by most installations. For an unusual setup,
+an administrator can override uv's backend explicitly:
+
+```bash
+GPUDEV_TORCH_BACKEND=cu128 GPUDEV_ML_REFRESH=1 bash linux-setup.sh
+```
+
+Pre-Turing cards (compute capability below 7.5) are automatically kept on
+PyTorch's CUDA 12.6 legacy backend because CUDA 13 removed library and
+offline-compilation support for those architectures.
+
+The NVIDIA driver and the CUDA runtime bundled in PyTorch have different jobs;
+installing the newest driver alone cannot add GPU architectures missing from a
+PyTorch wheel. For that reason setup still runs and synchronizes a real tensor
+operation separately on every installed card. A mixed set of GPUs is accepted
+only when one resolved wheel works on all of them.
 
 CUDA packages contain large wheels. The generated Dockerfile gives uv a
 five-minute read timeout, retries failed requests five times, and keeps uv's
@@ -816,6 +842,8 @@ Configuration on the host:
 ```
 ~/.config/gpudev/host.json      ← domain, port base, admin key, CF API token
 ~/.config/gpudev/clients.json   ← registry of provisioned clients
+~/.config/gpudev/gpu-inventory.csv
+~/.config/gpudev/pylock.gpudev-torch.toml
 ~/.cloudflared/config.yml       ← tunnel ingress rules (one entry per client + the host)
 /etc/systemd/system/gpudev-tunnel.service
 ~/bin/{gpudev,client-setup.sh,kernel-manager.sh}

@@ -13,6 +13,11 @@ BASE_IMAGE_NAME="gpudev-base"
 BASE_IMAGE_TAG="latest"
 HOST_SSH_PORT=52100
 PORT_BASE=52200
+GPU_INVENTORY="${CONFIG_DIR}/gpu-inventory.csv"
+TORCH_INPUT="${CONFIG_DIR}/requirements-torch.in"
+TORCH_LOCK="${CONFIG_DIR}/pylock.gpudev-torch.toml"
+UV_RESOLVER_BIN="${CONFIG_DIR}/bin/uv"
+ML_PROFILE_SCHEMA=1
 
 # Source-of-truth for the host's gpudev scripts. fetch_companions() populates
 # this dir on first run (or self-update refreshes it). install_gpudev_cli copies
@@ -327,24 +332,18 @@ To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
     fi
 }
 
-# ── Step 4: Build base image ──────────────────────────────────────────────────
+# ── Step 4b: Resolve the ML stack for this host ───────────────────────────────
 
 write_base_requirements() {
-    # Pinned top-level ML stack for reproducible base images.
-    # Bump intentionally after re-testing torch.cuda on your driver.
-    # Last reviewed: 2026-08.
-    #
-    # Order in Dockerfile: torch (cu128 index) first, then this base file.
-    # CUDA 12.8 wheels are required for RTX 50-series / Blackwell (sm_120).
+    # Torch starts as a small, unpinned intent file. resolve_ml_stack() detects
+    # this host's GPUs/driver and turns it into a fully pinned pylock.toml.
     # Do NOT pin numpy here — torch pulls a compatible numpy (often 2.x).
     # numba must support that numpy: 0.60.x only allows numpy<2.1 → use >=0.61.
     mkdir -p "$CONFIG_DIR"
-    cat > "${CONFIG_DIR}/requirements-torch.txt" <<'REQ'
-# Installed with: uv pip install --index-url https://download.pytorch.org/whl/cu128 -r …
-# If resolve fails for your platform, relax pins and re-run linux-setup.sh.
-torch==2.10.0
-torchvision==0.25.0
-torchaudio==2.10.0
+    cat > "$TORCH_INPUT" <<'REQ'
+torch
+torchvision
+torchaudio
 REQ
     cat > "${CONFIG_DIR}/requirements-base.txt" <<'REQ'
 ipykernel==6.29.5
@@ -366,14 +365,258 @@ requests>=2.32.0
 transformers>=4.46.0,<4.50
 datasets>=3.0.0,<3.3
 REQ
-    # Must go to stderr: write_dockerfile's stdout is captured as the Dockerfile path.
-    log "Wrote pinned requirements to ${CONFIG_DIR}/requirements-torch.txt and requirements-base.txt" >&2
+    log "Wrote ML requirements intent to ${TORCH_INPUT} and requirements-base.txt"
 }
+
+detect_gpu_inventory() {
+    mkdir -p "$CONFIG_DIR"
+    local inventory
+    inventory="$($DOCKER run --rm --gpus all nvidia/cuda:12.3.0-base-ubuntu22.04 \
+        nvidia-smi --query-gpu=index,name,compute_cap,driver_version \
+        --format=csv,noheader,nounits 2>/dev/null || true)"
+
+    if [ -z "$inventory" ]; then
+        # compute_cap is unavailable on a few older nvidia-smi builds. Keep the
+        # remaining fingerprint useful and let the final runtime test decide.
+        inventory="$($DOCKER run --rm --gpus all nvidia/cuda:12.3.0-base-ubuntu22.04 \
+            nvidia-smi --query-gpu=index,name,driver_version \
+            --format=csv,noheader,nounits 2>/dev/null \
+            | awk -F', *' '{ print $1 ", " $2 ", unknown, " $3 }' || true)"
+    fi
+
+    if [ -z "$inventory" ]; then
+        if [ "${SKIP_GPU_CHECK:-}" = "1" ]; then
+            if [ -s "$GPU_INVENTORY" ]; then
+                warn "Could not refresh the GPU inventory; SKIP_GPU_CHECK=1 — reusing the previous inventory and lock."
+                return 0
+            fi
+            warn "Could not inventory GPUs; SKIP_GPU_CHECK=1 — an explicit GPUDEV_TORCH_BACKEND is required."
+            : > "$GPU_INVENTORY"
+            return 0
+        fi
+        fail "Could not read the GPU inventory from Docker. Check NVIDIA passthrough and re-run."
+    fi
+
+    printf '%s\n' "$inventory" > "$GPU_INVENTORY"
+    chmod 600 "$GPU_INVENTORY"
+    log "Detected GPU inventory:"
+    sed 's/^/  /' "$GPU_INVENTORY"
+}
+
+gpu_fingerprint() {
+    if [ -s "$GPU_INVENTORY" ]; then
+        sha256sum "$GPU_INVENTORY" | awk '{print $1}'
+    else
+        printf 'unavailable'
+    fi
+}
+
+install_uv_resolver() {
+    if [ -x "$UV_RESOLVER_BIN" ] && "$UV_RESOLVER_BIN" pip compile --help 2>/dev/null | grep -q -- '--torch-backend'; then
+        return 0
+    fi
+
+    log "Installing the uv package resolver..."
+    mkdir -p "$(dirname "$UV_RESOLVER_BIN")"
+    curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR="$(dirname "$UV_RESOLVER_BIN")" UV_NO_MODIFY_PATH=1 sh
+    [ -x "$UV_RESOLVER_BIN" ] || fail "uv resolver installation failed."
+    "$UV_RESOLVER_BIN" pip compile --help 2>/dev/null | grep -q -- '--torch-backend' \
+        || fail "Installed uv is too old to select a PyTorch backend automatically."
+}
+
+select_torch_backend() {
+    local requested="$1"
+    if [ "$requested" != "auto" ]; then
+        printf '%s' "$requested"
+        return 0
+    fi
+
+    # CUDA 13 no longer supports offline compilation for pre-Turing GPUs. uv's
+    # auto mode primarily follows the driver, so keep those older cards on the
+    # latest CUDA 12 backend instead of selecting CUDA 13 merely
+    # because the host has a new driver. Runtime verification remains final.
+    if [ -s "$GPU_INVENTORY" ] && python3 - "$GPU_INVENTORY" <<'PY'
+import csv, sys
+rows = list(csv.reader(open(sys.argv[1], newline="")))
+caps = []
+for row in rows:
+    try:
+        caps.append(float(row[2].strip()))
+    except (IndexError, ValueError):
+        pass
+raise SystemExit(0 if caps and min(caps) < 7.5 else 1)
+PY
+    then
+        warn "Pre-Turing GPU detected; selecting PyTorch's CUDA 12.6 legacy backend instead of CUDA 13."
+        printf 'cu126'
+    else
+        printf 'auto'
+    fi
+}
+
+ml_lock_is_current() {
+    local fingerprint="$1" requested="$2"
+    [ -s "$TORCH_LOCK" ] || return 1
+    [ "${GPUDEV_ML_REFRESH:-0}" != "1" ] || return 1
+    python3 - "$HOST_CONFIG" "$fingerprint" "$requested" "$ML_PROFILE_SCHEMA" "$TORCH_LOCK" <<'PY'
+import hashlib, json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+profile = json.loads(path.read_text()).get("ml_profile", {})
+lock_hash = hashlib.sha256(pathlib.Path(sys.argv[5]).read_bytes()).hexdigest()
+ok = (profile.get("gpu_fingerprint") == sys.argv[2]
+      and profile.get("requested_backend") == sys.argv[3]
+      and profile.get("schema") == int(sys.argv[4])
+      and profile.get("lock_sha256") == lock_hash)
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+persist_ml_profile() {
+    local fingerprint="$1" requested="$2" resolver_backend="$3"
+    local resolver_version lock_hash
+    resolver_version="$($UV_RESOLVER_BIN --version | awk '{print $2}')"
+    lock_hash="$(sha256sum "$TORCH_LOCK" | awk '{print $1}')"
+
+    GPU_FINGERPRINT_VAL="$fingerprint" \
+    REQUESTED_BACKEND_VAL="$requested" \
+    RESOLVER_BACKEND_VAL="$resolver_backend" \
+    RESOLVER_VERSION_VAL="$resolver_version" \
+    LOCK_HASH_VAL="$lock_hash" \
+    ML_PROFILE_SCHEMA_VAL="$ML_PROFILE_SCHEMA" \
+    python3 - "$HOST_CONFIG" "$GPU_INVENTORY" "$TORCH_LOCK" <<'PY'
+import csv, datetime, json, os, pathlib, re, sys
+
+config_path, inventory_path, lock_path = map(pathlib.Path, sys.argv[1:])
+config = json.loads(config_path.read_text()) if config_path.exists() else {}
+
+gpus = []
+if inventory_path.exists():
+    for row in csv.reader(inventory_path.read_text().splitlines()):
+        if len(row) >= 4:
+            gpus.append({
+                "index": row[0].strip(),
+                "name": row[1].strip(),
+                "compute_capability": row[2].strip(),
+                "driver_version": row[3].strip(),
+            })
+
+lock_text = lock_path.read_text()
+versions = {}
+for block in re.split(r"(?m)^\[\[packages\]\]\s*$", lock_text)[1:]:
+    name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', block)
+    version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', block)
+    if name and version:
+        versions[name.group(1).lower().replace("_", "-")] = version.group(1)
+backends = sorted(set(re.findall(r"download\.pytorch\.org/whl/(cu\d+|cpu)", lock_text)))
+resolved = ",".join(backends) or os.environ["RESOLVER_BACKEND_VAL"]
+
+config["ml_profile"] = {
+    "schema": int(os.environ["ML_PROFILE_SCHEMA_VAL"]),
+    "requested_backend": os.environ["REQUESTED_BACKEND_VAL"],
+    "resolved_backend": resolved,
+    "gpu_fingerprint": os.environ["GPU_FINGERPRINT_VAL"],
+    "gpus": gpus,
+    "torch": versions.get("torch", ""),
+    "torchvision": versions.get("torchvision", ""),
+    "torchaudio": versions.get("torchaudio", ""),
+    "lock_file": str(lock_path),
+    "lock_sha256": os.environ["LOCK_HASH_VAL"],
+    "resolver": f"uv {os.environ['RESOLVER_VERSION_VAL']}",
+    "resolved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+config_path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+    chmod 600 "$HOST_CONFIG" "$TORCH_LOCK"
+}
+
+print_ml_profile() {
+    python3 - "$HOST_CONFIG" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1])).get("ml_profile", {})
+versions = ", ".join(
+    f"{name} {p.get(name)}" for name in ("torch", "torchvision", "torchaudio") if p.get(name)
+)
+print(f"  Backend: {p.get('resolved_backend', 'unknown')} (requested: {p.get('requested_backend', 'auto')})")
+if versions:
+    print(f"  Packages: {versions}")
+print(f"  Detected GPUs: {len(p.get('gpus', []))}")
+PY
+}
+
+mark_ml_profile_validated() {
+    python3 - "$HOST_CONFIG" <<'PY'
+import datetime, json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data.setdefault("ml_profile", {})["validated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+data["ml_profile"]["validated_gpu_count"] = len(data["ml_profile"].get("gpus", []))
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+    chmod 600 "$HOST_CONFIG"
+}
+
+resolve_ml_stack() {
+    write_base_requirements
+    detect_gpu_inventory
+
+    local requested resolver_backend fingerprint
+    requested="${GPUDEV_TORCH_BACKEND:-auto}"
+    case "$requested" in
+        auto|cpu|cu[0-9][0-9][0-9]) ;;
+        *) fail "Invalid GPUDEV_TORCH_BACKEND='$requested'. Use auto, cpu, or a uv CUDA backend such as cu128." ;;
+    esac
+
+    fingerprint="$(gpu_fingerprint)"
+    if ml_lock_is_current "$fingerprint" "$requested"; then
+        log "GPU and driver are unchanged; reusing the locked ML stack."
+        print_ml_profile
+        return 0
+    fi
+
+    resolver_backend="$(select_torch_backend "$requested")"
+    if [ "$fingerprint" = "unavailable" ] && [ "$resolver_backend" = "auto" ]; then
+        fail "Automatic PyTorch selection needs a visible GPU.
+Fix GPU passthrough, or rerun with an explicit override, for example:
+  GPUDEV_TORCH_BACKEND=cu128 SKIP_GPU_CHECK=1 bash linux-setup.sh"
+    fi
+
+    install_uv_resolver
+    log "Resolving PyTorch for backend '${resolver_backend}' (requested: '${requested}')..."
+    local gpu_args=()
+    [ "$fingerprint" = "unavailable" ] || gpu_args=(--gpus all)
+    if ! $DOCKER run --rm "${gpu_args[@]}" \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e UV_HTTP_TIMEOUT=300 \
+        -e UV_HTTP_RETRIES=5 \
+        -v "$UV_RESOLVER_BIN:/usr/local/bin/uv:ro" \
+        -v "$CONFIG_DIR:/work" \
+        -w /work \
+        python:3.12-slim \
+        uv pip compile requirements-torch.in \
+            --output-file pylock.gpudev-torch.toml \
+            --format pylock.toml \
+            --python-version 3.12 \
+            --torch-backend "$resolver_backend" \
+            --upgrade; then
+        fail "Could not resolve a compatible PyTorch stack.
+Check network access and the detected GPUs above. Advanced override example:
+  GPUDEV_TORCH_BACKEND=cu128 GPUDEV_ML_REFRESH=1 bash linux-setup.sh"
+    fi
+
+    [ -s "$TORCH_LOCK" ] || fail "uv completed without writing ${TORCH_LOCK}."
+    persist_ml_profile "$fingerprint" "$requested" "$resolver_backend"
+    log "Locked the resolved ML stack:"
+    print_ml_profile
+}
+
+# ── Step 5: Build base image ──────────────────────────────────────────────────
 
 write_dockerfile() {
     local dockerfile="${CONFIG_DIR}/Dockerfile.base"
-    write_base_requirements
-
     cat > "$dockerfile" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
@@ -407,15 +650,14 @@ RUN mkdir -p /run/sshd \
 
 # Base ML venv at /opt/venv — built once into the image, available read-only to all containers.
 # PyTorch bundles its own CUDA runtime so no CUDA base image is needed.
-# Torch from official CUDA wheel index (default PyPI often serves CPU-only).
-# Pins live in requirements-*.txt next to this Dockerfile (written by linux-setup.sh).
+# The host-specific PyTorch backend and exact versions were resolved before the
+# build. pylock.toml records both package versions and their wheel sources.
 # Per-client venvs are created on their data volumes by client-setup.sh and persist indefinitely.
-COPY requirements-torch.txt requirements-base.txt /tmp/gpudev-req/
+COPY pylock.gpudev-torch.toml requirements-base.txt /tmp/gpudev-req/
 RUN uv venv /opt/venv --python 3.12 --seed
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        -r /tmp/gpudev-req/requirements-torch.txt
+        -r /tmp/gpudev-req/pylock.gpudev-torch.toml
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python \
         -r /tmp/gpudev-req/requirements-base.txt
@@ -471,9 +713,9 @@ build_base_image() {
     local dockerfile
     dockerfile="$(write_dockerfile | tail -n1)"
     [ -f "$dockerfile" ] || fail "Dockerfile not written (got path: ${dockerfile:-empty})"
-    [ -f "${CONFIG_DIR}/requirements-torch.txt" ] \
+    [ -s "$TORCH_LOCK" ] \
         && [ -f "${CONFIG_DIR}/requirements-base.txt" ] \
-        || fail "Pinned requirements missing in ${CONFIG_DIR} — write_base_requirements failed."
+        || fail "Resolved ML lock or base requirements missing in ${CONFIG_DIR} — resolve_ml_stack failed."
 
     $DOCKER build \
         --network=host \
@@ -484,9 +726,35 @@ build_base_image() {
     log "Base image built: ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}"
 }
 
-# Confirm the base image's torch build can execute a real GPU kernel. Merely
-# checking is_available() is insufficient: an old wheel reports True for an RTX
-# 5080, then fails at runtime because it has no sm_120 kernel image.
+# Confirm the base image's torch build can execute a real GPU kernel on every
+# installed card. Merely checking is_available() is insufficient: a wheel can
+# see a device while lacking a kernel image for that device's architecture.
+check_all_torch_gpus() {
+    [ -s "$GPU_INVENTORY" ] || return 1
+    local indices index
+    indices="$(cut -d',' -f1 "$GPU_INVENTORY" | sed 's/[[:space:]]//g')"
+    [ -n "$indices" ] || return 1
+
+    while IFS= read -r index; do
+        [ -n "$index" ] || continue
+        log "  Testing physical GPU ${index}..."
+        $DOCKER run --rm --gpus "device=${index}" "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
+            python -c '
+import torch
+assert torch.cuda.is_available(), (torch.__version__, torch.version.cuda)
+assert torch.cuda.device_count() == 1, torch.cuda.device_count()
+device = torch.cuda.current_device()
+x = torch.arange(4, device=device, dtype=torch.float32)
+result = (x * x).sum()
+torch.cuda.synchronize(device)
+assert result.item() == 14.0, result
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+print("gpu", torch.cuda.get_device_name(device), "capability", torch.cuda.get_device_capability(device))
+print("architectures", " ".join(torch.cuda.get_arch_list()))
+' || return 1
+    done <<< "$indices"
+}
+
 verify_torch_cuda() {
     if [ "${SKIP_GPU_CHECK:-}" = "1" ]; then
         warn "SKIP_GPU_CHECK=1 — skipping torch.cuda check"
@@ -497,28 +765,20 @@ verify_torch_cuda() {
         fail "Base image missing; cannot verify torch.cuda."
     fi
 
-    log "Verifying a real torch CUDA operation inside ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}..."
-    if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
-        python -c '
-import torch
-assert torch.cuda.is_available(), (torch.__version__, torch.version.cuda)
-device = torch.cuda.current_device()
-x = torch.arange(4, device=device, dtype=torch.float32)
-result = (x * x).sum()
-torch.cuda.synchronize(device)
-assert result.item() == 14.0, result
-print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("gpu", torch.cuda.get_device_name(device), "capability", torch.cuda.get_device_capability(device))
-print("architectures", " ".join(torch.cuda.get_arch_list()))
-'; then
-        log "torch CUDA kernel execution: OK"
+    log "Verifying real torch CUDA operations on every installed GPU..."
+    if check_all_torch_gpus; then
+        mark_ml_profile_validated
+        log "torch CUDA kernel execution: OK on every GPU"
         return 0
     fi
 
 fail "torch cannot execute a GPU kernel inside the base image.
-Passthrough may work (and torch.cuda.is_available() may be True) while the wheel lacks your GPU architecture.
-RTX 50-series / Blackwell requires a CUDA 12.8+ PyTorch wheel with sm_120 support.
-Fix: confirm the NVIDIA driver is current, then re-run linux-setup.sh.
+Passthrough may work while the selected wheel lacks one of the installed GPU architectures.
+The detected inventory and locked ML profile are in ${CONFIG_DIR}.
+Fix: update the NVIDIA driver and refresh automatic selection:
+  GPUDEV_ML_REFRESH=1 bash linux-setup.sh
+Advanced override example:
+  GPUDEV_TORCH_BACKEND=cu128 GPUDEV_ML_REFRESH=1 bash linux-setup.sh
 To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 }
 
@@ -1040,12 +1300,12 @@ run_health_check() {
         || warn "  base image:               NOT BUILT"
 
     if $DOCKER image inspect "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
-        if $DOCKER run --rm --gpus all "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}" \
-            python -c "import torch; assert torch.cuda.is_available(); x=torch.ones(1, device='cuda'); x.add_(1); torch.cuda.synchronize(); assert x.item() == 2" \
-            >/dev/null 2>&1; then
-            log "  torch.cuda kernel:        OK"
+        if check_all_torch_gpus >/dev/null 2>&1; then
+            local validated_count
+            validated_count="$(wc -l < "$GPU_INVENTORY" | tr -d ' ')"
+            log "  torch.cuda kernels:       OK (${validated_count} GPU(s))"
         else
-            warn "  torch.cuda kernel:        FAIL (wheel may not support this GPU architecture)"
+            warn "  torch.cuda kernels:       FAIL (one or more GPU architectures unsupported)"
         fi
     fi
 
@@ -1137,6 +1397,9 @@ main() {
 
     step "gpudev Step 4: Verify GPU passthrough"
     verify_gpu_passthrough
+
+    step "gpudev Step 4b: Detect GPUs and resolve ML stack"
+    resolve_ml_stack
 
     step "gpudev Step 5: Build base image"
     build_base_image

@@ -73,6 +73,22 @@ print(d.get('${field}', ''))
 "
 }
 
+ml_profile_summary() {
+    python3 - "$HOST_CONFIG" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+p = json.loads(path.read_text()).get("ml_profile", {}) if path.exists() else {}
+if not p:
+    print("not resolved — run linux-setup.sh")
+else:
+    backend = p.get("resolved_backend", "unknown")
+    torch = p.get("torch", "unknown")
+    count = len(p.get("gpus", []))
+    validated = p.get("validated_gpu_count", 0)
+    print(f"torch {torch}, {backend}, {validated}/{count} GPU(s) validated")
+PY
+}
+
 client_get() {
     local name="$1" field="$2"
     python3 - "$CLIENTS_CONFIG" "$name" "$field" <<'PY'
@@ -153,6 +169,7 @@ cmd_host_status() {
     docker_cmd image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
         && echo "  Base image:     OK ($BASE_IMAGE)" \
         || echo "  Base image:     NOT BUILT — run linux-setup.sh"
+    echo "  ML stack:       $(ml_profile_summary)"
 
     echo ""
     local count
@@ -781,6 +798,7 @@ cmd_status() {
     else
         echo "  nvidia-smi unavailable (NVIDIA driver missing on host)"
     fi
+    printf "  ML stack: %s\n" "$(ml_profile_summary)"
     echo "───────────────────────────────────────────────────────────────────"
     echo " CLIENTS"
     if [ "$client_count" -eq 0 ]; then
