@@ -22,7 +22,8 @@
       2. Check that the NVIDIA Windows driver is present (warn if not — WSL GPU
          passthrough requires the Windows driver, not a Linux one).
       3. Run `wsl --update` to keep the WSL kernel current.
-      4. Configure Windows power settings (no auto-sleep on AC).
+      4. Configure Windows power settings (no auto-sleep on AC) and wake-on-LAN
+         (wired NIC wakes on a magic packet; every other wake source disarmed).
       5. Write %USERPROFILE%\.wslconfig (instanceIdleTimeout=-1 keeps the
          distro alive; vmIdleTimeout=-1 keeps the shared WSL2 VM alive).
       6. Ensure the WSL2 platform is enabled (--no-distribution; reboots+resumes
@@ -271,7 +272,11 @@ function Update-WslKernel {
 function Set-PowerSettings {
     # Never auto-sleep / hibernate / spin down on AC — a GPU host must stay up.
     # Hibernate is turned OFF so an explicit `gpudev power sleep` performs S3
-    # sleep (and wakes cleanly) rather than hibernating.
+    # sleep (and wakes cleanly) rather than hibernating. Turning hibernate off
+    # also disables Fast Startup, which matters for wake-on-LAN: a Fast Startup
+    # "shutdown" is really a hybrid hibernate that powers the NIC down, so WoL
+    # from S5 silently stops working while it is on. Don't re-enable hibernate
+    # without re-testing the wake path.
     Log "Configuring Windows power plan (no automatic sleep on AC)..."
     & powercfg /change standby-timeout-ac 0   | Out-Null
     & powercfg /change hibernate-timeout-ac 0 | Out-Null
@@ -284,6 +289,171 @@ function Set-PowerSettings {
     } catch {
         Warn "Could not set High performance plan (modern-standby system?); timeouts still disabled."
     }
+}
+
+# ── Wake-on-LAN (sleep on demand, wake on a magic packet) ─────────────────────
+
+# Keywords that arm a wake on ORDINARY traffic rather than on a magic packet.
+# Each is listed in both spellings on purpose: the '*'-prefixed names are the
+# standard NDIS keywords, and the bare names are the vendor keywords some drivers
+# implement instead. Device Manager's "Only allow a magic packet to wake the
+# computer" checkbox writes only the standard spelling, so on a driver that uses
+# the vendor one (MediaTek's Wi-Fi parts, for instance) the box is ticked while
+# pattern-match wake is still armed underneath — the host then wakes about a
+# second after it sleeps, forever. Clearing both spellings is the actual fix.
+$script:WakeNoiseKeywords = @(
+    '*WakeOnPattern', 'WakeOnPattern',
+    '*PMARPOffload',  'PMARPOffload',
+    '*PMNSOffload',   'PMNSOffload'
+)
+
+# Link-power features that renegotiate or drop the PHY in low-power states, which
+# silently breaks WoL on several Realtek parts.
+$script:LinkPowerKeywords = @('EnableGreenEthernet', 'PowerSavingMode', '*EEE', 'AdvancedEEE')
+
+# Ethernet is identified POSITIVELY (media type 802.3) rather than as "not
+# wireless". Inverting it would classify WWAN/cellular and other exotic media as
+# wired and arm them, which is both wrong and a spurious-wake risk.
+function Test-WiredNic {
+    param($Adapter)
+    return ($Adapter.PhysicalMediaType -eq '802.3') -and
+           ($Adapter.InterfaceDescription -notmatch 'Wi-?Fi|Wireless|WLAN|Bluetooth|Virtual')
+}
+
+# True on a Modern Standby (S0 low power idle) platform, where classic S3 usually
+# does not exist and WoL is gated by a SEPARATE keyword. Read the platform flag
+# instead of parsing `powercfg /a`, whose text is localized.
+function Test-ModernStandby {
+    try {
+        $p = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction Stop
+        return ([int]$p.CsEnabled -eq 1)
+    } catch {
+        return $false
+    }
+}
+
+function Set-NicKeyword {
+    param([string]$Adapter, [string]$Keyword, [int]$Value)
+    try {
+        Set-NetAdapterAdvancedProperty -Name $Adapter -RegistryKeyword $Keyword `
+            -RegistryValue $Value -NoRestart -ErrorAction Stop
+        return $true
+    } catch {
+        # Driver doesn't expose this keyword. Expected across vendors, not an error.
+        return $false
+    }
+}
+
+function Set-WakeOnLan {
+    Log "Configuring wake-on-LAN..."
+
+    $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth|Virtual' })
+    if (-not $nics) {
+        Warn "  No physical network adapters found — skipping wake-on-LAN configuration."
+        return
+    }
+
+    $modernStandby = Test-ModernStandby
+    if ($modernStandby) {
+        Log "  Platform sleep: Modern Standby (S0 low power idle)."
+    } else {
+        Log "  Platform sleep: classic S3."
+    }
+
+    # Ethernet is the supported wake path: WoWLAN cannot be relied on to hold AP
+    # association across sleep. Wi-Fi is armed ONLY as a fallback on a machine
+    # with no Ethernet at all — otherwise such a host would sleep with no way to
+    # wake it. That fallback is safe with respect to the sleep/wake loop, which is
+    # caused by pattern-match wake (cleared below), never by magic packet.
+    $wired = @($nics | Where-Object { Test-WiredNic $_ })
+    if ($wired) {
+        $wakeNics = $wired
+    } else {
+        $wakeNics = $nics
+        Warn "  No Ethernet NIC found — falling back to Wi-Fi magic-packet wake (best effort)."
+        Warn "  WoWLAN is driver-dependent; prefer a wired connection for a host you must wake."
+    }
+    $wakeNames = @($wakeNics | ForEach-Object { $_.InterfaceDescription })
+
+    if (@($nics | Where-Object { $_.Status -eq 'Up' }).Count -gt 0) {
+        Log "  Adapters will be reset to apply these settings — expect a brief network drop."
+    }
+
+    foreach ($nic in $nics) {
+        # Clear every wake-on-ordinary-traffic keyword in both spellings. This is
+        # the fix for the sleep/wake loop, and it applies to EVERY NIC, including
+        # ones that are not a wake source, because a disarmed-in-powercfg NIC with
+        # pattern match still set can be re-armed by a driver update.
+        foreach ($kw in $script:WakeNoiseKeywords) { Set-NicKeyword $nic.Name $kw 0 | Out-Null }
+
+        if ($wakeNames -contains $nic.InterfaceDescription) {
+            foreach ($kw in $script:LinkPowerKeywords) { Set-NicKeyword $nic.Name $kw 0 | Out-Null }
+            Set-NicKeyword $nic.Name '*WakeOnMagicPacket' 1 | Out-Null
+            Set-NicKeyword $nic.Name 'S5WakeOnLan' 1 | Out-Null
+            # On Modern Standby the classic magic-packet keyword is not enough:
+            # wake from S0ix is gated by its own keyword, which ships disabled.
+            if ($modernStandby) {
+                Set-NicKeyword $nic.Name '*ModernStandbyWoLMagicPacket' 1 | Out-Null
+            }
+            Log "  $($nic.Name): magic-packet wake armed (MAC $($nic.MacAddress))."
+        } else {
+            Set-NicKeyword $nic.Name '*WakeOnMagicPacket' 0 | Out-Null
+            Log "  $($nic.Name): wake disarmed."
+        }
+
+        try { Restart-NetAdapter -Name $nic.Name -ErrorAction Stop } catch { }
+    }
+    Start-Sleep -Seconds 3
+
+    # The NDIS keywords above decide WHAT a NIC wakes on; powercfg decides WHETHER
+    # a device may wake the system at all. Both have to agree.
+    foreach ($nic in $nics) {
+        if ($wakeNames -contains $nic.InterfaceDescription) {
+            & powercfg /deviceenablewake  "$($nic.InterfaceDescription)" 2>$null | Out-Null
+        } else {
+            & powercfg /devicedisablewake "$($nic.InterfaceDescription)" 2>$null | Out-Null
+        }
+    }
+
+    # Disarm by WHITELIST, not by name pattern: anything still armed that is not a
+    # NIC we deliberately chose gets turned off. This catches HID devices, USB
+    # hubs, touchpads and Bluetooth radios without depending on English device
+    # names — powercfg reports localized names, so a 'mouse|keyboard' regex would
+    # silently miss them on a non-English Windows and leave the loop in place.
+    foreach ($d in @(& powercfg /devicequery wake_armed 2>$null)) {
+        $name = "$d".Trim()
+        if (-not $name) { continue }
+        if ($wakeNames -notcontains $name) {
+            & powercfg /devicedisablewake "$name" 2>$null | Out-Null
+            Log "  Disarmed wake source: $name"
+        }
+    }
+
+    # Wake timers let Windows Update and scheduled maintenance wake the host on
+    # their own schedule. The operator's magic packet should be the only trigger.
+    # Applied to EVERY scheme, so switching power plans can't quietly restore them.
+    # GUIDs are parsed out of `powercfg /list` because its labels are localized.
+    $schemes = @(& powercfg /list 2>$null |
+        ForEach-Object { if ("$_" -match '([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})') { $Matches[1] } })
+    if (-not $schemes) { $schemes = @('SCHEME_CURRENT') }
+    foreach ($g in $schemes) {
+        & powercfg /setacvalueindex $g SUB_SLEEP RTCWAKE 0 2>$null | Out-Null
+        & powercfg /setdcvalueindex $g SUB_SLEEP RTCWAKE 0 2>$null | Out-Null
+    }
+    & powercfg /setactive SCHEME_CURRENT 2>$null | Out-Null
+    Log "  Wake timers disabled across $($schemes.Count) power scheme(s)."
+
+    # The one part of WoL no script can configure. On many desktops the NIC loses
+    # standby power until these are changed, and WoL fails no matter what Windows
+    # is told — so name them rather than leaving the operator guessing.
+    if (@($wakeNics | Where-Object { $_.Status -eq 'Up' }).Count -eq 0) {
+        Warn "  No wake-capable NIC currently has a link. Connect the cable, then re-run."
+    }
+    Log "  If the host still won't wake, check firmware setup (names vary by vendor):"
+    Log "    'Wake on LAN' / 'Power On By PCI-E' / 'PME Event Wake'  -> Enabled"
+    Log "    'ErP' / 'EuP Ready'                                     -> Disabled"
+    Log "    'Deep Sleep' / 'Deep Sx'                                -> Disabled"
 }
 
 # ── Keep WSL2 alive (Layer 1: distro + VM don't auto-idle-shutdown) ───────────
@@ -682,6 +852,35 @@ function Invoke-HealthCheck {
         }
     } else { Warn "  .wslconfig (distro + VM idle): MISSING" }
 
+    # Wake-on-LAN. A wake source that isn't a NIC is not a cosmetic problem: it
+    # wakes the host within seconds of `gpudev power sleep`, so report it as a
+    # failure. Classify by comparing against the real adapter list rather than by
+    # matching device-name text, which is localized on non-English Windows.
+    $nicNames = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth|Virtual' } |
+        ForEach-Object { $_.InterfaceDescription })
+    $armed = @(& powercfg /devicequery wake_armed 2>$null |
+        ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    $spurious = @($armed | Where-Object { $nicNames -notcontains $_ })
+    $armedNics = @($armed | Where-Object { $nicNames -contains $_ })
+
+    if ($spurious) {
+        Warn "  Wake-on-LAN:               SPURIOUS SOURCES ARMED — $($spurious -join ', ')"
+        Warn "                             The host will wake seconds after it sleeps."
+    } elseif ($armedNics) {
+        Log "  Wake-on-LAN:               OK ($($armedNics -join ', '))"
+        foreach ($nic in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                Where-Object { $armedNics -contains $_.InterfaceDescription })) {
+            if ($nic.Status -eq 'Up') {
+                Log "    Send the magic packet to MAC $($nic.MacAddress) ($($nic.Name))"
+            } else {
+                Warn "    $($nic.Name) is $($nic.Status) — WoL needs an active link."
+            }
+        }
+    } else {
+        Warn "  Wake-on-LAN:               no wake source armed — the host cannot be woken remotely."
+    }
+
     if (-not $autologin) { Show-AutologinHelp }
 
     Write-Host ""
@@ -739,8 +938,9 @@ function Main {
         Step "Step 3: WSL kernel update"
         Update-WslKernel
 
-        Step "Step 4: Windows power settings"
+        Step "Step 4: Windows power settings + wake-on-LAN"
         Set-PowerSettings
+        Set-WakeOnLan
 
         Step "Step 5: WSL2 global config"
         Set-WslGlobalConfig
