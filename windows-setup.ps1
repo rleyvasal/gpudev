@@ -821,6 +821,83 @@ function Register-KeepaliveTask {
     }
 }
 
+# ── Host clock (detected and reported; Phase A does not change it) ────────────
+
+# A GPU host that sleeps between sessions free-runs on the CMOS oscillator while
+# it is down. If the time service never syncs, the clock drifts until SSH, TLS
+# and the Cloudflare tunnel start failing with errors that name none of those
+# things. Phase A reports this rather than fixing it: the time zone is the
+# operator's call, and silently re-pointing a host's clock is not our business.
+#
+# Every signal here is language-independent — a DWORD, a service enum, or a
+# registry string. Deliberately NOT parsed from `w32tm /query /status`, whose
+# labels are localized and would make this check pass on a broken non-English
+# host (the same trap that made the wake-source check unreliable).
+function Get-ClockIssues {
+    $issues = @()
+
+    try {
+        $tz = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' -ErrorAction Stop
+        if ([int]$tz.DynamicDaylightTimeDisabled -eq 1) {
+            $issues += "daylight saving is disabled for '$($tz.TimeZoneKeyName)' — local time is wrong for half the year"
+        }
+    } catch {
+        $issues += "the time zone configuration could not be read"
+    }
+
+    try {
+        $svc = Get-Service W32Time -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            $issues += "the Windows Time service is $($svc.Status) — the clock is not being synchronised"
+        }
+        if ($svc.StartType -ne 'Automatic') {
+            $issues += "the Windows Time service start type is $($svc.StartType) — it may not run after a reboot"
+        }
+    } catch {
+        $issues += "the Windows Time service could not be queried"
+    }
+
+    try {
+        $type = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' `
+            -Name Type -ErrorAction Stop).Type
+        if ($type -eq 'NoSync') {
+            $issues += "time synchronisation is set to NoSync — the clock free-runs on the CMOS oscillator"
+        }
+    } catch { }
+
+    return $issues
+}
+
+function Show-ClockHelp {
+    $zone = "$(& tzutil /g 2>$null)".Trim() -replace '_dstoff$', ''
+    if (-not $zone) { $zone = '<your time zone>' }
+    Write-Host ""
+    Write-Host "IMPORTANT — fix the host clock (run as Administrator):" -ForegroundColor Yellow
+    Write-Host "  This host sleeps between sessions and free-runs on the CMOS oscillator"
+    Write-Host "  while it is down. Once the clock drifts far enough, SSH, TLS and the"
+    Write-Host "  Cloudflare tunnel fail with errors that mention none of those things."
+    Write-Host ""
+    Write-Host "    1. Re-enable daylight saving for the current zone. Selecting the same"
+    Write-Host "       zone WITHOUT the '_dstoff' suffix clears it — that variant pins the"
+    Write-Host "       host to standard time all year, so it runs an hour off in summer:"
+    Write-Host "         tzutil /s `"$zone`""
+    Write-Host ""
+    Write-Host "    2. Make the time service start automatically and poll real NTP servers:"
+    Write-Host "         Set-Service W32Time -StartupType Automatic"
+    Write-Host "         Start-Service W32Time"
+    Write-Host "         w32tm /config /manualpeerlist:`"time.windows.com,0x9 pool.ntp.org,0x9`" /syncfromflags:manual /update"
+    Write-Host "         Restart-Service W32Time"
+    Write-Host "         w32tm /resync /force"
+    Write-Host ""
+    Write-Host "  Verify — the offset should be well under a second:"
+    Write-Host "         w32tm /stripchart /computer:time.windows.com /samples:2 /dataonly"
+    Write-Host ""
+    Write-Host "  'Last Successful Sync Time: unspecified' in 'w32tm /query /status' means"
+    Write-Host "  the host has NEVER synced. The status flag can take a few 17-minute poll"
+    Write-Host "  cycles to read 'synchronized' after the first sync; the offset above is"
+    Write-Host "  the reliable signal."
+}
+
 # ── Autologin (manual prerequisite for unattended reboot recovery) ─────────────
 function Test-Autologon {
     # The boot/keepalive tasks run as the operator and trigger at LOGON, so WSL
@@ -912,6 +989,14 @@ function Invoke-HealthCheck {
         }
     } else { Warn "  .wslconfig (distro + VM idle): MISSING" }
 
+    $clockIssues = @(Get-ClockIssues)
+    if ($clockIssues) {
+        Warn "  Host clock:                NEEDS ATTENTION"
+        foreach ($i in $clockIssues) { Warn "                             - $i" }
+    } else {
+        Log "  Host clock:                OK (zone honours DST; time service automatic)"
+    }
+
     # Idle sleep. Report BOTH the visible timeout and the hidden unattended one:
     # a host that sleeps ~2 min after every remote wake looks impossible from the
     # Settings UI, which only ever shows the first of these.
@@ -960,6 +1045,7 @@ function Invoke-HealthCheck {
     }
 
     if (-not $autologin) { Show-AutologinHelp }
+    if ($clockIssues) { Show-ClockHelp }
 
     Write-Host ""
     Write-Host "Phase A complete — Windows is ready for gpudev." -ForegroundColor Green
