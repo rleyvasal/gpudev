@@ -269,6 +269,18 @@ function Update-WslKernel {
 }
 
 # ── Windows power settings ─────────────────────────────────────────────────────
+
+# Every power scheme's GUID. Parsed out of `powercfg /list` because its scheme
+# LABELS are localized while the GUIDs are not. Power settings are applied to all
+# schemes rather than just the active one, so switching power plans later cannot
+# quietly restore a sleep timeout we deliberately cleared.
+function Get-PowerSchemeGuids {
+    $guids = @(& powercfg /list 2>$null |
+        ForEach-Object { if ("$_" -match '([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})') { $Matches[1] } })
+    if (-not $guids) { $guids = @('SCHEME_CURRENT') }
+    return $guids
+}
+
 function Set-PowerSettings {
     # Never auto-sleep / hibernate / spin down on AC — a GPU host must stay up.
     # Hibernate is turned OFF so an explicit `gpudev power sleep` performs S3
@@ -277,17 +289,68 @@ function Set-PowerSettings {
     # "shutdown" is really a hybrid hibernate that powers the NIC down, so WoL
     # from S5 silently stops working while it is on. Don't re-enable hibernate
     # without re-testing the wake path.
-    Log "Configuring Windows power plan (no automatic sleep on AC)..."
-    & powercfg /change standby-timeout-ac 0   | Out-Null
-    & powercfg /change hibernate-timeout-ac 0 | Out-Null
-    & powercfg /change disk-timeout-ac 0      | Out-Null
-    & powercfg /change monitor-timeout-ac 10  | Out-Null
-    & powercfg /hibernate off                 2>$null | Out-Null
+    Log "Configuring Windows power plan (host stays awake unless told to sleep)..."
+
+    $sleepSub     = '238c9fa8-0aad-41ed-83f4-97be242c8f20'   # Sleep subgroup
+    $unattendGuid = '7bc4a2f9-d8fc-4469-b07b-33eb785aaca0'   # System unattended sleep timeout
+
+    # The System Unattended Sleep Timeout is HIDDEN from both the Settings UI and
+    # `powercfg /query` (its Attributes value is 1) and defaults to 120 seconds.
+    # It replaces the normal idle timeout whenever the machine wakes from a DEVICE
+    # rather than from user input — which is exactly what a wake-on-LAN magic
+    # packet is. A WoL-woken host therefore sleeps again two minutes later while
+    # "Make my device sleep after" still reads Never, with nothing in the UI to
+    # explain it. Unhide it so the value is visible to whoever debugs this next;
+    # it is zeroed with the other idle timeouts below.
     try {
-        & powercfg /setactive SCHEME_MIN 2>$null | Out-Null   # High performance
-        Log "  Active plan: High performance; sleep/hibernate/disk timeouts disabled."
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sleepSub\$unattendGuid" `
+            -Name Attributes -Value 2 -Type DWord -ErrorAction Stop
+        Log "  Unhid the system unattended sleep timeout so it shows in the power UI."
     } catch {
-        Warn "Could not set High performance plan (modern-standby system?); timeouts still disabled."
+        Warn "  Could not unhide the unattended sleep timeout (it is still set to Never below)."
+    }
+
+    # Hibernate off also disables Fast Startup, whose hybrid shutdown powers the
+    # NIC down and silently breaks wake-on-LAN from S5.
+    & powercfg /hibernate off 2>$null | Out-Null
+
+    # Applied to EVERY scheme, on both AC and DC. DC is included even though a
+    # desktop never runs on battery, so the same script behaves identically on a
+    # UPS-backed or laptop host that briefly reports DC.
+    $idleSettings = @(
+        @{ Sub = $sleepSub; Id = '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Value = 0; Name = 'Sleep after -> Never' }
+        @{ Sub = $sleepSub; Id = '9d7815a6-7ee4-497e-8888-515a05f02364'; Value = 0; Name = 'Hibernate after -> Never' }
+        @{ Sub = $sleepSub; Id = $unattendGuid;                          Value = 0; Name = 'Unattended sleep -> Never' }
+        @{ Sub = $sleepSub; Id = '94ac6d29-73ce-41a6-809f-6363ba21b47e'; Value = 0; Name = 'Hybrid sleep -> Off' }
+        @{ Sub = '0012ee47-9041-4b5d-9b77-535fba8b1442'
+           Id  = '6738e2c4-e8a5-4a42-b16a-e040e769756e'; Value = 0; Name = 'Disk timeout -> Never' }
+    )
+
+    $schemes = Get-PowerSchemeGuids
+    foreach ($g in $schemes) {
+        foreach ($s in $idleSettings) {
+            & powercfg /setacvalueindex $g $s.Sub $s.Id $s.Value 2>$null | Out-Null
+            & powercfg /setdcvalueindex $g $s.Sub $s.Id $s.Value 2>$null | Out-Null
+        }
+        # The monitor may blank; only the SYSTEM is barred from sleeping.
+        & powercfg /setacvalueindex $g '7516b95f-f776-4464-8c53-06167f40cc99' `
+            '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' 600 2>$null | Out-Null
+    }
+    foreach ($s in $idleSettings) { Log "  $($s.Name)" }
+    Log "  Applied across $($schemes.Count) power scheme(s); monitor blanks after 10 min."
+
+    # Activate LAST. powercfg only commits edits to the ACTIVE scheme when that
+    # scheme is (re)activated, and the values above must already be written when
+    # it happens. The previous version had this backwards: it applied `/change` to
+    # whatever plan was active and only then switched to High performance, so on a
+    # machine that started on Balanced the timeouts landed on the wrong plan and
+    # High performance kept its own defaults.
+    & powercfg /setactive SCHEME_MIN 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Log "  Active plan: High performance."
+    } else {
+        & powercfg /setactive SCHEME_CURRENT 2>$null | Out-Null
+        Warn "  Could not select High performance; kept the current plan (values still applied)."
     }
 }
 
@@ -433,10 +496,7 @@ function Set-WakeOnLan {
     # Wake timers let Windows Update and scheduled maintenance wake the host on
     # their own schedule. The operator's magic packet should be the only trigger.
     # Applied to EVERY scheme, so switching power plans can't quietly restore them.
-    # GUIDs are parsed out of `powercfg /list` because its labels are localized.
-    $schemes = @(& powercfg /list 2>$null |
-        ForEach-Object { if ("$_" -match '([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})') { $Matches[1] } })
-    if (-not $schemes) { $schemes = @('SCHEME_CURRENT') }
+    $schemes = Get-PowerSchemeGuids
     foreach ($g in $schemes) {
         & powercfg /setacvalueindex $g SUB_SLEEP RTCWAKE 0 2>$null | Out-Null
         & powercfg /setdcvalueindex $g SUB_SLEEP RTCWAKE 0 2>$null | Out-Null
@@ -851,6 +911,24 @@ function Invoke-HealthCheck {
             Warn "  .wslconfig (distro + VM idle): INCOMPLETE"
         }
     } else { Warn "  .wslconfig (distro + VM idle): MISSING" }
+
+    # Idle sleep. Report BOTH the visible timeout and the hidden unattended one:
+    # a host that sleeps ~2 min after every remote wake looks impossible from the
+    # Settings UI, which only ever shows the first of these.
+    $sleepSub = '238c9fa8-0aad-41ed-83f4-97be242c8f20'
+    $activeScheme = ((& powercfg /getactivescheme) -replace '.*GUID: ' -replace ' .*').Trim()
+    $schemeKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$activeScheme\$sleepSub"
+    $standby  = (Get-ItemProperty "$schemeKey\29f6c1db-86da-48c5-9fdb-f2b67b1f44da" -ErrorAction SilentlyContinue).ACSettingIndex
+    $unattend = (Get-ItemProperty "$schemeKey\7bc4a2f9-d8fc-4469-b07b-33eb785aaca0" -ErrorAction SilentlyContinue).ACSettingIndex
+    if ($standby -eq 0) {
+        Log "  Idle sleep (AC):           OK (never)"
+    } else { Warn "  Idle sleep (AC):           $standby s — the host will sleep on its own" }
+    if ($unattend -eq 0) {
+        Log "  Unattended sleep (AC):     OK (never)"
+    } elseif ($null -eq $unattend) {
+        Warn "  Unattended sleep (AC):     NOT SET — defaults to 120 s, so the host will"
+        Warn "                             sleep ~2 min after every wake-on-LAN wake."
+    } else { Warn "  Unattended sleep (AC):     $unattend s — the host will sleep after a remote wake" }
 
     # Wake-on-LAN. A wake source that isn't a NIC is not a cosmetic problem: it
     # wakes the host within seconds of `gpudev power sleep`, so report it as a
