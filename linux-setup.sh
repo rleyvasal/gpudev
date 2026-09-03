@@ -764,10 +764,15 @@ write_profiling_requirements() {
     # anything here — baking it in means an unresolvable pin blocks the whole
     # image build. Prove it in a client venv first, then promote it.
     mkdir -p "$CONFIG_DIR"
+    # Pin the CUDA LINE, not just the version. The bare `tensorrt` package is a
+    # meta-package that resolves to the NEWEST CUDA variant available, so it pulled
+    # tensorrt-cu13 into this CUDA 12.8 image — the same class of toolkit/runtime
+    # mismatch this variant exists to avoid, one layer down. It installs happily
+    # and only fails at `import tensorrt`, against the 12.8 runtime.
     cat > "$PROFILING_REQS" <<'REQ'
 onnx>=1.17.0
 onnxruntime-gpu>=1.20.0
-tensorrt>=10.0.0
+tensorrt-cu12>=10.0.0
 REQ
     log "Wrote profiling requirements to ${PROFILING_REQS}"
 }
