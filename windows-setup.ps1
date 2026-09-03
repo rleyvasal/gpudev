@@ -126,6 +126,8 @@ param(
     [string]$UbuntuSeries = 'noble',
     [string]$RootfsUrl = '',
     [string]$InstallLocation = '',
+    [int]$WslMemoryGB = 0,
+    [switch]$EnableGpuProfiling,
     [switch]$Reinstall,
     [switch]$SkipReboot,
     [switch]$Resume
@@ -149,6 +151,7 @@ $script:LinuxUser       = $LinuxUser
 $script:UbuntuSeries    = $UbuntuSeries
 $script:RootfsUrl       = $RootfsUrl
 $script:InstallLocation = $InstallLocation
+$script:WslMemoryGB     = [int]$WslMemoryGB
 $script:Reinstall       = [bool]$Reinstall
 
 Set-StrictMode -Version Latest
@@ -518,13 +521,35 @@ function Set-WakeOnLan {
 }
 
 # ── Keep WSL2 alive (Layer 1: distro + VM don't auto-idle-shutdown) ───────────
+# How much RAM to hand WSL when -WslMemoryGB is not given. WSL2's own default is
+# HALF of physical memory, which is far too little for ML data loaders — nuScenes
+# and similar datasets will OOM the loader long before the GPU is the limit.
+#
+# Reserve 9 GB rather than a percentage: Windows itself needs several GB, and the
+# WSL2 VM's overhead sits OUTSIDE this ceiling, so a percentage split silently
+# over-commits on small machines. On a 32 GB host this yields 22 GB.
+function Get-DefaultWslMemoryGB {
+    $totalGB = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+    $mem = $totalGB - 9
+    if ($mem -lt 4) { $mem = 4 }
+    return [int]$mem
+}
+
 function Set-WslGlobalConfig {
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
     $instanceWant = 'instanceIdleTimeout=-1'
     $vmWant = 'vmIdleTimeout=-1'
 
+    $memGB = if ($script:WslMemoryGB -gt 0) { $script:WslMemoryGB } else { Get-DefaultWslMemoryGB }
+    $memWant = "memory=${memGB}GB"
+    Log "WSL memory ceiling: ${memGB}GB (WSL2 would otherwise default to half of RAM)."
+    # autoMemoryReclaim is deliberately NOT set. It hands freed pages back to
+    # Windows in the background, which is good for a general workstation and bad
+    # for a benchmark host: the reclaim work lands mid-run and shows up as latency
+    # variance in exactly the measurements this machine exists to produce.
+
     if (-not (Test-Path $wslconfig)) {
-        $content = "[general]`r`n$instanceWant`r`n`r`n[wsl2]`r`n$vmWant`r`n"
+        $content = "[general]`r`n$instanceWant`r`n`r`n[wsl2]`r`n$vmWant`r`n$memWant`r`n"
         Set-Content -Path $wslconfig -Value $content -Encoding ASCII -NoNewline
         Log "Wrote $wslconfig"
         return
@@ -535,7 +560,7 @@ function Set-WslGlobalConfig {
     # Keep comments on their own lines: malformed .wslconfig files are silently
     # ignored by WSL, so generated values intentionally have no inline comments.
     $lines = @(Get-Content $wslconfig | Where-Object {
-        $_ -notmatch '^[ \t]*(?:instanceIdleTimeout|vmIdleTimeout)[ \t]*='
+        $_ -notmatch '^[ \t]*(?:instanceIdleTimeout|vmIdleTimeout|memory)[ \t]*='
     })
     if (-not ($lines -match '^[ \t]*\[general\][ \t]*$')) { $lines = @('[general]') + $lines }
     if (-not ($lines -match '^[ \t]*\[wsl2\][ \t]*$')) { $lines = @('[wsl2]') + $lines }
@@ -550,11 +575,60 @@ function Set-WslGlobalConfig {
         }
         if (-not $vmInserted -and $l -match '^[ \t]*\[wsl2\][ \t]*$') {
             $out.Add($vmWant)
+            $out.Add($memWant)
             $vmInserted = $true
         }
     }
     [System.IO.File]::WriteAllText($wslconfig, ($out -join "`r`n") + "`r`n", [System.Text.Encoding]::ASCII)
-    Log "Normalized .wslconfig (distro + VM idle shutdown disabled)."
+    Log "Normalized .wslconfig (idle shutdown disabled, memory ceiling ${memGB}GB)."
+    Log "  Takes effect on the next 'wsl --shutdown'."
+}
+
+# ── GPU performance counters (opt-in: -EnableGpuProfiling) ────────────────────
+
+# Nsight Compute (ncu) and Nsight Systems read GPU performance counters, and the
+# NVIDIA driver restricts those to Administrators by default. Without this, ncu
+# fails with ERR_NVGPUCTRPERM no matter what is fixed inside the container —
+# the restriction lives in the WINDOWS driver, and WSL2's GPU is virtualised
+# through it, so no amount of container capability tweaking reaches it.
+#
+# OPT-IN, not default. Lifting the restriction lets any local user read GPU
+# performance counters, which on a multi-client gpudev host means one client can
+# observe another's GPU activity — a real side channel. Fine on a single-operator
+# box, not something to switch on for everybody silently.
+#
+# NVIDIA's own UI for this is Control Panel > Desktop > Enable Developer Settings
+# > Developer > Manage GPU Performance Counters; it writes the same value.
+function Set-GpuProfilingAccess {
+    $paths = @(
+        'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak',
+        'HKLM:\SOFTWARE\WOW6432Node\NVIDIA Corporation\Global\NVTweak'
+    )
+    $wrote = $false
+    foreach ($p in $paths) {
+        try {
+            if (-not (Test-Path $p)) { New-Item -Path $p -Force -ErrorAction Stop | Out-Null }
+            Set-ItemProperty -Path $p -Name 'RmProfilingAdminOnly' -Value 0 -Type DWord -ErrorAction Stop
+            $wrote = $true
+        } catch {
+            Warn "  Could not write RmProfilingAdminOnly to ${p}: $_"
+        }
+    }
+    if ($wrote) {
+        Log "GPU performance counters opened to all users (RmProfilingAdminOnly=0)."
+        Log "  REBOOT REQUIRED before ncu / Nsight Compute can read counters."
+    } else {
+        Warn "Could not enable GPU profiling access; ncu will fail with ERR_NVGPUCTRPERM."
+    }
+}
+
+function Test-GpuProfilingAccess {
+    foreach ($p in @('HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak',
+                     'HKLM:\SOFTWARE\WOW6432Node\NVIDIA Corporation\Global\NVTweak')) {
+        $v = (Get-ItemProperty $p -Name 'RmProfilingAdminOnly' -ErrorAction SilentlyContinue).RmProfilingAdminOnly
+        if ($null -ne $v -and [int]$v -eq 0) { return $true }
+    }
+    return $false
 }
 
 # ── Install WSL2 + distro (OOBE-free via wsl --import) ─────────────────────────
@@ -1166,7 +1240,23 @@ function Invoke-HealthCheck {
         } else {
             Warn "  .wslconfig (distro + VM idle): INCOMPLETE"
         }
+        if ($wslconfigText -match '(?m)^[ \t]*memory[ \t]*=[ \t]*(\S+)[ \t]*$') {
+            Log "  WSL memory ceiling:        OK ($($Matches[1]))"
+        } else {
+            Warn "  WSL memory ceiling:        NOT SET — WSL2 defaults to half of RAM, which"
+            Warn "                             OOMs ML data loaders. Re-run with -WslMemoryGB."
+        }
     } else { Warn "  .wslconfig (distro + VM idle): MISSING" }
+
+    # Profiling readiness. Reported always, because ERR_NVGPUCTRPERM is opaque and
+    # sends people digging in the container, where the cause is not.
+    if (Test-GpuProfilingAccess) {
+        Log "  GPU perf counters:         OK (open to all users — ncu/Nsight can profile)"
+    } else {
+        Log "  GPU perf counters:         admin-only (default). ncu fails with"
+        Log "                             ERR_NVGPUCTRPERM. Re-run with -EnableGpuProfiling"
+        Log "                             if this host is used for GPU profiling."
+    }
 
     $clockIssues = @(Get-ClockIssues)
     if ($clockIssues) {
@@ -1287,6 +1377,11 @@ function Main {
 
         Step "Step 5: WSL2 global config"
         Set-WslGlobalConfig
+
+        if ($EnableGpuProfiling) {
+            Step "Step 5b: GPU performance counter access (-EnableGpuProfiling)"
+            Set-GpuProfilingAccess
+        }
     } else {
         Load-State
         Write-Host "Resuming Phase A after the platform-enable reboot..." -ForegroundColor Cyan
