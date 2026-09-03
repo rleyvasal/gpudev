@@ -799,6 +799,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         ca-certificates \\
         git \\
         build-essential \\
+        libgl1 \\
+        libglib2.0-0 \\
     && rm -rf /var/lib/apt/lists/*
 
 # The CUDA -devel image ships nvcc but NOT the profilers. They come from the same
