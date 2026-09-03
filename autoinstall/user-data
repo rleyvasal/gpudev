@@ -1,0 +1,117 @@
+#cloud-config
+# gpudev — Ubuntu Server 24.04 LTS autoinstall for a bare-metal GPU host.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  READ THIS BEFORE USING. THIS FILE ERASES A DISK.
+#
+#  1. `storage.config.match` below decides WHICH DISK IS WIPED. It ships with a
+#     serial number placeholder that does not match anything, so an unedited
+#     copy FAILS SAFE: the installer stops rather than guessing. Replace it with
+#     your target SSD's serial.
+#
+#  2. Even with the right serial, physically disconnect or disable the Windows
+#     drive in firmware during the install. It costs one reboot and removes the
+#     entire class of "installed the bootloader on the wrong disk" accident,
+#     which is otherwise easy to make and painful to undo.
+#
+#  3. Find the serial from a live USB session (Try Ubuntu -> terminal):
+#         lsblk -o NAME,SIZE,MODEL,SERIAL
+#     or from Windows PowerShell before you start:
+#         Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,SerialNumber,Size
+#
+#  4. Generate the password hash yourself; do not paste a plaintext password:
+#         mkpasswd --method=SHA-512 --rounds=4096
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Usage: put this file and an empty file named `meta-data` on a second USB stick
+# in a directory, then at the installer boot menu edit the kernel command line
+# and append:
+#     autoinstall ds=nocloud;s=/cdrom/  (or the path to your USB)
+# Alternatively serve both files over HTTP and use ds=nocloud-net;s=http://...
+
+autoinstall:
+  version: 1
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # Headless on purpose. A desktop compositor runs on the GPU: it consumes VRAM
+  # and adds variance to exactly the timings this host exists to measure.
+  # Claude Code's CLI, gpudev and the Cloudflare tunnel are all terminal-only.
+  ssh:
+    install-server: true
+    allow-pw: true
+    # Paste your admin public key here to skip password SSH entirely:
+    # authorized-keys:
+    #   - ssh-ed25519 AAAA... you@mac
+
+  identity:
+    hostname: gpudev-linux
+    username: gpudev
+    # REPLACE: output of `mkpasswd --method=SHA-512 --rounds=4096`
+    password: "$6$REPLACE_ME$WITH_YOUR_OWN_HASH"
+
+  storage:
+    config:
+      - type: disk
+        id: target-ssd
+        ptable: gpt
+        wipe: superblock-recursive
+        preserve: false
+        grub_device: true
+        # ── THE LINE THAT DECIDES WHICH DISK IS ERASED ──────────────────────
+        # Serial match, not /dev/nvmeXn1: kernel device names are assigned in
+        # discovery order and can differ between the live session and the
+        # installed system, so a path match can silently point at the wrong
+        # disk on the next boot.
+        match:
+          serial: "REPLACE_WITH_TARGET_SSD_SERIAL"
+      - type: partition
+        id: efi-part
+        device: target-ssd
+        size: 1G
+        flag: boot
+        grub_device: true
+      - type: format
+        id: efi-fs
+        volume: efi-part
+        fstype: fat32
+      - type: mount
+        id: efi-mount
+        device: efi-fs
+        path: /boot/efi
+      - type: partition
+        id: root-part
+        device: target-ssd
+        size: -1
+      - type: format
+        id: root-fs
+        volume: root-part
+        fstype: ext4
+      - type: mount
+        id: root-mount
+        device: root-fs
+        path: /
+
+  packages:
+    - build-essential
+    - curl
+    - git
+    - ethtool          # required by gpudev's wake-on-LAN step
+    - pkg-config
+
+  # Driver and gpudev installs are deliberately NOT automated here. The NVIDIA
+  # driver wants a reboot and a verification step of its own, and linux-setup.sh
+  # is interactive (Cloudflare domain, admin SSH key, browser authorisation).
+  # Automating them into the installer hides failures at the point where they
+  # are cheapest to see.
+  late-commands:
+    # Dual-boot clock fix: Windows keeps LOCAL time in the RTC, Linux assumes
+    # UTC. Without this the two fight and the clock drifts by the UTC offset on
+    # every switch.
+    - curtin in-target --target=/target -- timedatectl set-local-rtc 0
+    # Keep the machine reachable and current on first boot.
+    - curtin in-target --target=/target -- systemctl enable ssh
+
+  shutdown: reboot

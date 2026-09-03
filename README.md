@@ -739,8 +739,20 @@ the bare-metal path automatically.
 ### Prerequisites
 
 1. **A distro with systemd.** gpudev's service model (`Restart=always`,
-   `WantedBy=multi-user.target`) depends on it. Ubuntu 24.04 LTS matches what
-   the WSL path is tested against.
+   `WantedBy=multi-user.target`) depends on it. **Ubuntu Server 26.04 LTS
+   (`resolute`) or 24.04 LTS (`noble`)** both work; 26.04 is preferable on
+   Blackwell for its newer kernel and driver packaging.
+
+   The host's Python version does **not** constrain the ML stack, which is a
+   natural thing to assume and wrong: the containers run a standalone CPython
+   that `uv` downloads and pins (`uv venv --python 3.12`), so the shapely /
+   Python 3.12 constraint documented below is a property of the container, not
+   of the distro. The host's `python3` is used only for small JSON helpers in
+   `linux-setup.sh`.
+
+   Two things do depend on the release, and both are satisfied on 26.04:
+   Docker publishes an apt repo per Ubuntu codename (`resolute` is present),
+   and the NVIDIA Container Toolkit repo is distro-agnostic.
 2. **The NVIDIA driver, installed on Linux.** Verify with `nvidia-smi` before
    running setup — the script checks GPU passthrough through Docker, which fails
    confusingly if the host driver is missing entirely.
