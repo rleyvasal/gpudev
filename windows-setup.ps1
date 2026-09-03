@@ -927,26 +927,66 @@ function Show-ClockHelp {
 }
 
 # ── Autologin (manual prerequisite for unattended reboot recovery) ─────────────
-function Test-Autologon {
-    # The boot/keepalive tasks run as the operator and trigger at LOGON, so WSL
-    # only auto-starts after a reboot if Windows auto-logs-in the operator. Phase A
-    # can't configure that safely (it needs the account password / an MSA->local
-    # conversion), so it DETECTS it and prints instructions if missing.
+# The boot/keepalive tasks trigger at LOGON, so WSL only comes back on its own if
+# Windows creates a session with nobody at the keyboard. TWO mechanisms do that,
+# and only one of them is the classic autologin:
+#
+#   AutoAdminLogon — classic autologin. Signs in on EVERY boot, a cold boot after
+#                    power loss included. Costs the account password, stored as an
+#                    LSA secret, and a Microsoft->local conversion first.
+#   ARSO           — Automatic Restart Sign-On ("use my sign-in info to finish
+#                    setting up after an update"). Windows signs the user back in
+#                    after an update or user-initiated restart, then LOCKS the
+#                    screen. A real session exists, so the AtLogon triggers fire
+#                    and WSL starts — it just looks like nobody logged in. Stores
+#                    no password. Does NOT survive power loss: Windows has to
+#                    stash the credential during an orderly shutdown.
+#
+# Both are reported, because checking only AutoAdminLogon told operators whose
+# reboots already worked that "WSL won't auto-start after a reboot" and handed
+# them a page of account-conversion steps for a problem they did not have.
+function Get-LogonRecovery {
+    $state = [ordered]@{ AutoAdminLogon = $false; Arso = $false }
     try {
         $w = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction Stop
-        return ("$($w.AutoAdminLogon)" -eq '1')
-    } catch {
-        return $false
-    }
+        $state.AutoAdminLogon = ("$($w.AutoAdminLogon)" -eq '1')
+
+        # ARSO is armed when Winlogon has stored a SID to sign back in as. Compare
+        # it against the SID that OWNS the tasks: an AutoLogonSID belonging to a
+        # different user restores a session that cannot see this operator's distro,
+        # since WSL registrations live in that user's HKCU.
+        $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $armed = ($w.PSObject.Properties.Name -contains 'AutoLogonSID') -and ("$($w.AutoLogonSID)" -eq $sid)
+
+        $disabled = $false
+        foreach ($p in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\System',
+                         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')) {
+            $v = (Get-ItemProperty $p -Name DisableAutomaticRestartSignOn -ErrorAction SilentlyContinue).DisableAutomaticRestartSignOn
+            if ($null -ne $v -and [int]$v -eq 1) { $disabled = $true }
+        }
+        $state.Arso = ($armed -and -not $disabled)
+    } catch { }
+    return [pscustomobject]$state
 }
 
 function Show-AutologinHelp {
     $u = $env:USERNAME
     Write-Host ""
-    Write-Host "IMPORTANT — enable Windows AUTOLOGIN so WSL comes back after an unattended reboot:" -ForegroundColor Yellow
+    Write-Host "IMPORTANT — nothing restores a logon session, so WSL stays down after a reboot:" -ForegroundColor Yellow
     Write-Host "  The boot/keepalive tasks run as '$u' (SYSTEM can't see your WSL distro) and"
-    Write-Host "  fire at LOGON. Without autologin, nothing starts until someone signs in."
+    Write-Host "  fire at LOGON. Until a session exists, the tunnel is down."
     Write-Host ""
+    Write-Host "  Option A — ARSO. Free, stores no password, and covers Windows Update and"
+    Write-Host "  user-initiated restarts (the common case). Windows signs '$u' back in and"
+    Write-Host "  locks the screen; the session is real, so the tasks fire. It does NOT"
+    Write-Host "  survive a cold boot after power loss. Try this FIRST:"
+    Write-Host "      Settings > Accounts > Sign-in options >"
+    Write-Host "        'Use my sign-in info to automatically finish setting up after an update'  -> On"
+    Write-Host "      (Requires a password/PIN on the account. Verify below, then reboot to test.)"
+    Write-Host ""
+    Write-Host "  Option B — classic autologin. Covers EVERY boot including power loss, but"
+    Write-Host "  costs a stored password and a local-account conversion. Only worth it if the"
+    Write-Host "  host must survive an unattended power cut:"
     Write-Host "    1. If '$u' is a Microsoft account, convert it to a LOCAL account first"
     Write-Host "       (so you're not storing your Microsoft password):"
     Write-Host "         Settings > Accounts > Your info > 'Sign in with a local account instead'"
@@ -956,7 +996,12 @@ function Show-AutologinHelp {
     Write-Host "         https://learn.microsoft.com/sysinternals/downloads/autologon"
     Write-Host "         Autologon.exe -accepteula $u . <local-password>"
     Write-Host ""
-    Write-Host "  Verify:  (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoAdminLogon  → 1"
+    Write-Host "  Verify either one (run as '$u'):"
+    Write-Host "    ARSO      — (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoLogonSID"
+    Write-Host "                should equal ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value"
+    Write-Host "    Autologin — (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoAdminLogon  -> 1"
+    Write-Host ""
+    Write-Host "  Real test: reboot, do NOT sign in, then reach the host from another machine."
 }
 
 # ── Health check ───────────────────────────────────────────────────────────────
@@ -1000,10 +1045,15 @@ function Invoke-HealthCheck {
         }
     } else { Warn "  Keepalive task (5 min):    not registered" }
 
-    $autologin = Test-Autologon
-    if ($autologin) {
-        Log "  Autologin (unattended boot): OK"
-    } else { Warn "  Autologin (unattended boot): NOT set — WSL won't auto-start after a reboot (manual step below)" }
+    $logon = Get-LogonRecovery
+    if ($logon.AutoAdminLogon) {
+        Log "  Reboot recovery:           OK (autologin — covers cold boot after power loss too)"
+    } elseif ($logon.Arso) {
+        Log "  Reboot recovery:           OK (ARSO re-signs in '$env:USERNAME' after a restart)"
+        Log "                             Gap: a cold boot after POWER LOSS still needs a manual sign-in."
+    } else {
+        Warn "  Reboot recovery:           NONE — WSL stays down until someone signs in (steps below)"
+    }
 
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
     if (Test-Path $wslconfig) {
@@ -1072,7 +1122,7 @@ function Invoke-HealthCheck {
         Warn "  Wake-on-LAN:               no wake source armed — the host cannot be woken remotely."
     }
 
-    if (-not $autologin) { Show-AutologinHelp }
+    if (-not ($logon.AutoAdminLogon -or $logon.Arso)) { Show-AutologinHelp }
     if ($clockIssues) { Show-ClockHelp }
 
     Write-Host ""
