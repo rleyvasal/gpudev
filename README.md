@@ -811,6 +811,42 @@ Three constraints, none of them CUDA, each of which fails in a misleading way:
 | **shapely overridden to 2.x** | mmdet3d → lyft-dataset-sdk → shapely 1.8.5.post1, which cannot build on **Python 3.12** (`pkgutil.ImpImporter` was removed). Reads as an mmdet3d failure. |
 | **spconv-cu126** | No `cu128` or `cu130` wheel exists. cu126 works on 12.8 via CUDA 12.x minor-version compatibility. |
 
+### torch-tensorrt
+
+Works, but three things must line up. Verified at **2.57x over eager** on an
+RTX 5080 (fp16, 8x3x256x256, three conv layers), output matching eager to
+0.0012.
+
+```bash
+PY=/home/gpudev/.venv/bin/python
+uv pip install --python $PY "tensorrt-cu12>=10.0,<11" dllist
+uv pip install --python $PY --no-deps     --index-url https://download.pytorch.org/whl/cu128 torch-tensorrt==2.11.0
+```
+
+| Requirement | Why |
+| --- | --- |
+| Wheel from the **PyTorch cu128 index**, not PyPI | The PyPI wheel is cu13-linked. It installs cleanly and dies at import on `libcudart.so.13`. |
+| `--no-deps` with `--index-url` | uv's `first-index` strategy lets PyPI outrank `--index-url`, silently giving you the cu13 build again. `--no-deps` removes resolution from the equation; install `dllist` separately. |
+| **TensorRT 10.x**, not 11 | `libtorchtrt.so` links `libnvinfer.so.10`. An unbounded `tensorrt-cu12>=10.0.0` resolves to 11.x and leaves torch-tensorrt unloadable. |
+| Version tracks torch **exactly** | torch 2.11 -> torch-tensorrt 2.11. Releases skip 2.10 and 2.12 on PyPI; the cu128 index carries 2.7, 2.8, 2.9, 2.11. |
+
+Diagnosing link problems here is much faster with `ldd` than with pip metadata:
+
+```bash
+ldd $PY_SITE/torch_tensorrt/lib/libtorchtrt.so | grep -E 'not found|cudart|nvinfer'
+```
+
+`libtorch.so` / `libc10.so` showing "not found" is normal — they live in the venv
+and resolve at runtime through torch's own loader.
+
+One API note: with a `.half()` module, torch-tensorrt 2.11 sets
+`use_explicit_typing` and then **rejects** `enabled_precisions`, asserting rather
+than warning. Pass the dtype via the module, not the compile call.
+
+**You do not need torch-tensorrt for TensorRT.** `onnxruntime-gpu` exposes
+`TensorrtExecutionProvider` out of the box, so ONNX -> engine -> benchmark works
+with none of the above. torch-tensorrt only skips the ONNX export step.
+
 Verify:
 
 ```bash

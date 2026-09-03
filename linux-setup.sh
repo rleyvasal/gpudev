@@ -781,10 +781,23 @@ write_profiling_requirements() {
     # them in means a multi-GB image rebuild per attempt. Install those into the
     # client's own venv, which lives on its data volume and survives rebuilds.
     #
-    # torch-tensorrt is also left out on purpose. It must match both torch and
-    # TensorRT exactly, and Blackwell wheel availability is the least certain of
-    # anything here — baking it in means an unresolvable pin blocks the whole
-    # image build. Prove it in a client venv first, then promote it.
+    # torch-tensorrt is left out of the image but IS known to work — verified at
+    # 2.57x over eager on an RTX 5080. It needs three things that are easy to get
+    # wrong, so it is installed per-client rather than baked in:
+    #
+    #   1. The wheel must come from the PyTorch cu128 index, NOT PyPI. PyPI ships
+    #      a cu13-linked build that installs cleanly and dies at import on
+    #      libcudart.so.13. Use --index-url with --no-deps so PyPI cannot win the
+    #      resolution, then install its pure-python deps (dllist) separately.
+    #   2. TensorRT must be on the 10.x line (see the cap above).
+    #   3. Its version tracks torch exactly: torch 2.11 -> torch-tensorrt 2.11.
+    #
+    #   uv pip install --python $PY dllist
+    #   uv pip install --python $PY --no-deps     #       --index-url https://download.pytorch.org/whl/cu128 torch-tensorrt==2.11.0
+    #
+    # ONNX -> TensorRT via onnxruntime's TensorrtExecutionProvider needs none of
+    # this and works out of the box, so torch-tensorrt is a convenience, not a
+    # missing capability.
     #
     # If you are installing the AV perception stack into a client venv, three
     # constraints are already known — all found the hard way, none CUDA-related:
@@ -807,10 +820,20 @@ write_profiling_requirements() {
     # tensorrt-cu13 into this CUDA 12.8 image — the same class of toolkit/runtime
     # mismatch this variant exists to avoid, one layer down. It installs happily
     # and only fails at `import tensorrt`, against the 12.8 runtime.
+    # TensorRT is capped BELOW 11 on purpose. torch-tensorrt links against
+    # libnvinfer.so.10, so a TensorRT 11 runtime leaves it unloadable — and an
+    # unbounded >=10.0.0 resolves to 11.x, which is how this image originally
+    # shipped a TensorRT that torch-tensorrt could not use. ONNX Runtime's
+    # TensorrtExecutionProvider works on either line, so capping costs nothing
+    # there and buys torch-tensorrt compatibility.
+    #
+    # Note the CUDA line must be pinned too: the bare `tensorrt` meta-package
+    # resolves to the newest CUDA variant and pulled cu13 into this cu128 image.
+    # Both halves of this requirement have been wrong once.
     cat > "$PROFILING_REQS" <<'REQ'
 onnx>=1.17.0
 onnxruntime-gpu>=1.20.0
-tensorrt-cu12>=10.0.0
+tensorrt-cu12>=10.0,<11
 REQ
     log "Wrote profiling requirements to ${PROFILING_REQS}"
 }
