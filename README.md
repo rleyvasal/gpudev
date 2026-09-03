@@ -768,6 +768,20 @@ the bare-metal path automatically.
 
 ### Setup
 
+Use the **normal interactive installer**. It asks which disk to install to and
+shows each one by model and size, which is both simpler and safer than matching
+a serial number you transcribed by hand. Two prompts matter: pick the right disk
+on the storage screen, and tick **Install OpenSSH server** — without it a
+headless box has no way in but the physical console.
+
+`autoinstall/user-data` in this repo exists for provisioning *several* hosts
+unattended. For a single machine it is more work and more risk than clicking
+through the installer: it needs a password hash and the target disk's serial
+edited in by hand, and its failure mode is a halted installer rather than a
+clear prompt. Skip it unless you are building more than one host.
+
+Then, on the installed system:
+
 ```bash
 # Enable ncu profiling for all users (opt-in; see the caveat below).
 GPUDEV_ENABLE_PROFILING=1 bash <(curl -fsSL   https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)
