@@ -206,7 +206,13 @@ What the script does, in order:
    GPU verification will fail without it.
 3. Runs `wsl --update` to keep the WSL kernel current.
 4. Configures Windows power settings (`powercfg`): disables auto-sleep /
-   hibernate / disk-spindown on AC, sets High Performance.
+   hibernate / disk-spindown on AC, sets High Performance. This includes the
+   **system unattended sleep timeout**, which is hidden from the Settings UI and
+   from `powercfg /query`, defaults to 120 s, and applies after any *device*
+   wake — so a wake-on-LAN'd host would otherwise go back to sleep two minutes
+   later while "Make my device sleep after" still reads *Never*. Also arms
+   **wake-on-LAN** (magic packet, Ethernet) and disarms every other wake source,
+   so the host sleeps on command and wakes only when you send it a packet.
 5. Writes `%USERPROFILE%\.wslconfig` with both `instanceIdleTimeout=-1` and
    `vmIdleTimeout=-1`, keeping the gpudev distribution and its shared WSL2 VM
    alive between sessions. The values are written without inline comments so
@@ -228,18 +234,30 @@ What the script does, in order:
    needed. The task invokes `wsl.exe` directly to avoid nested-shell quoting.
    Belt-and-suspenders against WSL crashes / background Windows updates.
 
-> **Manual step — enable autologin (required for unattended reboot recovery).**
-> Both tasks fire at **logon**, so for WSL to come back after a reboot *with
-> nobody signing in*, Windows must auto-log-in your user. Phase A can't do this
-> (it needs your password) — it detects it and prints instructions. One-time:
-> if your account is a **Microsoft account**, first convert it to a **local
-> account** (Settings → Accounts → Your info → *Sign in with a local account
-> instead*; keep the username, set a simple local password) so you're not storing
-> your Microsoft password — then enable autologin with
-> [Sysinternals Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon)
-> (`Autologon.exe -accepteula <user> . <local-password>`), which stores it as an
-> encrypted LSA secret. Without this, the stack only comes up when you manually
-> sign in or run `wsl`.
+9. Registers a **cold-boot task** (`gpudev-wsl-coldboot`) with logon type
+   **S4U** — *run whether the user is logged on or not*, **without storing a
+   password**. Fires one minute after boot and repeats every 5 min. This is the
+   only one of the three that runs with **nobody signed in**, which is what
+   brings the host back after a power cut. It doubles as the keepalive for that
+   case, since the other two can only run inside a logon session.
+
+> **Autologin is normally NOT needed.** Earlier versions of this README said it
+> was required; that was wrong. Two mechanisms already restore the stack without
+> a stored password:
+>
+> - **ARSO** (*Settings → Accounts → Sign-in options → "Use my sign-in info to
+>   automatically finish setting up after an update"*) signs you back in after a
+>   Windows Update or user-initiated restart and locks the screen. The session is
+>   real, so `gpudev-wsl-boot` fires and WSL starts — it only *looks* like nobody
+>   logged in. It does **not** survive power loss: Windows stashes the resume
+>   credential during an orderly shutdown, which a power cut skips.
+> - **`gpudev-wsl-coldboot`** (S4U, above) covers exactly that remaining case,
+>   needing no session at all.
+>
+> Classic autologin buys nothing on top of those two, and costs a stored password
+> plus a Microsoft→local account conversion. Phase A's health check reports which
+> mechanism is active and only prints the autologin instructions if **neither**
+> covers the host.
 
 The script ends with a health check; everything should be `OK`:
 
@@ -251,7 +269,14 @@ WSL2 distro installed:     OK (gpudev)
 Linux user (gpudev):       OK (default user, sudo)
 Boot task (wake on boot):  OK (gpudev-wsl-boot)
 Keepalive task (5 min):    OK (gpudev-wsl-keepalive)
-Autologin (unattended boot): OK
+Host clock:                OK (zone honours DST; time service automatic)
+Reboot recovery:           OK (ARSO re-signs in 'you' after a restart)
+Power-loss recovery:       OK (gpudev-wsl-coldboot, S4U — needs no sign-in)
+                           Allow 10-15 min after a power cut before calling it down.
+Idle sleep (AC):           OK (never)
+Unattended sleep (AC):     OK (never)
+Wake-on-LAN:               OK (Realtek PCIe 2.5GbE Family Controller)
+  Send the magic packet to MAC XX-XX-XX-XX-XX-XX (Ethernet)
 .wslconfig (distro + VM idle): OK
 ```
 
@@ -841,13 +866,51 @@ What comes back on its own, and what needs a hand:
 
 | Event | Auto-recovers | Why |
 | --- | --- | --- |
-| **Windows restart** | ✅ everything *(if autologin is on)* | At logon the `gpudev-wsl-boot` task (runs as your user) wakes WSL; systemd auto-starts `ssh` + `gpudev-tunnel`; DNS is unchanged. **Requires Windows autologin** (above) so the logon happens unattended — without it, WSL stays down until you sign in or run `wsl`. |
-| **WSL `--shutdown`** | ✅ everything *(while the Windows user is logged in)* | `gpudev-wsl-keepalive` re-wakes WSL within 5 min; systemd restarts the services. |
+| **Windows restart / Windows Update reboot** | ✅ everything | ARSO re-signs you in and locks the screen; the session is real, so `gpudev-wsl-boot` fires at logon and systemd auto-starts `ssh` + `gpudev-tunnel`. DNS is unchanged. No autologin or stored password needed. |
+| **Power loss / dirty cold boot** | ✅ everything, but **slowly** | ARSO does not apply here. `gpudev-wsl-coldboot` (S4U) runs with no session and starts WSL a minute after boot. Measured end-to-end: ~7.5 min from Windows boot to a reachable tunnel, plus firmware time before that — **budget 10–15 min from pressing power**. See *Cold boot after power loss is slow* below. |
+| **WSL `--shutdown`** | ✅ everything | `gpudev-wsl-keepalive` re-wakes WSL within 5 min while you are signed in; `gpudev-wsl-coldboot` does the same when nobody is. |
 | **Distro reinstall** | ⚠️ mostly | Re-run `linux-setup.sh`: it re-creates the tunnel + credentials, re-points DNS with `--overwrite-dns`, and re-adds your admin key. The **one** manual step is the host-key trust on the admin side (`ssh-keygen -R`, above). |
 
 The stale-DNS 530 that this was all about can no longer happen after a restart:
 the systemd unit runs the tunnel **by UUID** (pinned to its credentials file), and
 `linux-setup.sh` always `--overwrite-dns`-points the hostname at that same tunnel.
+
+### Cold boot after power loss is slow
+
+A dirty boot (power cut, or holding the power button) takes far longer than a
+normal restart — often 10–15 minutes before the host answers SSH. It is not
+hung. Two separate things are slow, and only one of them is Windows:
+
+**1. Firmware memory training (the big one, on DDR5).** Boards store the results
+of DDR5 memory training and reuse them across normal restarts. A power cut
+discards that saved data, so firmware retrains from scratch on the next boot —
+often several minutes of apparently dead black screen *before Windows starts at
+all*. This is why only dirty boots are slow.
+
+Most boards can cache the training data across power loss. The setting is called
+**Memory Context Restore** (AMD / Gigabyte / ASRock / MSI) or **MRC Fast Boot**
+(Intel / ASUS), usually under the memory or overclocking section of firmware
+setup. Enabling it typically turns a multi-minute POST into seconds.
+
+> It is a firmware setting, so no script here can set it — and it is a genuine
+> trade-off. Reusing cached training results occasionally makes a marginal memory
+> configuration less stable across cold boots. If the machine becomes flaky after
+> enabling it, turn it back off and accept the slow cold boot. On a host you wake
+> remotely and rarely power-cycle, slow-but-certain is a reasonable choice.
+
+**2. The gpudev stack itself**, measured on a real recovery:
+
+| From Windows boot | What happened |
+| --- | --- |
+| +1:00 | `gpudev-wsl-coldboot` fires (deliberate trigger delay — `wslservice`, Hyper-V and the network stack are not ready sooner) |
+| ~+3:00 | `wslservice` up, WSL VM booting |
+| ~+4:00 | WSL VM booted, systemd starting `ssh` / `docker` / `gpudev-tunnel` |
+| ~+7:30 | `cloudflared` registers its edge connections — **only now is SSH reachable** |
+
+So `ssh` failing at the 5-minute mark after a power cut is expected and means
+nothing. Wait the full 15 before treating it as broken. If it is still down
+after that, check `Get-ScheduledTaskInfo gpudev-wsl-coldboot` — `LastTaskResult`
+should be `0` and `NextRunTime` must not be blank.
 
 ### Tunnel / sshd dies after `wsl --shutdown` or Windows reboot
 
