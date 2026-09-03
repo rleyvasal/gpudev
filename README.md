@@ -712,6 +712,102 @@ there survive `gpudev client rebuild` (but not `client remove`).
 
 ---
 
+## Bare-metal Linux host
+
+gpudev runs on Windows+WSL2 or on bare Linux. **Bare Linux is the only way to get
+Nsight Compute**: GPU performance counters are not exposed to a WSL2 guest, so
+`ncu` fails there regardless of container privileges (see the WSL2 note below).
+If counter-level profiling matters — occupancy, memory throughput, warp stalls,
+roofline — run the host on Linux.
+
+Everything else is the same: `linux-setup.sh` detects the environment and takes
+the bare-metal path automatically.
+
+### What differs from WSL2
+
+| | WSL2 | Bare Linux |
+| --- | --- | --- |
+| `ncu` counters | **unavailable** | works, after opt-in + reboot |
+| `nsys`, `torch.profiler` | works | works |
+| Clock locking | Windows-side only | native, `sudo nvidia-smi -lgc` |
+| Persistence mode (`-pm 1`) | silently no-ops | works |
+| NVIDIA driver | installed on **Windows** | installed on **Linux** |
+| Wake-on-LAN | `windows-setup.ps1` | `linux-setup.sh` (systemd unit) |
+| Memory ceiling | `.wslconfig` | all host RAM |
+| Sleep/wake | Windows power plan | logind + sudoers |
+
+### Prerequisites
+
+1. **A distro with systemd.** gpudev's service model (`Restart=always`,
+   `WantedBy=multi-user.target`) depends on it. Ubuntu 24.04 LTS matches what
+   the WSL path is tested against.
+2. **The NVIDIA driver, installed on Linux.** Verify with `nvidia-smi` before
+   running setup — the script checks GPU passthrough through Docker, which fails
+   confusingly if the host driver is missing entirely.
+   ```bash
+   sudo ubuntu-drivers install       # or the .run installer / distro package
+   nvidia-smi                        # must list the GPU before continuing
+   ```
+   On Blackwell (RTX 50-series) you need a driver new enough for `sm_120`.
+3. **Secure Boot off, or the driver signed.** With Secure Boot on and an
+   unsigned module, `nvidia-smi` fails after a reboot that appeared to work.
+4. **A normal user with sudo.** Do not run setup as root — gpudev writes
+   per-user configuration into `$HOME` and the systemd units run as that user.
+
+### Setup
+
+```bash
+# Enable ncu profiling for all users (opt-in; see the caveat below).
+GPUDEV_ENABLE_PROFILING=1 bash <(curl -fsSL   https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)
+```
+
+Omit `GPUDEV_ENABLE_PROFILING=1` on a shared host: it lifts the driver's
+restriction so *any* local user can read GPU performance counters, meaning one
+client could observe another's GPU activity. Fine for a single operator.
+
+**Reboot after setup** if you enabled profiling — the setting is a kernel module
+parameter (`NVreg_RestrictProfilingToAdminUsers=0`) and only applies once the
+nvidia modules reload.
+
+### What the bare-metal path adds
+
+Steps 10b–10d run only on Linux:
+
+- **GPU profiling counters** — writes
+  `/etc/modprobe.d/gpudev-nvidia-profiling.conf` and refreshes the initramfs.
+  This is the Linux equivalent of the Windows `RmProfilingAdminOnly` registry
+  value, and unlike WSL2 it actually enables `ncu`.
+- **Clock locking** — a sudoers rule letting the operator lock/reset GPU clocks
+  without a password, so a benchmark harness need not run as root:
+  ```bash
+  sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 2100   # before a run
+  sudo nvidia-smi -rgc                                 # after
+  ```
+  Pick a frequency below the sustained thermal ceiling, not near the maximum, or
+  long runs throttle and reintroduce the variance you locked clocks to remove.
+- **Wake-on-LAN** — a `gpudev-wol.service` systemd unit that arms magic-packet
+  wake on the first wired NIC at every boot. `ethtool` settings do not survive a
+  reboot or link-down, hence the unit. Magic packet only (`wol g`): the broader
+  wake modes fire on ordinary traffic and produce a sleep/wake loop. Firmware
+  must also allow it — enable WoL/PME, disable ErP and Deep Sleep.
+
+Verify from the health check at the end of setup:
+
+```
+GPU perf counters:        OK (all users) — reboot first if just enabled
+clock locking:            OK (passwordless nvidia-smi -lgc/-rgc)
+wake-on-LAN:              OK (magic packet, re-armed each boot)
+```
+
+### Package pinning is identical
+
+The version constraints in the `cuda-dev` section below are properties of the
+packages, not of WSL2 — CUDA 12.8, torch 2.11+cu128, mmcv 2.1.0, spconv-cu126
+and the TensorRT 10.x cap all apply unchanged on bare metal. The `spconv` wheel
+ceiling that rules out CUDA 13 is the same on both.
+
+---
+
 ## GPU profiling and custom CUDA ops (`cuda-dev` variant)
 
 The default base image is `python:3.12-slim` and carries **no CUDA toolkit** —

@@ -1495,6 +1495,127 @@ EOF
     fi
 }
 
+# ── Bare-Linux only: GPU profiling counters ───────────────────────────────────
+
+# Nsight Compute reads GPU performance counters, which the NVIDIA driver
+# restricts to root by default. On Linux the restriction is a KERNEL MODULE
+# parameter, not a registry key as on Windows — and unlike WSL2, where the
+# counters are simply not exposed to the guest at all, lifting it here actually
+# works. This is the main reason to run gpudev on bare metal rather than WSL2:
+# `ncu` cannot collect counters under WSL2 no matter how the container is
+# configured, verified including --privileged.
+#
+# OPT-IN via GPUDEV_ENABLE_PROFILING=1. Lifting the restriction lets any local
+# user read GPU performance counters, so on a multi-client host one client could
+# observe another's GPU activity. Fine for a single operator, not a default.
+#
+# Takes effect only after the nvidia modules reload — in practice, a reboot.
+configure_gpu_profiling() {
+    [ "$HOST_ENV" = "linux" ] || return 0
+    if [ "${GPUDEV_ENABLE_PROFILING:-0}" != "1" ]; then
+        log "GPU performance counters: left restricted to root (default)."
+        log "  ncu will fail with ERR_NVGPUCTRPERM for non-root users."
+        log "  Re-run with GPUDEV_ENABLE_PROFILING=1 to allow all users."
+        return 0
+    fi
+
+    local conf=/etc/modprobe.d/gpudev-nvidia-profiling.conf
+    sudo tee "$conf" >/dev/null <<'EOF'
+# gpudev: allow non-root users to read GPU performance counters, so Nsight
+# Compute (ncu) can profile. Without this ncu fails with ERR_NVGPUCTRPERM.
+options nvidia NVreg_RestrictProfilingToAdminUsers=0
+EOF
+    sudo chmod 644 "$conf"
+    log "  Wrote $conf"
+
+    # The setting lives in the initramfs too on distros that load nvidia early.
+    if command_exists update-initramfs; then
+        sudo update-initramfs -u >/dev/null 2>&1             && log "  initramfs updated."             || warn "  update-initramfs failed; the modprobe conf still applies after reboot."
+    fi
+    warn "  REBOOT REQUIRED before ncu can read counters."
+}
+
+test_gpu_profiling_enabled() {
+    [ -f /etc/modprobe.d/gpudev-nvidia-profiling.conf ] || return 1
+    grep -q 'NVreg_RestrictProfilingToAdminUsers=0' /etc/modprobe.d/gpudev-nvidia-profiling.conf
+}
+
+# ── Bare-Linux only: benchmark clock locking ──────────────────────────────────
+
+# Locking GPU clocks removes the largest source of run-to-run variance in
+# benchmarks. On Linux this works natively, unlike WSL2 where `nvidia-smi -lgc`
+# fails as both user and root and the lock has to be set from Windows.
+# Persistence mode also works here; on Windows/WDDM it silently no-ops.
+#
+# nvidia-smi needs root to change clocks, and a benchmark harness should not run
+# as root, so grant exactly those two verbs passwordless.
+configure_clock_locking() {
+    [ "$HOST_ENV" = "linux" ] || return 0
+    command_exists nvidia-smi || { warn "nvidia-smi not found — skipping clock-lock sudoers."; return 0; }
+
+    local smi sudoers_file=/etc/sudoers.d/gpudev-clocks
+    smi="$(command -v nvidia-smi)"
+    sudo tee "$sudoers_file" >/dev/null <<EOF
+# gpudev: let ${LINUX_USER} lock/reset GPU clocks for benchmark runs without a
+# password. Scoped to nvidia-smi only.
+${LINUX_USER} ALL=(root) NOPASSWD: ${smi} -pm *, ${smi} -lgc *, ${smi} -rgc, ${smi} --lock-gpu-clocks=*, ${smi} --reset-gpu-clocks
+EOF
+    sudo chmod 440 "$sudoers_file"
+    if sudo visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        log "  sudoers: ${LINUX_USER} may lock/reset GPU clocks for benchmarks."
+        log "    sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc <mhz>   # before a run"
+        log "    sudo nvidia-smi -rgc                                  # after"
+    else
+        warn "clock-lock sudoers failed validation — removing."
+        sudo rm -f "$sudoers_file"
+    fi
+}
+
+# ── Bare-Linux only: wake-on-LAN ──────────────────────────────────────────────
+
+# Windows hosts get this from windows-setup.ps1. On Linux, ethtool settings do
+# not survive a reboot or a link-down, so arm the NIC on every boot with a
+# systemd unit. Magic packet only (`wol g`): the other wake modes fire on
+# ordinary traffic and put the host into a sleep/wake loop.
+configure_wake_on_lan() {
+    [ "$HOST_ENV" = "linux" ] || return 0
+    command_exists ethtool || sudo apt-get install -qy ethtool >/dev/null 2>&1
+    command_exists ethtool || { warn "ethtool unavailable — skipping wake-on-LAN."; return 0; }
+
+    # First wired interface that reports magic-packet support. Wireless is
+    # excluded: WoWLAN rarely survives suspend and is the usual cause of a host
+    # that refuses to stay asleep.
+    local iface="" cand
+    for cand in $(ls /sys/class/net); do
+        case "$cand" in lo|docker*|veth*|br-*|virbr*|wl*) continue ;; esac
+        if sudo ethtool "$cand" 2>/dev/null | grep -q 'Supports Wake-on.*g'; then
+            iface="$cand"; break
+        fi
+    done
+    [ -n "$iface" ] || { warn "No wired NIC supports magic-packet wake — skipping."; return 0; }
+
+    sudo tee /etc/systemd/system/gpudev-wol.service >/dev/null <<EOF
+[Unit]
+Description=gpudev: arm wake-on-LAN (magic packet) on ${iface}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$(command -v ethtool) -s ${iface} wol g
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now gpudev-wol.service >/dev/null 2>&1
+    local mac
+    mac="$(cat /sys/class/net/${iface}/address 2>/dev/null)"
+    log "  wake-on-LAN armed on ${iface} (MAC ${mac}), re-armed at every boot."
+    log "    Firmware must also allow it: WoL/PME enabled, ErP disabled."
+}
+
 # ── Health check ──────────────────────────────────────────────────────────────
 
 run_health_check() {
@@ -1579,6 +1700,21 @@ run_health_check() {
     [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] \
         && log "  admin SSH shortcuts:      OK (sleep/reboot scheduling)" \
         || warn "  admin SSH shortcuts:      MISSING"
+
+    if [ "$HOST_ENV" = "linux" ]; then
+        if test_gpu_profiling_enabled; then
+            log "  GPU perf counters:        OK (all users) — reboot first if just enabled"
+        else
+            log "  GPU perf counters:        root-only; ncu gives ERR_NVGPUCTRPERM."
+            log "                            Re-run with GPUDEV_ENABLE_PROFILING=1 to allow."
+        fi
+        [ -f /etc/sudoers.d/gpudev-clocks ] \
+            && log "  clock locking:            OK (passwordless nvidia-smi -lgc/-rgc)" \
+            || warn "  clock locking:            not configured; boost adds benchmark variance"
+        systemctl is-enabled gpudev-wol >/dev/null 2>&1 \
+            && log "  wake-on-LAN:              OK (magic packet, re-armed each boot)" \
+            || warn "  wake-on-LAN:              not armed; host cannot be woken remotely"
+    fi
 
     if [ "$HOST_ENV" = "wsl2" ]; then
         { [ -x /mnt/c/Windows/System32/shutdown.exe ] || command_exists shutdown.exe; } \
@@ -1683,6 +1819,19 @@ main() {
 
     step "gpudev Step 10: Configure power management"
     configure_power_management
+
+    # Bare metal only. Each is a no-op under WSL2, where the Windows side owns
+    # wake-on-LAN and GPU counters are not reachable from the guest at all.
+    if [ "$HOST_ENV" = "linux" ]; then
+        step "gpudev Step 10b: GPU profiling counters (ncu)"
+        configure_gpu_profiling
+
+        step "gpudev Step 10c: Benchmark clock locking"
+        configure_clock_locking
+
+        step "gpudev Step 10d: Wake-on-LAN"
+        configure_wake_on_lan
+    fi
 
     run_health_check
 
