@@ -849,10 +849,31 @@ function Register-ColdBootTask {
 
     # Delay the first attempt: wslservice, the Hyper-V platform and the network
     # stack are not necessarily ready the instant the startup trigger fires.
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $trigger.Delay = 'PT1M'
-    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+    # TWO triggers, because they cover different windows and a boot trigger alone
+    # cannot be verified:
+    #
+    #   BootTrigger  — the cold-boot case. Delayed a minute because wslservice,
+    #                  the Hyper-V platform and the network stack are not ready
+    #                  the instant it fires.
+    #   TimeTrigger  — repeats every 5 minutes for the life of the machine, so
+    #                  this task is also the ONLY keepalive that runs while nobody
+    #                  is signed in (the Interactive one cannot). It also gives
+    #                  Get-ScheduledTaskInfo a real NextRunTime, so the health
+    #                  check can prove the schedule is armed instead of trusting
+    #                  it: a BootTrigger's own repetition projects no future runs
+    #                  once its boot cycle has passed, and reads back blank.
+    #
+    # StopAtDurationEnd is cleared explicitly. New-ScheduledTaskTrigger sets it
+    # true while leaving Duration empty, and that pair registers a repetition with
+    # NO future occurrences — the task would fire once and never retry.
+    $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+    $bootTrigger.Delay = 'PT1M'
+
+    $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $repeatTrigger.Repetition.StopAtDurationEnd = $false
+
+    $trigger = @($bootTrigger, $repeatTrigger)
 
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
@@ -863,8 +884,13 @@ function Register-ColdBootTask {
         Register-ScheduledTask -TaskName $ColdBootTaskName -Action $action -Trigger $trigger `
             -Principal $principal -Settings $settings -Force | Out-Null
         Log "Registered cold-boot task '$ColdBootTaskName' (S4U — runs with nobody signed in)."
-        Log "  Verify by pulling the power, booting, and NOT signing in — the host"
-        Log "  should become reachable on its own within a couple of minutes."
+        Log "  Verify by pulling the power, booting, and NOT signing in. BUDGET 10-15"
+        Log "  MINUTES from pressing power before calling it a failure — measured on a"
+        Log "  real recovery: +1 min trigger delay, ~3 min for wslservice and the VM,"
+        Log "  ~3 min more before cloudflared registers its edge connections, and on a"
+        Log "  DDR5 board several minutes of memory training in firmware BEFORE Windows"
+        Log "  even starts, because a power cut discards the saved training data."
+        Log "  Testing at 5 minutes reports a failure that is really just impatience."
     } catch {
         Warn "Could not register the S4U cold-boot task: $_"
         Warn "  Recovery after POWER LOSS will need a manual sign-in. Restarts and"
@@ -1100,8 +1126,15 @@ function Invoke-HealthCheck {
     #   a restored LOGON SESSION (autologin / ARSO) makes the AtLogon tasks fire;
     #   the S4U cold-boot task needs no session at all, which is the only thing
     #   that helps after a power cut.
+    # NextRunTime is checked, not just registration: a repetition registered with
+    # StopAtDurationEnd true and no Duration is accepted, looks correct in the
+    # task's XML, and schedules NOTHING — it reads back as a blank NextRunTime.
+    # That shipped once. Proving the schedule is armed catches it.
     $coldTask = Get-ScheduledTask -TaskName $ColdBootTaskName -ErrorAction SilentlyContinue
-    $coldOk = ($coldTask -and $coldTask.State -ne 'Disabled' -and $coldTask.Principal.LogonType -eq 'S4U')
+    $coldInfo = Get-ScheduledTaskInfo -TaskName $ColdBootTaskName -ErrorAction SilentlyContinue
+    $coldArmed = ($coldInfo -and $coldInfo.NextRunTime)
+    $coldOk = ($coldTask -and $coldTask.State -ne 'Disabled' `
+        -and $coldTask.Principal.LogonType -eq 'S4U' -and $coldArmed)
 
     $logon = Get-LogonRecovery
     if ($logon.AutoAdminLogon) {
@@ -1114,6 +1147,9 @@ function Invoke-HealthCheck {
 
     if ($coldOk) {
         Log "  Power-loss recovery:       OK ($ColdBootTaskName, S4U — needs no sign-in)"
+        Log "                             Allow 10-15 min after a power cut before calling it down."
+    } elseif ($coldTask -and -not $coldArmed) {
+        Warn "  Power-loss recovery:       task registered but NO next run scheduled — re-run setup"
     } elseif ($logon.AutoAdminLogon) {
         Log "  Power-loss recovery:       OK (autologin covers it)"
     } else {
