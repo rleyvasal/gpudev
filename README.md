@@ -712,6 +712,124 @@ there survive `gpudev client rebuild` (but not `client remove`).
 
 ---
 
+## GPU profiling and custom CUDA ops (`cuda-dev` variant)
+
+The default base image is `python:3.12-slim` and carries **no CUDA toolkit** —
+torch ships its own runtime libraries, which is enough to *run* GPU code but not
+to compile it. That single gap is why `nvcc`, `nsys` and `ncu` are all absent:
+one root cause, three symptoms.
+
+For profiling work or building custom CUDA ops, use the opt-in `cuda-dev`
+variant. It is several GB larger and much slower to build, so it is never built
+by default.
+
+```bash
+gpudev image list                              # what is built
+gpudev image build cuda-dev                    # ~25 min, several GB
+gpudev client add bev --variant cuda-dev
+```
+
+It ships CUDA 12.8 devel (`nvcc`), Nsight Compute (`ncu`), Nsight Systems
+(`nsys`), TensorRT (`tensorrt-cu12`), ONNX and onnxruntime-gpu, with torch
+pinned to `cu128` to match the toolkit. A client on this variant also gets
+`--cap-add=SYS_ADMIN --cap-add=PERFMON`; every client, on any variant, gets
+`--shm-size=8g` because Docker's 64 MB default kills multi-worker PyTorch
+DataLoaders with an error that mentions nothing about shared memory.
+
+### Nsight Compute does not work under WSL2
+
+**`ncu` cannot read GPU performance counters in WSL2.** This is a platform
+limitation, not a configuration problem, and it is worth knowing before you plan
+a profiling methodology around it.
+
+The usual fix — NVIDIA Control Panel → Developer → Manage GPU Performance
+Counters, or `RmProfilingAdminOnly=0`, which `windows-setup.ps1
+-EnableGpuProfiling` sets — is necessary but **not sufficient**. That setting
+governs native Windows processes; WSL2's GPU is paravirtualised and hardware
+counters are not exposed to the guest. Verified: with the registry set, the host
+rebooted, and `SYS_ADMIN` + `PERFMON` attached, `ncu` still returns
+`ERR_NVGPUCTRPERM` — and it fails identically under `--privileged`, which rules
+out container capabilities entirely.
+
+| Tool | Under WSL2 | Why |
+| --- | --- | --- |
+| `nvcc` | works | plain compilation |
+| `nsys` timeline | works | CUPTI *activity* tracing, no counters |
+| `nsys --gpu-metrics` | fails | needs hardware counters |
+| `ncu` | fails | needs hardware counters |
+| `torch.profiler` | works | CUPTI activity |
+
+So you get kernel durations, memory transfers and API overhead, but not
+occupancy, memory-throughput or warp-stall analysis. For counter-level work you
+need native Linux on the same card, or a cloud GPU (different silicon, which
+muddies comparisons).
+
+### Locking clocks for benchmarks
+
+Clock locking works, but only from **Windows**, while benchmarks run inside WSL.
+A benchmark harness therefore needs a Windows-side step:
+
+```powershell
+nvidia-smi -lgc 2100,2100     # Administrator PowerShell, before the run
+nvidia-smi -rgc               # after
+```
+
+Two traps. `nvidia-smi -pm 1` prints *"not supported on this platform"* and
+still **exits 0** on Windows/WDDM, so do not gate a harness on its exit code.
+And pick a frequency below the sustained thermal ceiling rather than near the
+maximum, or long runs throttle and reintroduce the variance you locked clocks to
+remove. From inside WSL, `-lgc` fails as both user and root; telemetry
+(`clocks.gr`, `temperature.gpu`, `power.draw`) reads fine.
+
+### AV perception stack (mmdetection3d) — verified recipe
+
+Verified end to end on an RTX 5080 (`sm_120`, capability 12.0) inside a
+`cuda-dev` client. Install into the **client venv**, not the image: these carry
+custom CUDA ops you will rebuild, and the client venv lives on the data volume,
+so it survives `gpudev client rebuild`.
+
+```bash
+PY=/home/gpudev/.venv/bin/python
+
+# Build deps. setuptools 81+ dropped pkg_resources, which mmcv's setup.py imports.
+uv pip install --python $PY "setuptools<81" wheel ninja psutil
+
+# mmcv from source, ~6 min. Pin the arch: without it the build may omit sm_120
+# and fail at kernel launch instead of at build time.
+MMCV_WITH_OPS=1 TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS=4 FORCE_CUDA=1   uv pip install --python $PY --no-build-isolation mmcv==2.1.0
+
+uv pip install --python $PY spconv-cu126          # prebuilt, ~11s
+uv pip install --python $PY mmengine "mmdet<3.3.1"
+uv pip install --python $PY --override <(echo 'shapely>=2.0.0') mmdet3d
+```
+
+Three constraints, none of them CUDA, each of which fails in a misleading way:
+
+| Constraint | What happens without it |
+| --- | --- |
+| **mmcv 2.1.0**, not 2.2.0 | mmdet/mmdet3d assert `mmcv<2.2.0` at *import*. The pin is only in their `mim` extra, so pip installs 2.2.0 happily and you discover it after a six-minute build. |
+| **shapely overridden to 2.x** | mmdet3d → lyft-dataset-sdk → shapely 1.8.5.post1, which cannot build on **Python 3.12** (`pkgutil.ImpImporter` was removed). Reads as an mmdet3d failure. |
+| **spconv-cu126** | No `cu128` or `cu130` wheel exists. cu126 works on 12.8 via CUDA 12.x minor-version compatibility. |
+
+Verify:
+
+```bash
+$PY -c "
+from mmdet3d.utils import register_all_modules; register_all_modules()
+from mmdet3d.registry import MODELS; print(len(MODELS.module_dict), 'models')
+from mmcv.ops import nms; import torch
+print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))"
+```
+
+Expect 107 models and capability `(12, 0)`. A registry count of **0 is normal**
+before `register_all_modules()` — mmdet3d registers lazily.
+
+The `libGL.so.1` system library is already in the image; without it `import mmcv`
+fails via OpenCV *after* a successful CUDA build, which reads as a broken build
+rather than a missing system library.
+
+---
+
 ## Day-to-day admin operations
 
 From the admin computer, power commands do not require opening an interactive

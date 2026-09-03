@@ -37,14 +37,21 @@ BASE_IMAGE_TAG="latest"
 # ATen on std::strong_ordering and friends. Patching mmcv's setup.py c++17 ->
 # c++20 (five lines) makes it compile in about 7 minutes.
 #
-# 12.8 is chosen because the CUDA line drags the torch version with it: the
-# cu128 line gives torch 2.11, cu130 gives 2.14. mmcv 2.2.0 predates both, and
-# 2.11 is the shorter jump. mmcv is also the EASIEST package in this stack —
-# spconv, mmdetection3d and torch-tensorrt are more tightly coupled to torch and
-# remain untested on either line. Each is another chance to need a patch, and
-# patches compound. If those turn out to build on torch 2.14, prefer 13.x and
-# collapse to a single CUDA line: the default base already runs cu130, so 12.8
-# is the reason two lines exist at all.
+# The decisive reason is spconv, not torch. spconv ships PREBUILT wheels and
+# stops at spconv-cu126 — there is no cu128 and no cu130. The cu126 wheel works
+# on a 12.8 runtime because CUDA 12.x guarantees minor-version compatibility.
+# That guarantee does NOT span a major version, so on CUDA 13 spconv would have
+# to be compiled from source. Verified: spconv-cu126 2.3.8 installs in 11s and
+# runs a sparse conv3d on an RTX 5080 under 12.8.
+#
+# A secondary reason: the CUDA line drags torch with it (cu128 -> torch 2.11,
+# cu130 -> 2.14), and the mm packages predate both, so 2.11 is the shorter jump.
+#
+# Verified working end to end on sm_120 under this pinning:
+#   mmcv 2.1.0 (source build), mmengine 0.10.7, mmdet 3.3.0, mmdet3d 1.4.0,
+#   spconv-cu126 2.3.8 — mmdet3d's own CUDA ops execute on the GPU.
+# Revisit 13.x only if spconv publishes a cu13x wheel; the default base already
+# runs cu130, so spconv is the only thing keeping two CUDA lines alive.
 CUDA_DEV_IMAGE_NAME="gpudev-base-cuda-dev"
 CUDA_DEV_BASE_IMAGE="nvidia/cuda:12.8.1-devel-ubuntu24.04"
 CUDA_DEV_TORCH_BACKEND="cu128"
@@ -778,6 +785,22 @@ write_profiling_requirements() {
     # TensorRT exactly, and Blackwell wheel availability is the least certain of
     # anything here — baking it in means an unresolvable pin blocks the whole
     # image build. Prove it in a client venv first, then promote it.
+    #
+    # If you are installing the AV perception stack into a client venv, three
+    # constraints are already known — all found the hard way, none CUDA-related:
+    #
+    #   mmcv MUST be 2.1.0, not 2.2.0. mmdet 3.3.0 and mmdet3d 1.4.0 assert
+    #   mmcv < 2.2.0 at IMPORT time. The pin lives only in their 'mim' extra, so
+    #   pip installs 2.2.0 happily and the failure appears later as an
+    #   AssertionError, after a six-minute source build.
+    #
+    #   shapely must be overridden to 2.x. mmdet3d depends on lyft-dataset-sdk,
+    #   which pins shapely 1.8.5.post1, which cannot build on PYTHON 3.12 — it
+    #   uses pkgutil.ImpImporter, removed in 3.12. Install with
+    #   `uv pip install --override <(echo 'shapely>=2.0.0') mmdet3d`.
+    #
+    #   spconv comes from the prebuilt spconv-cu126 wheel. See the CUDA note at
+    #   the top of this file for why that ceiling pins the whole variant.
     mkdir -p "$CONFIG_DIR"
     # Pin the CUDA LINE, not just the version. The bare `tensorrt` package is a
     # meta-package that resolves to the NEWEST CUDA variant available, so it pulled
