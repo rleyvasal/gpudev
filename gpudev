@@ -263,9 +263,23 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
 }
 
 cmd_client_add() {
-    local name="${1:-}"
-    [ -n "$name" ] || fail "Usage: gpudev client add <name>"
+    local name="" variant="default"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --variant)   variant="${2:-}"; shift 2 ;;
+            --variant=*) variant="${1#*=}"; shift ;;
+            -*)          fail "Unknown option '$1'. Usage: gpudev client add <name> [--variant cuda-dev]" ;;
+            *)           [ -z "$name" ] && name="$1" || fail "Unexpected argument '$1'."; shift ;;
+        esac
+    done
+    [ -n "$name" ] || fail "Usage: gpudev client add <name> [--variant cuda-dev]"
+    [ -n "$variant" ] || fail "--variant needs a value (default, cuda-dev)."
     [ -f "$CLIENT_SETUP" ] || fail "client-setup.sh not found at $CLIENT_SETUP"
+
+    case "$variant" in
+        default|cuda-dev) ;;
+        *) fail "Unknown variant '$variant'. Known variants: default, cuda-dev." ;;
+    esac
 
     echo ""
     echo "Paste the SSH public key for client '${name}':"
@@ -273,7 +287,45 @@ cmd_client_add() {
     IFS= read -r ssh_key
     [ -n "$ssh_key" ] || fail "SSH public key is required."
 
-    bash "$CLIENT_SETUP" "$name" "$ssh_key"
+    GPUDEV_VARIANT="$variant" bash "$CLIENT_SETUP" "$name" "$ssh_key"
+}
+
+# ── gpudev image build <variant> ──────────────────────────────────────────────
+
+cmd_image() {
+    local sub="${1:-}" variant="${2:-}"
+    case "$sub" in
+        build)
+            [ -n "$variant" ] || fail "Usage: gpudev image build <default|cuda-dev>"
+            case "$variant" in
+                cuda-dev)
+                    local setup="${REPO_DIR}/linux-setup.sh"
+                    [ -f "$setup" ] || fail "linux-setup.sh not found at $setup (run: gpudev self-update)"
+                    echo "Building the cuda-dev image. This is several GB and takes a while."
+                    bash "$setup" --build-cuda-dev
+                    ;;
+                default)
+                    fail "The default image is built by linux-setup.sh. Re-run it to rebuild."
+                    ;;
+                *) fail "Unknown variant '$variant'. Known variants: cuda-dev." ;;
+            esac
+            ;;
+        list|"")
+            echo "Images:"
+            for img in "gpudev-base:latest" "gpudev-base-cuda-dev:latest"; do
+                if docker_cmd image inspect "$img" >/dev/null 2>&1; then
+                    local size
+                    size="$(docker_cmd image inspect "$img" --format '{{.Size}}' 2>/dev/null || echo 0)"
+                    printf '  %-32s built  (%s GB)\n' "$img" "$(( size / 1000000000 ))"
+                else
+                    printf '  %-32s not built\n' "$img"
+                fi
+            done
+            echo ""
+            echo "  gpudev image build cuda-dev   CUDA 12.8 devel + nvcc/ncu/nsys + TensorRT"
+            ;;
+        *) fail "Usage: gpudev image [list|build <variant>]" ;;
+    esac
 }
 
 # ── gpudev client remove ──────────────────────────────────────────────────────
@@ -1436,8 +1488,10 @@ Host:
 
 Clients:
   gpudev client list
-  gpudev client add <name>
+  gpudev client add <name> [--variant cuda-dev]
   gpudev client invite <name>
+  gpudev image list
+  gpudev image build cuda-dev
   gpudev client remove <name> [--yes]
   gpudev client start <name>
   gpudev client stop <name>
@@ -1481,10 +1535,13 @@ main() {
                 *)      usage; exit 1 ;;
             esac
             ;;
+        image)
+            cmd_image "${2:-}" "${3:-}"
+            ;;
         client)
             case "${2:-}" in
                 list)    cmd_client_list ;;
-                add)     cmd_client_add "${3:-}" ;;
+                add)     shift 2; cmd_client_add "$@" ;;
                 invite)  cmd_client_invite "${3:-}" ;;
                 remove)  cmd_client_remove "${3:-}" "${4:-}" ;;
                 start)   cmd_client_start "${3:-}" ;;

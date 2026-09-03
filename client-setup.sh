@@ -13,6 +13,43 @@ CLIENTS_CONFIG="${CONFIG_DIR}/clients.json"
 BASE_IMAGE="gpudev-base:latest"
 KERNEL_MANAGER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel-manager.sh"
 
+# ── Image variants ────────────────────────────────────────────────────────────
+# GPUDEV_VARIANT selects which base image a client is built on. Empty/"default"
+# keeps the standard image, so every existing caller is unaffected.
+#
+#   default   gpudev-base:latest            python:3.12-slim + torch (no CUDA toolkit)
+#   cuda-dev  gpudev-base-cuda-dev:latest   CUDA 12.8 devel + nvcc/ncu/nsys + TensorRT
+#
+# Build the cuda-dev image first with: gpudev image build cuda-dev
+GPUDEV_VARIANT="${GPUDEV_VARIANT:-default}"
+
+# Shared memory for every client. Docker's 64MB default is far too small for
+# PyTorch DataLoaders: each worker maps shared memory for batch handoff, so
+# multi-worker loading dies with a bus error / "DataLoader worker killed" that
+# names nothing about shm. Raising it is free when unused — it is a ceiling, not
+# an allocation. --ipc=host would also fix it but drops IPC isolation between
+# clients, which is a worse trade on a multi-tenant host.
+CLIENT_SHM_SIZE="${GPUDEV_SHM_SIZE:-8g}"
+
+resolve_variant_image() {
+    case "$1" in
+        ""|default) echo "gpudev-base:latest" ;;
+        cuda-dev)   echo "gpudev-base-cuda-dev:latest" ;;
+        *)          fail "Unknown variant '$1'. Known variants: default, cuda-dev." ;;
+    esac
+}
+
+# Extra docker run flags a variant needs. SYS_ADMIN is granted ONLY to cuda-dev:
+# Nsight Compute needs it to read GPU performance counters from inside a
+# container, but it is close to root on the host, so it must never be the default
+# for ordinary clients.
+variant_run_flags() {
+    case "$1" in
+        cuda-dev) echo "--cap-add=SYS_ADMIN --cap-add=PERFMON" ;;
+        *)        echo "" ;;
+    esac
+}
+
 # Inside every gpudev container the UNIX user is uniform — `gpudev`. The client
 # *identity* (which container, which volume, which DNS hostname) is carried by
 # the container's --name / volume name / cf hostname instead. This makes prompts
@@ -100,6 +137,10 @@ data['clients'].append({
     'name':         '${name}',
     'ssh_port':     int('${ssh_port}'),
     'added_at':     '${added_at}',
+    # Recorded so rebuild/restart put the client back on the SAME image it was
+    # created on. Older records predate this field; readers treat a missing
+    # value as 'default'.
+    'variant':      '${GPUDEV_VARIANT}',
 })
 data['clients'].sort(key=lambda c: c['name'])
 open(path, 'w').write(json.dumps(data, indent=2))
@@ -332,18 +373,27 @@ start_container() {
 
     # --hostname gpudev-<name>: prompt becomes gpudev@gpudev-<name>:~$ after
     # SSH, clearly different from the notebook side.
+    # Word-splitting on $extra_flags is intended: it carries zero or more separate
+    # docker flags, and quoting it would pass them as one bogus argument.
+    local extra_flags
+    extra_flags="$(variant_run_flags "$GPUDEV_VARIANT")"
+    # shellcheck disable=SC2086
     docker run -d \
         --name "$name" \
         --hostname "gpudev-${name}" \
         --gpus all \
+        --shm-size="$CLIENT_SHM_SIZE" \
+        $extra_flags \
         --restart unless-stopped \
         -v "${name}-data:${CONTAINER_HOME}" \
         -p "127.0.0.1:${ssh_port}:22" \
         -e "GPUDEV_CLIENT=${name}" \
+        -e "GPUDEV_VARIANT=${GPUDEV_VARIANT}" \
         "$BASE_IMAGE" \
         "${CONTAINER_HOME}/start.sh"
 
-    log "Container '$name' started."
+    log "Container '$name' started (variant: ${GPUDEV_VARIANT}, shm: ${CLIENT_SHM_SIZE})."
+    [ -n "$extra_flags" ] && log "  Extra capabilities: ${extra_flags}"
 }
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -451,6 +501,13 @@ main() {
 
     CLIENT_NAME="$(sanitize_name "$raw_name")"
     [ -n "$CLIENT_NAME" ] || fail "Invalid client name after sanitization."
+
+    # Resolve the variant BEFORE anything uses $BASE_IMAGE. GPUDEV_VARIANT is set
+    # by `gpudev client add --variant`, and defaults to the standard image.
+    BASE_IMAGE="$(resolve_variant_image "$GPUDEV_VARIANT")"
+    docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || fail "Image '$BASE_IMAGE' not found.
+Variant '${GPUDEV_VARIANT}' needs its image built first:
+  gpudev image build ${GPUDEV_VARIANT}"
 
     require_host_setup
 

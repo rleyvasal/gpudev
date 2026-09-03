@@ -11,6 +11,30 @@ HOST_CONFIG="${CONFIG_DIR}/host.json"
 CLIENTS_CONFIG="${CONFIG_DIR}/clients.json"
 BASE_IMAGE_NAME="gpudev-base"
 BASE_IMAGE_TAG="latest"
+
+# ── cuda-dev variant ──────────────────────────────────────────────────────────
+# An OPT-IN second base image for GPU profiling and custom-CUDA-op work. Not
+# built by default: it is several GB larger and much slower to build than the
+# default base, and most clients never need it.
+#
+# Why a CUDA image at all: the default base is python:3.12-slim and carries NO
+# CUDA toolkit — torch ships its own runtime libraries, which is enough to RUN
+# GPU code but not to compile it. That single gap is why nvcc, nsys and ncu are
+# all missing there: one root cause, three symptoms.
+#
+# Why 12.8 specifically, and why torch is pinned to match: building PyTorch
+# CUDA extensions (mmcv, spconv, mmdetection3d's ops) requires the toolkit to
+# match the CUDA version torch itself was built against. uv's automatic backend
+# selection follows the DRIVER, and on a recent driver it picks cu130 — pairing
+# a 12.8 toolkit with cu130 torch, a major-version mismatch that breaks
+# extension builds in ways that are miserable to diagnose. Pin both sides.
+# 12.8 is also the first CUDA release with sm_120 (Blackwell) support, and is
+# what the mm-ecosystem actually targets today.
+CUDA_DEV_IMAGE_NAME="gpudev-base-cuda-dev"
+CUDA_DEV_BASE_IMAGE="nvidia/cuda:12.8.1-devel-ubuntu24.04"
+CUDA_DEV_TORCH_BACKEND="cu128"
+PROFILING_REQS="${CONFIG_DIR}/requirements-profiling.txt"
+
 HOST_SSH_PORT=52100
 PORT_BASE=52200
 GPU_INVENTORY="${CONFIG_DIR}/gpu-inventory.csv"
@@ -726,6 +750,137 @@ build_base_image() {
     log "Base image built: ${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}"
 }
 
+# ── cuda-dev variant image ────────────────────────────────────────────────────
+
+write_profiling_requirements() {
+    # GENERAL profiling/inference tooling only. Project-specific packages
+    # (nuscenes-devkit, mmcv, mmdetection3d, spconv) deliberately do NOT belong
+    # here: they carry custom CUDA ops you will rebuild repeatedly, and baking
+    # them in means a multi-GB image rebuild per attempt. Install those into the
+    # client's own venv, which lives on its data volume and survives rebuilds.
+    #
+    # torch-tensorrt is also left out on purpose. It must match both torch and
+    # TensorRT exactly, and Blackwell wheel availability is the least certain of
+    # anything here — baking it in means an unresolvable pin blocks the whole
+    # image build. Prove it in a client venv first, then promote it.
+    mkdir -p "$CONFIG_DIR"
+    cat > "$PROFILING_REQS" <<'REQ'
+onnx>=1.17.0
+onnxruntime-gpu>=1.20.0
+tensorrt>=10.0.0
+REQ
+    log "Wrote profiling requirements to ${PROFILING_REQS}"
+}
+
+write_cuda_dev_dockerfile() {
+    local dockerfile="${CONFIG_DIR}/Dockerfile.cuda-dev"
+    # Mirrors the default base image's LAYOUT so client-setup.sh's start.sh runs
+    # unchanged against either image: sshd + ssh-keygen present, /etc/ssh/sshd_config
+    # sed-able, uv at /usr/local/bin, venv at /opt/venv, same profile.d venv hook.
+    #
+    # Two things the default base has are deliberately ABSENT, because start.sh
+    # tolerates both: the pixi/Mojo layer (its seed copy is guarded by
+    # `[ -d "$MOJO_SEED" ]`) and the gpudev user (start.sh useradds it at runtime).
+    # Skipping them keeps this image meaningfully smaller and faster to build.
+    cat > "$dockerfile" <<DOCKERFILE
+# syntax=docker/dockerfile:1
+FROM ${CUDA_DEV_BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        openssh-server \\
+        curl \\
+        ca-certificates \\
+        git \\
+        build-essential \\
+    && rm -rf /var/lib/apt/lists/*
+
+# The CUDA -devel image ships nvcc but NOT the profilers. They come from the same
+# CUDA apt repository the image already trusts, so no extra key setup is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        cuda-nsight-compute-12-8 \\
+        cuda-nsight-systems-12-8 \\
+    && rm -rf /var/lib/apt/lists/*
+
+# sshd login shells do not inherit ENV, so PATH for nvcc/ncu/nsys goes in profile.d.
+RUN printf '%s\\n' \\
+        'export PATH="/usr/local/cuda/bin:/opt/nvidia/nsight-compute:/opt/nvidia/nsight-systems/bin:\$PATH"' \\
+        > /etc/profile.d/05-gpudev-cuda.sh
+ENV PATH="/usr/local/cuda/bin:\${PATH}"
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+ENV UV_HTTP_TIMEOUT=300 \\
+    UV_HTTP_RETRIES=5 \\
+    UV_LINK_MODE=copy
+
+RUN mkdir -p /run/sshd \\
+    && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \\
+    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \\
+    && sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# uv fetches its own standalone CPython, so this does not depend on the base
+# image's system python.
+RUN uv venv /opt/venv --python 3.12 --seed
+
+# torch pinned to ${CUDA_DEV_TORCH_BACKEND} to MATCH the toolkit above. Do not
+# switch this to automatic backend selection: uv follows the driver and would
+# pick a newer CUDA line than the toolkit in this image.
+RUN --mount=type=cache,target=/root/.cache/uv \\
+    uv pip install --python /opt/venv/bin/python \\
+        --torch-backend ${CUDA_DEV_TORCH_BACKEND} \\
+        torch torchvision torchaudio
+
+COPY requirements-base.txt requirements-profiling.txt /tmp/gpudev-req/
+RUN --mount=type=cache,target=/root/.cache/uv \\
+    uv pip install --python /opt/venv/bin/python -r /tmp/gpudev-req/requirements-base.txt
+RUN --mount=type=cache,target=/root/.cache/uv \\
+    uv pip install --python /opt/venv/bin/python -r /tmp/gpudev-req/requirements-profiling.txt
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:\${PATH}"
+
+RUN printf '%s\\n' \\
+        'export VIRTUAL_ENV=/home/gpudev/.venv' \\
+        'export UV_PROJECT_ENVIRONMENT=/home/gpudev/.venv' \\
+        'export PATH="/home/gpudev/.venv/bin:\$PATH"' \\
+        > /etc/profile.d/10-gpudev-venv.sh
+
+EXPOSE 22
+
+CMD ["/usr/sbin/sshd", "-D"]
+DOCKERFILE
+
+    echo "$dockerfile"
+}
+
+build_cuda_dev_image() {
+    write_base_requirements
+    write_profiling_requirements
+
+    local dockerfile
+    dockerfile="$(write_cuda_dev_dockerfile | tail -n1)"
+    [ -f "$dockerfile" ] || fail "cuda-dev Dockerfile not written (got: ${dockerfile:-empty})"
+
+    log "Building ${CUDA_DEV_IMAGE_NAME}:latest from ${CUDA_DEV_BASE_IMAGE}"
+    log "  This is several GB and takes a while — the CUDA toolkit and profilers dominate."
+
+    $DOCKER build \
+        --network=host \
+        -f "$dockerfile" \
+        -t "${CUDA_DEV_IMAGE_NAME}:latest" \
+        "$CONFIG_DIR"
+
+    log "Built ${CUDA_DEV_IMAGE_NAME}:latest"
+    log ""
+    log "Verify the toolchain:"
+    log "  docker run --rm --gpus all ${CUDA_DEV_IMAGE_NAME}:latest bash -lc 'nvcc --version; ncu --version; nsys --version'"
+    log ""
+    log "Create a client on it:"
+    log "  gpudev client add <name> --variant cuda-dev"
+}
+
 # Confirm the base image's torch build can execute a real GPU kernel on every
 # installed card. Merely checking is_available() is insufficient: a wheel can
 # see a device while lacking a kernel image for that device's architecture.
@@ -1380,6 +1535,18 @@ run_health_check() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
+    # Sub-entry point: build ONLY the opt-in cuda-dev variant image. Invoked by
+    # `gpudev image build cuda-dev` on a host that is already set up, so it skips
+    # the full install and just does the docker build.
+    if [ "${1:-}" = "--build-cuda-dev" ]; then
+        assert_not_root
+        detect_environment
+        require_debian_family
+        ensure_docker_running
+        build_cuda_dev_image
+        exit 0
+    fi
+
     assert_not_root
     assert_sudo
     require_debian_family
