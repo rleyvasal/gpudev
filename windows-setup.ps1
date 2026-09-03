@@ -159,6 +159,7 @@ $StateFile      = Join-Path $StateDir 'windows-setup-state.json'
 $ResumeTaskName = 'gpudev-setup-resume'
 $BootTaskName   = 'gpudev-wsl-boot'
 $KeepaliveTaskName = 'gpudev-wsl-keepalive'
+$ColdBootTaskName  = 'gpudev-wsl-coldboot'
 
 # ── Logging helpers (mirror linux-setup.sh) ───────────────────────────────────
 function Step { param([string]$m) Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -821,6 +822,56 @@ function Register-KeepaliveTask {
     }
 }
 
+# ── Cold-boot task (Layer 4: wake WSL with NOBODY signed in) ──────────────────
+function Register-ColdBootTask {
+    # Covers the one case ARSO cannot: a cold boot after POWER LOSS. Windows
+    # stashes the resume credential during an orderly shutdown, so after a power
+    # cut no session is created, the AtLogon tasks never fire, and WSL stays down
+    # until a human signs in. Verified on a real host by pulling the plug: the
+    # first logon of that boot was a person five minutes later, and WSL started
+    # only then — the tunnel answered "websocket: bad handshake" until it did.
+    #
+    # LogonType S4U ("run whether the user is logged on or not") runs as the
+    # operator WITHOUT storing a password. The task gets that user's SID and
+    # profile, which is what WSL needs, since distros are registered per-user
+    # under HKCU — the same reason these tasks cannot run as SYSTEM. The only
+    # other way to close this gap is classic autologin, which costs the account
+    # password as a stored LSA secret plus a Microsoft->local conversion.
+    #
+    # Deliberately a SEPARATE task. gpudev-wsl-boot (AtLogon, Interactive) is
+    # proven and is left untouched, so this is purely additive: if S4U turns out
+    # not to start WSL on some machine, nothing that already worked is lost.
+    #
+    # It repeats as well as firing at startup, because it is also the ONLY
+    # keepalive that runs while nobody is signed in — the Interactive one cannot.
+    $user = $env:USERNAME
+    $action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d $script:Distro --exec /bin/true"
+
+    # Delay the first attempt: wslservice, the Hyper-V platform and the network
+    # stack are not necessarily ready the instant the startup trigger fires.
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT1M'
+    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+        -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 3
+
+    try {
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest
+        Register-ScheduledTask -TaskName $ColdBootTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+        Log "Registered cold-boot task '$ColdBootTaskName' (S4U — runs with nobody signed in)."
+        Log "  Verify by pulling the power, booting, and NOT signing in — the host"
+        Log "  should become reachable on its own within a couple of minutes."
+    } catch {
+        Warn "Could not register the S4U cold-boot task: $_"
+        Warn "  Recovery after POWER LOSS will need a manual sign-in. Restarts and"
+        Warn "  Windows Update reboots are unaffected (ARSO covers those)."
+    }
+}
+
 # ── Host clock (detected and reported; Phase A does not change it) ────────────
 
 # A GPU host that sleeps between sessions free-runs on the CMOS oscillator while
@@ -1045,14 +1096,28 @@ function Invoke-HealthCheck {
         }
     } else { Warn "  Keepalive task (5 min):    not registered" }
 
+    # Reboot recovery has two halves, and they cover different failures:
+    #   a restored LOGON SESSION (autologin / ARSO) makes the AtLogon tasks fire;
+    #   the S4U cold-boot task needs no session at all, which is the only thing
+    #   that helps after a power cut.
+    $coldTask = Get-ScheduledTask -TaskName $ColdBootTaskName -ErrorAction SilentlyContinue
+    $coldOk = ($coldTask -and $coldTask.State -ne 'Disabled' -and $coldTask.Principal.LogonType -eq 'S4U')
+
     $logon = Get-LogonRecovery
     if ($logon.AutoAdminLogon) {
-        Log "  Reboot recovery:           OK (autologin — covers cold boot after power loss too)"
+        Log "  Reboot recovery:           OK (autologin — every boot, power loss included)"
     } elseif ($logon.Arso) {
         Log "  Reboot recovery:           OK (ARSO re-signs in '$env:USERNAME' after a restart)"
-        Log "                             Gap: a cold boot after POWER LOSS still needs a manual sign-in."
     } else {
-        Warn "  Reboot recovery:           NONE — WSL stays down until someone signs in (steps below)"
+        Warn "  Reboot recovery:           no logon restored — restarts need a manual sign-in"
+    }
+
+    if ($coldOk) {
+        Log "  Power-loss recovery:       OK ($ColdBootTaskName, S4U — needs no sign-in)"
+    } elseif ($logon.AutoAdminLogon) {
+        Log "  Power-loss recovery:       OK (autologin covers it)"
+    } else {
+        Warn "  Power-loss recovery:       NONE — after a power cut WSL waits for a sign-in"
     }
 
     $wslconfig = Join-Path $env:USERPROFILE '.wslconfig'
@@ -1122,7 +1187,7 @@ function Invoke-HealthCheck {
         Warn "  Wake-on-LAN:               no wake source armed — the host cannot be woken remotely."
     }
 
-    if (-not ($logon.AutoAdminLogon -or $logon.Arso)) { Show-AutologinHelp }
+    if (-not ($logon.AutoAdminLogon -or $logon.Arso -or $coldOk)) { Show-AutologinHelp }
     if ($clockIssues) { Show-ClockHelp }
 
     Write-Host ""
@@ -1222,6 +1287,9 @@ function Main {
 
     Step "Step 8: Register WSL keepalive task (Layer 3)"
     Register-KeepaliveTask
+
+    Step "Step 9: Register WSL cold-boot task (Layer 4, survives power loss)"
+    Register-ColdBootTask
 
     Unregister-ResumeTask
     Remove-State
