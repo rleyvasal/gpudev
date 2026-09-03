@@ -1435,6 +1435,17 @@ install_gpudev_cli() {
         fi
     done
 
+    pending_updates="$(count_pending_updates)"
+    upd_total="${pending_updates%% *}"; upd_sec="${pending_updates##* }"
+    if [ "${upd_sec:-0}" -gt 0 ] 2>/dev/null; then
+        warn "  OS packages:              ${upd_total} pending, ${upd_sec} SECURITY"
+        warn "                            gpudev does not upgrade the OS. Run: sudo apt upgrade"
+    elif [ "${upd_total:-0}" -gt 0 ] 2>/dev/null; then
+        log "  OS packages:              ${upd_total} pending (none security-flagged)"
+    else
+        log "  OS packages:              OK (up to date)"
+    fi
+
     if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ]; then
         "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG"
     fi
@@ -1614,6 +1625,74 @@ EOF
     mac="$(cat /sys/class/net/${iface}/address 2>/dev/null)"
     log "  wake-on-LAN armed on ${iface} (MAC ${mac}), re-armed at every boot."
     log "    Firmware must also allow it: WoL/PME enabled, ErP disabled."
+}
+
+# ── OS package updates ────────────────────────────────────────────────────────
+
+# gpudev installs the specific packages it needs and deliberately does NOT
+# upgrade the rest of the system. That is a choice, not an oversight: a kernel or
+# NVIDIA package moving underneath a compiled mmcv or spconv is exactly the
+# silent breakage this stack is fragile to, and an upgrade landing mid-run ruins
+# a benchmark.
+#
+# What it must not do is let the backlog go unnoticed. This host terminates a
+# Cloudflare tunnel and runs sshd behind it, so the health check REPORTS pending
+# updates and calls out security ones. Acting on them stays a deliberate act.
+#
+# GPUDEV_AUTO_SECURITY_UPDATES=1 opts into unattended-upgrades restricted to the
+# security pocket, with kernel, NVIDIA and container packages held so the
+# toolchain cannot shift under a build, and automatic reboots off.
+
+# Prints "<total> <security>"; "0 0" when apt cannot be queried.
+count_pending_updates() {
+    local list total sec
+    list="$(apt list --upgradable 2>/dev/null | tail -n +2)" || { echo "0 0"; return; }
+    total="$(printf '%s' "$list" | grep -c . || true)"
+    sec="$(printf '%s' "$list" | grep -ci security || true)"
+    echo "${total:-0} ${sec:-0}"
+}
+
+configure_auto_security_updates() {
+    [ "${GPUDEV_AUTO_SECURITY_UPDATES:-0}" = "1" ] || return 0
+
+    log "Enabling unattended SECURITY updates (opt-in)..."
+    sudo apt-get install -qy unattended-upgrades >/dev/null 2>&1 || {
+        warn "  could not install unattended-upgrades"; return 0; }
+
+    # Security pocket only, and hold everything this stack is pinned against. A
+    # CUDA or driver bump invalidates a compiled mmcv; a docker bump restarts the
+    # daemon and takes every client down with it.
+    sudo tee /etc/apt/apt.conf.d/52gpudev-security >/dev/null <<'CONF'
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+        "${distro_id}ESMApps:${distro_codename}-apps-security";
+        "${distro_id}ESM:${distro_codename}-infra-security";
+};
+
+Unattended-Upgrade::Package-Blacklist {
+        "linux-image";
+        "linux-headers";
+        "linux-generic";
+        "nvidia-";
+        "libnvidia";
+        "cuda";
+        "docker-ce";
+        "containerd";
+};
+
+// A GPU host must never reboot itself: it could land mid-benchmark or mid-build.
+Unattended-Upgrade::Automatic-Reboot "false";
+CONF
+    sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'CONF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+CONF
+    sudo systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+    log "  Security-only updates on; kernel/NVIDIA/docker held, no auto-reboot."
+    if [ "$HOST_ENV" = "wsl2" ]; then
+        warn "  Under WSL2 the apt timers only fire while the distro is running, so"
+        warn "  updates can still lag. Watch the health check."
+    fi
 }
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -1819,6 +1898,7 @@ main() {
 
     step "gpudev Step 10: Configure power management"
     configure_power_management
+    configure_auto_security_updates
 
     # Bare metal only. Each is a no-op under WSL2, where the Windows side owns
     # wake-on-LAN and GPU counters are not reachable from the guest at all.
