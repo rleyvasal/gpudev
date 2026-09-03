@@ -99,6 +99,39 @@ print(client.get(sys.argv[3], "") if client else "")
 PY
 }
 
+# ── Image variants ────────────────────────────────────────────────────────────
+# Mirrors client-setup.sh. A client records its variant in clients.json, so
+# rebuild and restart put it back on the SAME image it was created on. Records
+# written before variants existed have no field, and client_get returns "" for a
+# missing key, so they read as "default" and are unaffected.
+client_variant() {
+    local v
+    v="$(client_get "$1" variant 2>/dev/null)"
+    case "$v" in
+        cuda-dev) echo "cuda-dev" ;;
+        *)        echo "default"  ;;
+    esac
+}
+
+variant_image() {
+    case "$1" in
+        cuda-dev) echo "gpudev-base-cuda-dev:latest" ;;
+        *)        echo "gpudev-base:latest" ;;
+    esac
+}
+
+# SYS_ADMIN is granted only to cuda-dev: Nsight Compute needs it to read GPU
+# counters inside a container, but it is close to root on the host.
+variant_run_flags() {
+    case "$1" in
+        cuda-dev) echo "--cap-add=SYS_ADMIN --cap-add=PERFMON" ;;
+        *)        echo "" ;;
+    esac
+}
+
+# Docker's 64MB default shm kills multi-worker PyTorch DataLoaders.
+CLIENT_SHM_SIZE="${GPUDEV_SHM_SIZE:-8g}"
+
 client_exists() {
     local name="$1"
     python3 -c "
@@ -487,6 +520,11 @@ cmd_client_restart() {
 # ~/.config/user-packages.txt as the recovery net.
 refresh_client_venv() {
     local name="$1" reset="${2:-0}"
+    # The venv is built against a specific image: it records that image's
+    # interpreter path in pyvenv.cfg and overlays that image's /opt/venv. Building
+    # it from the wrong image yields a venv the container cannot use.
+    local venv_image
+    venv_image="$(variant_image "$(client_variant "$name")")"
     if [ "$reset" = "1" ]; then
         log "  Resetting venv from base image + manifest (user files untouched)..."
     else
@@ -495,7 +533,7 @@ refresh_client_venv() {
     docker_cmd run --rm \
         -e "RESET=${reset}" \
         -v "${name}-data:/home/gpudev" \
-        "$BASE_IMAGE" bash -c '
+        "$venv_image" bash -c '
 set -e
 HOME_DIR=/home/gpudev
 VENV="$HOME_DIR/.venv"
@@ -547,7 +585,18 @@ rebuild_one() {
     local ssh_port
     ssh_port="$(client_get "$name" ssh_port)"
 
-    log "Rebuilding '$name' (volume data preserved)..."
+    # Rebuild onto the image this client was CREATED on, not the default. Without
+    # this a cuda-dev client silently drops back to the standard image on rebuild,
+    # losing its toolchain and leaving a venv that references the other image.
+    local variant image extra_flags
+    variant="$(client_variant "$name")"
+    image="$(variant_image "$variant")"
+    extra_flags="$(variant_run_flags "$variant")"
+    docker_cmd image inspect "$image" >/dev/null 2>&1 \
+        || fail "Client '$name' needs image '$image' (variant: $variant), which is not built.
+Build it with: gpudev image build $variant"
+
+    log "Rebuilding '$name' (volume data preserved, variant: $variant)..."
 
     if docker_cmd ps -a --format '{{.Names}}' | grep -qx "$name"; then
         docker_cmd rm -f "$name"
@@ -560,7 +609,7 @@ rebuild_one() {
         docker_cmd run --rm \
             -v "${name}-data:/home/gpudev" \
             -v "${km_src}:/tmp/kernel-manager.sh:ro" \
-            "$BASE_IMAGE" bash -c "
+            "$image" bash -c "
 mkdir -p /home/gpudev/bin
 cp /tmp/kernel-manager.sh /home/gpudev/bin/kernel-manager.sh
 chmod +x /home/gpudev/bin/kernel-manager.sh
@@ -586,15 +635,19 @@ chmod +x /home/gpudev/bin/kernel-manager.sh
     refresh_client_venv "$name" "$reset"
 
     # --hostname gpudev-<name>: prompt becomes gpudev@gpudev-<name>:~$ after SSH.
+    # shellcheck disable=SC2086
     docker_cmd run -d \
         --name "$name" \
         --hostname "gpudev-${name}" \
         --gpus all \
+        --shm-size="$CLIENT_SHM_SIZE" \
+        $extra_flags \
         --restart unless-stopped \
         -v "${name}-data:/home/gpudev" \
         -p "127.0.0.1:${ssh_port}:22" \
         -e "GPUDEV_CLIENT=${name}" \
-        "$BASE_IMAGE" \
+        -e "GPUDEV_VARIANT=${variant}" \
+        "$image" \
         "/home/gpudev/start.sh"
 
     local tries=15
