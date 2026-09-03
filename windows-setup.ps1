@@ -865,6 +865,21 @@ function Get-ClockIssues {
         }
     } catch { }
 
+    # With the 0x9 (SpecialInterval) peer flag that Show-ClockHelp recommends —
+    # and that most published w32tm recipes use — W32Time ignores Min/MaxPoll-
+    # Interval and polls on SpecialPollInterval ALONE. Windows ships 16384 s
+    # (4.5 h) here, which is long enough that the service goes stale between
+    # polls: the peers sit in 'Pending', root dispersion freezes, and the status
+    # reads 'not synchronized' even while the clock is perfectly accurate. That
+    # looks like a broken sync and sends you chasing the wrong thing.
+    try {
+        $spi = [int](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' `
+            -Name SpecialPollInterval -ErrorAction Stop).SpecialPollInterval
+        if ($spi -gt 3600) {
+            $issues += "the NTP poll interval is $spi s ($([math]::Round($spi / 3600, 1)) h) — too long to hold a synchronised clock"
+        }
+    } catch { }
+
     return $issues
 }
 
@@ -882,20 +897,33 @@ function Show-ClockHelp {
     Write-Host "       host to standard time all year, so it runs an hour off in summer:"
     Write-Host "         tzutil /s `"$zone`""
     Write-Host ""
-    Write-Host "    2. Make the time service start automatically and poll real NTP servers:"
+    Write-Host "    2. Make the time service start automatically and poll real NTP servers."
+    Write-Host "       Set SpecialPollInterval too: the '0x9' flag means SpecialInterval, so"
+    Write-Host "       W32Time polls on THAT value alone and ignores Min/MaxPollInterval."
+    Write-Host "       It ships at 16384 s (4.5 h), long enough that the service goes stale"
+    Write-Host "       between polls and reports 'not synchronized' while the clock is fine:"
     Write-Host "         Set-Service W32Time -StartupType Automatic"
     Write-Host "         Start-Service W32Time"
     Write-Host "         w32tm /config /manualpeerlist:`"time.windows.com,0x9 pool.ntp.org,0x9`" /syncfromflags:manual /update"
+    Write-Host "         Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' ``"
+    Write-Host "             -Name SpecialPollInterval -Value 3600 -Type DWord"
     Write-Host "         Restart-Service W32Time"
     Write-Host "         w32tm /resync /force"
     Write-Host ""
-    Write-Host "  Verify — the offset should be well under a second:"
+    Write-Host "  Verify — offset well under a second, and the service vouching for itself:"
     Write-Host "         w32tm /stripchart /computer:time.windows.com /samples:2 /dataonly"
+    Write-Host "         w32tm /query /status   -> Leap Indicator: 0(no warning), Stratum: 2-4"
+    Write-Host "         w32tm /query /peers    -> every peer 'State: Active', not 'Pending'"
     Write-Host ""
-    Write-Host "  'Last Successful Sync Time: unspecified' in 'w32tm /query /status' means"
-    Write-Host "  the host has NEVER synced. The status flag can take a few 17-minute poll"
-    Write-Host "  cycles to read 'synchronized' after the first sync; the offset above is"
-    Write-Host "  the reliable signal."
+    Write-Host "  'Last Successful Sync Time: unspecified' means the host has NEVER synced."
+    Write-Host "  A sync time that stops advancing means the poll interval is too long."
+    Write-Host ""
+    Write-Host "  Unrelated log noise on a WSL2 host: 'VMICTimeProvider ... not supported'"
+    Write-Host "  (event 158) every ~17 min is Hyper-V's GUEST time provider, registered"
+    Write-Host "  because WSL2 enables the hypervisor. It is harmless on a physical host but"
+    Write-Host "  buries real errors. Silence it with:"
+    Write-Host "         Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\VMICTimeProvider' ``"
+    Write-Host "             -Name Enabled -Value 0 -Type DWord; Restart-Service W32Time"
 }
 
 # ── Autologin (manual prerequisite for unattended reboot recovery) ─────────────
