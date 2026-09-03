@@ -22,14 +22,29 @@ BASE_IMAGE_TAG="latest"
 # GPU code but not to compile it. That single gap is why nvcc, nsys and ncu are
 # all missing there: one root cause, three symptoms.
 #
-# Why 12.8 specifically, and why torch is pinned to match: building PyTorch
-# CUDA extensions (mmcv, spconv, mmdetection3d's ops) requires the toolkit to
-# match the CUDA version torch itself was built against. uv's automatic backend
-# selection follows the DRIVER, and on a recent driver it picks cu130 — pairing
-# a 12.8 toolkit with cu130 torch, a major-version mismatch that breaks
-# extension builds in ways that are miserable to diagnose. Pin both sides.
-# 12.8 is also the first CUDA release with sm_120 (Blackwell) support, and is
-# what the mm-ecosystem actually targets today.
+# Why torch is pinned to the toolkit: building PyTorch CUDA extensions (mmcv,
+# spconv, mmdetection3d's ops) requires the toolkit to match the CUDA version
+# torch itself was built against. uv's automatic backend selection follows the
+# DRIVER, and on a recent driver it picks cu130 — pairing a 12.8 toolkit with
+# cu130 torch, a major-version mismatch that breaks extension builds in ways
+# that are miserable to diagnose. Pin both sides, whichever line you choose.
+#
+# Why 12.8 rather than 13.x — measured, not assumed. CUDA 13 is NOT a blocker:
+# mmcv 2.2.0 was built and run successfully on nvidia/cuda:13.0.3-devel with
+# torch 2.14.0+cu130 for sm_120, producing results identical to the 12.8 build.
+# The only obstacle there is a hardcoded compiler flag: mmcv's setup.py sets
+# -std=c++17, while torch 2.14's headers require C++20, so the build dies inside
+# ATen on std::strong_ordering and friends. Patching mmcv's setup.py c++17 ->
+# c++20 (five lines) makes it compile in about 7 minutes.
+#
+# 12.8 is chosen because the CUDA line drags the torch version with it: the
+# cu128 line gives torch 2.11, cu130 gives 2.14. mmcv 2.2.0 predates both, and
+# 2.11 is the shorter jump. mmcv is also the EASIEST package in this stack —
+# spconv, mmdetection3d and torch-tensorrt are more tightly coupled to torch and
+# remain untested on either line. Each is another chance to need a patch, and
+# patches compound. If those turn out to build on torch 2.14, prefer 13.x and
+# collapse to a single CUDA line: the default base already runs cu130, so 12.8
+# is the reason two lines exist at all.
 CUDA_DEV_IMAGE_NAME="gpudev-base-cuda-dev"
 CUDA_DEV_BASE_IMAGE="nvidia/cuda:12.8.1-devel-ubuntu24.04"
 CUDA_DEV_TORCH_BACKEND="cu128"
