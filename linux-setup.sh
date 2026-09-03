@@ -820,8 +820,21 @@ RUN mkdir -p /run/sshd \\
     && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \\
     && sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
 
-# uv fetches its own standalone CPython, so this does not depend on the base
-# image's system python.
+# uv fetches its own standalone CPython here, because this base image has no
+# system Python 3.12 (unlike the default base's python:3.12-slim). By default it
+# lands under /root, which is mode 700 — and containers run as the NON-ROOT
+# gpudev user. Worse, every per-client venv records the interpreter path in its
+# pyvenv.cfg, so a client venv built from such an image is unusable at runtime
+# and fails with "Client venv not found", which points at the venv rather than at
+# the unreadable interpreter behind it.
+#
+# Install managed Pythons somewhere world-readable instead. This MUST be ENV
+# rather than a build-time ARG: client-setup.sh runs \`uv venv\` at RUNTIME from
+# this image to create each client's venv, and that call has to resolve to the
+# same readable location.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv python install 3.12 && chmod -R a+rX /opt/uv-python
+
 RUN uv venv /opt/venv --python 3.12 --seed
 
 # torch pinned to ${CUDA_DEV_TORCH_BACKEND} to MATCH the toolkit above. Do not
