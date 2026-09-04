@@ -1240,30 +1240,98 @@ cmd_cloudflare() {
         echo ""
     fi
 
-    # Edge check: the 502 vs 200 distinction we hit during debugging — useful
-    # enough to surface up-front. Times out fast.
-    if [ -n "$host_cf_hostname" ] && command_exists curl; then
-        echo "── Edge reachability ──"
-        echo ""
-        local code
+    # Edge check. Probes EVERY ingress hostname, not just the host's: a client
+    # whose route never reached the connector is otherwise invisible here — the
+    # container is up, config.yml holds the rule, `systemctl status` is green,
+    # and the only symptom is an ssh error on the notebook machine that names
+    # nothing about tunnels.
+    #
+    # For ssh:// rules this speaks SSH, NOT HTTPS. An HTTPS probe cannot see the
+    # failure it is meant to catch: Cloudflare Access answers at the edge with a
+    # login page (HTTP 200) before the connector is ever consulted, and a
+    # hostname the connector does not serve falls to the `http_status:404`
+    # catch-all — both look "reachable". Reading the origin's SSH banner through
+    # `cloudflared access tcp` is the same path the notebook takes, so it proves
+    # DNS + edge + connector ingress + a live origin sshd. Measured at ~0.6s per
+    # hostname. Hostnames come from config.yml because that is what the
+    # connector actually serves.
+    probe_edge_ssh() {
+        local h="$1" port=$((40000 + RANDOM % 9000)) pid banner=""
+        timeout 20 cloudflared access tcp --hostname "$h" --url "127.0.0.1:${port}" \
+            >/dev/null 2>&1 &
+        pid=$!
+        local i
+        for i in $(seq 1 30); do
+            (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && break
+            sleep 0.3
+        done
+        banner="$(timeout 8 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}; head -c 8 <&3" 2>/dev/null || true)"
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        printf '%s' "$banner"
+    }
+
+    report_edge_http() {
+        local host="$1" label="$2" code
         code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-                "https://${host_cf_hostname}" 2>/dev/null || echo '---')"
+                "https://${host}" 2>/dev/null || echo '---')"
         case "$code" in
             200|301|302|400|401|403|404)
-                echo "  https://${host_cf_hostname} → HTTP $code (tunnel reachable)" ;;
+                echo "  ${label} ${host} → HTTP $code (edge reachable)" ;;
             502|503|504)
-                echo "  https://${host_cf_hostname} → HTTP $code (tunnel up, ORIGIN DOWN — check host sshd:52100)" ;;
+                echo "  ${label} ${host} → HTTP $code (tunnel up, ORIGIN DOWN)" ;;
             530|1033)
-                echo "  https://${host_cf_hostname} → HTTP $code (TUNNEL NOT CONNECTED to Cloudflare)"
-                # 530 for ONE hostname while the connector is up means stale DNS —
-                # see the "DNS route" section above, which names the exact fix.
-                echo "      → see the DNS route section above (likely a stale CNAME)."
-                ;;
+                echo "  ${label} ${host} → HTTP $code (TUNNEL NOT CONNECTED to Cloudflare)"
+                echo "         → see the DNS route section above (likely a stale CNAME)." ;;
             ---|000)
-                echo "  https://${host_cf_hostname} → unreachable / timeout" ;;
+                echo "  ${label} ${host} → unreachable / timeout" ;;
             *)
-                echo "  https://${host_cf_hostname} → HTTP $code" ;;
+                echo "  ${label} ${host} → HTTP $code" ;;
         esac
+    }
+
+    if [ -f "$config_yml" ] && { command_exists cloudflared || command_exists curl; }; then
+        echo "── Edge reachability ──"
+        echo ""
+        local pairs h svc label banner probed=0
+        pairs="$(awk '
+            /^[[:space:]]*-[[:space:]]*hostname:/ { sub(/^[[:space:]]*-[[:space:]]*hostname:[[:space:]]*/, ""); host=$0; next }
+            /^[[:space:]]*service:/ { sub(/^[[:space:]]*service:[[:space:]]*/, "");
+                                      if (host != "") { print host "\t" $0; host="" } }
+        ' "$config_yml")"
+        if [ -z "$pairs" ]; then
+            echo "  (no ingress hostnames in $config_yml)"
+        else
+            while IFS="$(printf '\t')" read -r h svc; do
+                [ -n "$h" ] || continue
+                probed=1
+                if [ "$h" = "$host_cf_hostname" ]; then label="host  "; else label="client"; fi
+                case "$svc" in
+                    ssh://*)
+                        if ! command_exists cloudflared; then
+                            report_edge_http "$h" "$label"
+                            continue
+                        fi
+                        banner="$(probe_edge_ssh "$h")"
+                        case "$banner" in
+                            SSH-2.0*)
+                                echo "  ${label} ${h} → OK (origin sshd answered through the tunnel)" ;;
+                            "")
+                                echo "  ${label} ${h} → NO SSH BANNER — the tunnel does not reach this origin."
+                                echo "         → connector may predate this rule (see Connector 'Config:' above):"
+                                echo "           sudo systemctl restart gpudev-tunnel"
+                                echo "         → or the container is down: gpudev client list" ;;
+                            *)
+                                echo "  ${label} ${h} → unexpected reply through the tunnel: ${banner}" ;;
+                        esac
+                        ;;
+                    *)
+                        if command_exists curl; then report_edge_http "$h" "$label"; fi
+                        ;;
+                esac
+            done <<< "$pairs"
+            [ "$probed" = "1" ] || echo "  (no probeable ingress hostnames)"
+        fi
         echo ""
     fi
 
