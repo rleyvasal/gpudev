@@ -661,6 +661,21 @@ Check network access and the detected GPUs above. Advanced override example:
 
 # ── Step 5: Build base image ──────────────────────────────────────────────────
 
+# BuildKit keeps uv's download/unpack cache between image builds, which makes a
+# retried build cheap. A build interrupted mid-unpack (Ctrl-C, OOM kill, full
+# disk) can leave a truncated entry there, and uv reuses it next build without
+# revalidating, failing on a wheel that is well formed upstream:
+#   error: Failed to install: nvidia_cuda_nvrtc-...whl
+#     Caused by: The wheel is invalid: Invalid Wheel-Version in WHEEL file: None
+# GPUDEV_UV_NO_CACHE=1 drops the cache mount from every uv layer in a generated
+# Dockerfile, so that build refetches each wheel instead. No-op when unset.
+strip_uv_cache_mounts() {
+    local dockerfile="$1"
+    [ "${GPUDEV_UV_NO_CACHE:-0}" = "1" ] || return 0
+    warn "GPUDEV_UV_NO_CACHE=1 — $(basename "$dockerfile") built without uv's BuildKit cache mount (slower; refetches every wheel)."
+    sed -i 's|^RUN --mount=type=cache,target=/root/.cache/uv \\$|RUN \\|' "$dockerfile"
+}
+
 write_dockerfile() {
     local dockerfile="${CONFIG_DIR}/Dockerfile.base"
     cat > "$dockerfile" <<'DOCKERFILE'
@@ -750,6 +765,8 @@ EXPOSE 22
 
 CMD ["/usr/sbin/sshd", "-D"]
 DOCKERFILE
+
+    strip_uv_cache_mounts "$dockerfile"
 
     echo "$dockerfile"
 }
@@ -932,6 +949,8 @@ EXPOSE 22
 
 CMD ["/usr/sbin/sshd", "-D"]
 DOCKERFILE
+
+    strip_uv_cache_mounts "$dockerfile"
 
     echo "$dockerfile"
 }

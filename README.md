@@ -681,6 +681,30 @@ an administrator can override uv's backend explicitly:
 GPUDEV_TORCH_BACKEND=cu128 GPUDEV_ML_REFRESH=1 bash linux-setup.sh
 ```
 
+Docker's BuildKit keeps uv's wheel cache between base-image builds, so a retried
+build is cheap. If a build is interrupted while unpacking, that cache can retain
+a truncated entry and the next build fails on a wheel that is perfectly valid
+upstream:
+
+```
+error: Failed to install: nvidia_cuda_nvrtc-13.0.88-...whl
+  Caused by: The wheel is invalid: Invalid Wheel-Version in WHEEL file: None
+```
+
+Clear the stale cache and rebuild (confirm free disk first — the CUDA wheels
+need roughly 20 GB of headroom under Docker's data root):
+
+```bash
+df -h /var/lib/docker && docker builder prune --filter type=exec.cachemount -f && bash linux-setup.sh
+```
+
+If it still fails, build once with the cache mount disabled so every wheel is
+refetched:
+
+```bash
+GPUDEV_UV_NO_CACHE=1 bash linux-setup.sh
+```
+
 Pre-Turing cards (compute capability below 7.5) are automatically kept on
 PyTorch's CUDA 12.6 legacy backend because CUDA 13 removed library and
 offline-compilation support for those architectures.
