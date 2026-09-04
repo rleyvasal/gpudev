@@ -1346,6 +1346,19 @@ if n and new != text:
 CFPORT
 }
 
+# Hardening edits /etc/ssh and restarts sshd, so it needs real root. The
+# NOPASSWD grant covers only `systemctl restart gpudev-tunnel`, deliberately —
+# it is not a general sudo pass. Say that up front instead of dying on a bare
+# "sudo: A terminal is required to authenticate" halfway through.
+require_interactive_sudo() {
+    local what="$1"
+    sudo -n true 2>/dev/null && return 0
+    [ -t 0 ] && return 0
+    fail "'gpudev ssh ${what}' needs sudo, and this session has no terminal to
+authenticate on. Run it from an interactive shell on the host:
+  gpudev ssh ${what}"
+}
+
 cmd_ssh_status() {
     require_host_setup
     local key port
@@ -1395,6 +1408,7 @@ cmd_ssh_status() {
 
 cmd_ssh_lockdown() {
     require_host_setup
+    require_interactive_sudo "lockdown"
     local key port
     key="$(host_get admin_ssh_key)"
     port="$(host_get host_ssh_port)"
@@ -1463,6 +1477,7 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
 
 cmd_ssh_unlock() {
     require_host_setup
+    require_interactive_sudo "unlock"
     warn "Re-enabling password login and restoring port 22."
     set_sshd_option "PasswordAuthentication" "yes"
     if ! sudo sshd -t 2>/dev/null; then

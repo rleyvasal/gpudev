@@ -110,35 +110,41 @@ It will ask for:
 | Prompt | What to give it |
 |---|---|
 | `Cloudflare domain` | the domain managed in your Cloudflare account, e.g. `example.com` |
-| `Paste the admin SSH public key` | the contents of `~/.ssh/gpudev-admin.pub` |
 | `sudo` password | your user password, for apt installs and `/etc` writes |
 
-For the key prompt, print it on your laptop and paste — you are in an SSH
-session, so the clipboard works:
-
-```bash
-cat ~/.ssh/gpudev-admin.pub
-```
-
-Give it the **`.pub`** file. It is one line beginning `ssh-ed25519`. Never paste
-the file without the `.pub` extension; that is your private key.
-
-> This is the same key `ssh-copy-id` already installed. The installer records it
-> in `host.json` so `gpudev` can manage SSH access later, and re-adds it to
-> `authorized_keys` (harmless if already present).
+It does **not** ask for your SSH key here. Step 2 already put it in
+`authorized_keys`, and the final phase picks it up from there.
 
 The run takes a while — it installs Docker and the NVIDIA container toolkit,
 resolves a PyTorch build matched to your GPU, and builds the base image
 (several GB). It finishes by verifying a real CUDA kernel on every GPU.
 
+### The last phase: admin setup
+
+The installer ends with **Step 11: Admin setup**. It finds the key
+`ssh-copy-id` installed, shows its fingerprint, records it in `host.json`, and
+wraps it so `ssh gpudev sleep` and `ssh gpudev reboot` work.
+
+Then it hands over to `gpudev ssh lockdown`, which disables password login and
+sets the port — but **only after confirming a key actually works**. If you are
+connected over the key from step 3, that is already proven and it proceeds
+silently. Otherwise it asks you to run `ssh gpudev` from another terminal and
+waits.
+
+If it cannot confirm, it changes nothing and tells you to run
+`gpudev ssh lockdown` later. Password login stays on rather than being disabled
+against an unverified key.
+
+> Unattended installs: pass `--no-lockdown` to skip the phase entirely.
+
 ### What it changes
 
 - installs Docker + NVIDIA Container Toolkit, adds you to the `docker` group
 - builds the `gpudev-base` image
-- **sshd: sets a non-default port, `PubkeyAuthentication yes`,
-  `PasswordAuthentication no`**
 - creates a Cloudflare tunnel and a systemd unit for it
 - configures wake-on-LAN and disables lid/idle suspend
+- **sshd, in the final phase only: port 52100, `PubkeyAuthentication yes`,
+  `PasswordAuthentication no`**
 
 ---
 
@@ -148,19 +154,23 @@ The installer moved sshd off port 22, so your `ssh gpudev` alias needs its
 `Port` line updated — one line, while the rest of the block from step 3 stays
 as it is.
 
-> **TODO — confirm the port.** `linux-setup.sh` writes `Port 52100` into
-> `sshd_config`, but Ubuntu 24.04 ships `ssh.socket` activation, which ignores
-> that setting. On at least one install both `22` and `52100` answered. Run this
-> **on the host, before you disconnect**, and use what it reports:
->
-> ```bash
-> systemctl is-enabled ssh.socket 2>/dev/null; ss -ltnp | grep -E ':(22|52100)\b'
-> ```
+The port is **52100**.
+
+Ubuntu 24.04 activates sshd through `ssh.socket`, but `sshd_config` is still
+authoritative: `openssh-server` ships a `sshd-socket-generator` that reads
+`Port` and regenerates the socket's listener from it. Verified on a live
+install — only 52100 listens, and 22 does not.
+
+Confirm on your own host before disconnecting if you want to be sure:
+
+```bash
+gpudev ssh status
+```
 
 Edit the one line on your laptop:
 
 ```
-  Port <PORT — see TODO above>
+  Port 52100
 ```
 
 Keep the old session open until the new one works. If `ssh gpudev` fails, the
@@ -199,9 +209,20 @@ Everything above is recoverable from the physical console, which is never
 affected by sshd config:
 
 1. Log in at the console.
-2. Re-enable passwords temporarily:
-   `sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config && sudo systemctl restart ssh`
-3. Fix the key, then set it back to `no`.
+2. Re-enable passwords and restore port 22:
+
+   ```bash
+   gpudev ssh unlock
+   ```
+
+3. Fix the key from a normal session, then re-run:
+
+   ```bash
+   gpudev ssh lockdown
+   ```
+
+`unlock` is the supported path — it puts `sshd_config` back and reloads the
+socket generator, rather than leaving a hand-edited config behind.
 
 ---
 
