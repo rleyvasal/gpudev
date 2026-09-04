@@ -185,36 +185,129 @@ p.write_text(content)
     # session mid-setup and aborts the add before the container is built (that was
     # the original bug, and SIGHUP proved no gentler). The connector only needs the
     # new ingress once everything else is done, so we defer the reload to the very
-    # end of main() and run it DETACHED (schedule_tunnel_reload), where a dropped
+    # end of main() and run it DETACHED (reload_tunnel_connector), where a dropped
     # session can no longer interrupt anything.
     NEED_TUNNEL_RELOAD=1
     RELOAD_TUNNEL_NAME="$tunnel_name"
     log "Ingress rule staged; tunnel reload deferred to the end (keeps this session alive during setup)."
 }
 
-# Reload the connector so the new ingress route takes effect — as the LAST thing,
-# and DETACHED. cloudflared re-dials its edge on reload, which drops tunnel
-# connections (including this SSH session if it rides the tunnel). Detaching with a
-# short delay lets `gpudev client add` fully finish and return first, so the client
-# is already created and the operator sees complete output before the brief drop.
-schedule_tunnel_reload() {
+# Restarting the connector drops every connection it carries — but ONLY those.
+# cloudflared dials sshd on localhost, so a session riding the tunnel reports
+# 127.0.0.1 as its peer, while a LAN or console session reports a real address.
+# Measured on the host:
+#   tunnel -> SSH_CONNECTION="127.0.0.1 55396 127.0.0.1 52100"
+#   LAN    -> SSH_CONNECTION="192.168.10.59 51214 192.168.10.80 52100"
+# Only the first case needs the deferred/detached dance; everywhere else the
+# reload can run inline and be VERIFIED before the command returns.
+session_rides_tunnel() {
+    case "${SSH_CONNECTION%% *}" in
+        127.0.0.1|::1) return 0 ;;
+        *)             return 1 ;;
+    esac
+}
+
+# The connector must have started AFTER the last ingress edit. If config.yml is
+# newer than the service's start time, cloudflared is still serving the rules it
+# loaded at boot and the newest client's hostname answers "websocket: bad
+# handshake" — exactly the silent failure this whole path exists to prevent.
+connector_is_current() {
+    local config_yml="${HOME}/.cloudflared/config.yml" ts started changed
+    [ -f "$config_yml" ] || return 0
+    command_exists systemctl || return 0
+    ts="$(systemctl show gpudev-tunnel -p ActiveEnterTimestamp --value 2>/dev/null)"
+    [ -n "$ts" ] || return 0
+    started="$(date -d "$ts" +%s 2>/dev/null)" || return 0
+    changed="$(stat -c %Y "$config_yml" 2>/dev/null)" || return 0
+    [ "$started" -ge "$changed" ]
+}
+
+# A host set up before the NOPASSWD grant existed should become self-sufficient
+# at the first client change rather than needing a full linux-setup.sh re-run.
+# Costs one interactive sudo; skipped silently when there is no TTY to ask on.
+install_tunnel_reload_grant() {
+    local sudoers_file="/etc/sudoers.d/gpudev-tunnel" user="${USER:-$(whoami)}"
+    [ -t 0 ] || return 1
+    log "Installing a NOPASSWD grant so future reloads need no password..."
+    sudo tee "$sudoers_file" >/dev/null <<EOF || return 1
+# gpudev: allow ${user} to reload the tunnel connector after a client change.
+${user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart gpudev-tunnel, /bin/systemctl restart gpudev-tunnel
+EOF
+    sudo chmod 440 "$sudoers_file" || return 1
+    if sudo visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        log "  sudoers: reloads no longer prompt for a password."
+        return 0
+    fi
+    warn "tunnel sudoers file failed validation — removing it to avoid breaking sudo."
+    sudo rm -f "$sudoers_file"
+    return 1
+}
+
+reload_tunnel_connector() {
     local tunnel_name="$1"
     echo ""
-    step "Applying tunnel route"
-    log "The client is fully created. Reloading the cloudflared connector to route it"
-    log "(detached, in a few seconds). This briefly drops tunnel connections — if you"
-    log "are connected via 'ssh gpudev', this shell will drop; just reconnect."
-    if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
-            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
-    else
+
+    # Legacy non-systemd connector: unchanged detached pkill+respawn.
+    if ! command_exists systemctl || ! systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+        log "Reloading the cloudflared connector (detached, no systemd unit)."
         setsid bash -c "sleep 3
 pkill -f 'cloudflared tunnel run ${tunnel_name}' 2>/dev/null
 sleep 1
 nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log' 2>&1" \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
+        log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
+        return 0
     fi
-    log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
+
+    if session_rides_tunnel; then
+        # Restarting now would kill this very shell mid-command. Defer + detach,
+        # but the detached process has NO TTY, so it can only use `sudo -n`:
+        # make sure that will work before walking away from it.
+        if ! sudo -n systemctl show gpudev-tunnel >/dev/null 2>&1; then
+            install_tunnel_reload_grant || true
+        fi
+        if ! sudo -n systemctl show gpudev-tunnel >/dev/null 2>&1; then
+            warn "Ingress updated, but the connector still serves the OLD config and this"
+            warn "shell rides the tunnel, so the reload cannot run unattended."
+            warn "Run this on the host (console or LAN ssh) to finish:"
+            warn "  sudo systemctl restart gpudev-tunnel"
+            return 0
+        fi
+        log "This shell rides the connector, so the restart is deferred a few seconds."
+        log "The session will drop — reconnect and the new hostname is live."
+        setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
+            >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
+        return 0
+    fi
+
+    # Not riding the tunnel: restart inline and prove it worked.
+    log "Restarting the cloudflared connector to publish the new ingress..."
+    if ! sudo -n systemctl restart gpudev-tunnel 2>/dev/null; then
+        if [ -t 0 ]; then
+            install_tunnel_reload_grant || true
+            sudo systemctl restart gpudev-tunnel || {
+                warn "Could not restart gpudev-tunnel. Run: sudo systemctl restart gpudev-tunnel"
+                return 0
+            }
+        else
+            warn "Ingress updated, but restarting the connector needs a password."
+            warn "Run this on the host to finish:"
+            warn "  sudo systemctl restart gpudev-tunnel"
+            return 0
+        fi
+    fi
+
+    local tries=20
+    while [ $tries -gt 0 ]; do
+        if systemctl is-active gpudev-tunnel >/dev/null 2>&1 && connector_is_current; then
+            log "Connector reloaded and serving the new ingress."
+            return 0
+        fi
+        sleep 1
+        tries=$((tries - 1))
+    done
+    warn "Connector did not report current within 20s."
+    warn "Check: systemctl status gpudev-tunnel"
 }
 
 # ── Container init ────────────────────────────────────────────────────────────
@@ -592,9 +685,9 @@ Variant '${GPUDEV_VARIANT}' needs its image built first:
     fi
 
     # Reload the connector LAST and detached, so applying the new route can't drop
-    # this session before the client is built (see schedule_tunnel_reload).
+    # this session before the client is built (see reload_tunnel_connector).
     if [ "${NEED_TUNNEL_RELOAD:-0}" = "1" ]; then
-        schedule_tunnel_reload "$RELOAD_TUNNEL_NAME"
+        reload_tunnel_connector "$RELOAD_TUNNEL_NAME"
     fi
 }
 
