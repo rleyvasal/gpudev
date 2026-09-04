@@ -47,6 +47,20 @@ class LinuxSetupTests(unittest.TestCase):
                 if re.match(r"^\s*\[ .* \] && ", line) and lines[i + 1].startswith("}"):
                     self.fail(f"{name}:{i + 1} ends a function with an AND-list: {line.strip()}")
 
+    def test_admin_key_presence_matches_the_wrapped_entry(self):
+        # gpudev-ssh-dispatch rewrites the admin entry as
+        #   command="<dispatcher>" ssh-ed25519 <blob> <comment>
+        # so a whole-line match can never hit once that wrapper is installed,
+        # and the installer would append a second UNWRAPPED copy of the key.
+        # sshd honours the first matching line, so the bare duplicate silently
+        # disables the ssh-gpudev shortcuts.
+        body = function_body("setup_host_ssh")
+        self.assertNotIn('grep -qxF "$ADMIN_SSH_KEY"', body)
+        self.assertIn("admin_key_present", body)
+        # Must compare the key's type and blob fields, not the raw line.
+        self.assertIn("awk '{print $1}'", body)
+        self.assertIn("awk '{print $2}'", body)
+
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a
         # host where docker-group membership already grants access.

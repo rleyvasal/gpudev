@@ -1209,11 +1209,29 @@ setup_host_ssh() {
 
     sudo mkdir -p /run/sshd
 
-    # Add admin key to authorized_keys
+    # Add admin key to authorized_keys.
+    #
+    # Match on the key's TYPE + BLOB, never the whole line. gpudev-ssh-dispatch
+    # rewrites this entry as `command="<dispatcher>" <key>`, so a whole-line
+    # match (grep -qxF) can never hit once that wrapper is installed — and this
+    # re-run would then append a SECOND, unwrapped copy of the same key. sshd
+    # honours the FIRST matching line, so a bare entry landing above the wrapped
+    # one silently disables the `ssh gpudev sleep|reboot` shortcuts. Same
+    # predicate gpudev-ssh-dispatch uses when it replaces the entry, so the two
+    # agree on what "this key is already here" means.
     mkdir -p "${HOME}/.ssh"
     touch "${HOME}/.ssh/authorized_keys"
-    grep -qxF "$ADMIN_SSH_KEY" "${HOME}/.ssh/authorized_keys" \
-        || echo "$ADMIN_SSH_KEY" >> "${HOME}/.ssh/authorized_keys"
+    admin_key_present() {
+        local file="$1" type blob
+        type="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $1}')"
+        blob="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $2}')"
+        [ -n "$type" ] && [ -n "$blob" ] || return 1
+        awk -v t="$type" -v b="$blob" \
+            'index($0, t) && index($0, b) { found = 1 } END { exit !found }' "$file"
+    }
+    if ! admin_key_present "${HOME}/.ssh/authorized_keys"; then
+        echo "$ADMIN_SSH_KEY" >> "${HOME}/.ssh/authorized_keys"
+    fi
     chmod 700 "${HOME}/.ssh"
     chmod 600 "${HOME}/.ssh/authorized_keys"
 
