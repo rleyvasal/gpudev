@@ -2170,6 +2170,12 @@ def gpu_setup(line):
     # attach a copy control to it, which matters because this line is long
     # enough that a hand-selection tends to clip the trailing quote.
     if _HAS_RICH_DISPLAY:
+        # print() writes to a buffered OutStream that flushes on a timer, while
+        # display() publishes immediately — so without this the fenced block
+        # jumps ahead of every preceding line and lands at the top of the cell,
+        # leaving a gap where it belongs. Flush the stream first so the two
+        # arrive in the order they were written.
+        sys.stdout.flush()
         display(Markdown(f"```bash\n{admin_cmd}\n```"))
     else:
         print(f"  {admin_cmd}")
