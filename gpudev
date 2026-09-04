@@ -469,6 +469,37 @@ cmd_image() {
 
 # ── gpudev client remove ──────────────────────────────────────────────────────
 
+# cloudflared's own credential already carries DNS-capable API access: the
+# `cloudflared tunnel login` origin cert at ~/.cloudflared/cert.pem holds an
+# ARGO TUNNEL TOKEN block whose payload is {accountID, apiToken, zoneID}. That
+# is exactly how `tunnel route dns` creates a CNAME with no API token
+# configured — so requiring the operator to mint a second Zone.DNS token in the
+# dashboard just to DELETE what cloudflared created was busywork.
+#
+# cloudflared exposes no delete verb (`tunnel route dns` has only
+# --overwrite-dns), which is why removal has to call the API directly. It can
+# use these credentials to do it. Prints "<token> <zone_id>"; empty on failure.
+cf_creds_from_cert() {
+    local cert="${HOME}/.cloudflared/cert.pem"
+    [ -f "$cert" ] || return 1
+    python3 - "$cert" <<'PYCERT'
+import base64, json, pathlib, re, sys
+try:
+    text = pathlib.Path(sys.argv[1]).read_text()
+    m = re.search(r"-----BEGIN ARGO TUNNEL TOKEN-----(.*?)-----END ARGO TUNNEL TOKEN-----",
+                  text, re.S)
+    if not m:
+        raise SystemExit(1)
+    d = json.loads(base64.b64decode(re.sub(r"\s", "", m.group(1))))
+    token, zone = d.get("apiToken", ""), d.get("zoneID", "")
+    if not token or not zone:
+        raise SystemExit(1)
+    print(f"{token} {zone}")
+except Exception:
+    raise SystemExit(1)
+PYCERT
+}
+
 cmd_client_remove() {
     local name="${1:-}" confirm="${2:-}"
     [ -n "$name" ] || fail "Usage: gpudev client remove <name> [--yes]"
@@ -532,15 +563,31 @@ p.write_text(''.join(out))
         _need_tunnel_reload=1
     fi
 
-    # Remove Cloudflare DNS record via API
-    local cf_api_token cf_zone_id
+    # Remove Cloudflare DNS record via API. Prefer an explicitly configured
+    # token, but fall back to the credential cloudflared already has — so a
+    # normal install needs no dashboard step at all.
+    local cf_api_token cf_zone_id cf_creds cf_token_source
     cf_api_token="$(host_get cf_api_token)"
+    cf_zone_id=""
+    cf_token_source="host.json"
+    if [ -z "$cf_api_token" ]; then
+        cf_creds="$(cf_creds_from_cert 2>/dev/null || true)"
+        if [ -n "$cf_creds" ]; then
+            cf_api_token="${cf_creds%% *}"
+            cf_zone_id="${cf_creds##* }"
+            cf_token_source="cloudflared cert.pem"
+        fi
+    fi
     if [ -n "$cf_api_token" ]; then
+        log "Deleting DNS via Cloudflare API (credentials: ${cf_token_source})."
+        # cert.pem already names the zone; only look it up when it did not.
+        if [ -z "$cf_zone_id" ]; then
         cf_zone_id="$(curl -sf \
             -H "Authorization: Bearer ${cf_api_token}" \
             -H "Content-Type: application/json" \
             "https://api.cloudflare.com/client/v4/zones?name=${cf_domain}&status=active" \
             | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+        fi
 
         if [ -n "$cf_zone_id" ]; then
             local record_id
@@ -562,12 +609,11 @@ p.write_text(''.join(out))
             warn "Could not resolve zone ID for $cf_domain — delete DNS record manually."
         fi
     else
-        warn "No cf_api_token in host.json — cannot auto-delete DNS for $cf_hostname."
-        warn "  Option A: Cloudflare dashboard → DNS → delete CNAME $cf_hostname"
-        warn "  Option B: store a Zone.DNS Edit token, then re-run remove:"
-        warn "    gpudev cloudflare token-set   # pastes into host.json"
-        warn "  Create token: https://dash.cloudflare.com/profile/api-tokens"
-        warn "    Template 'Edit zone DNS' → only zone: $cf_domain"
+        warn "No usable Cloudflare credentials — cannot auto-delete DNS for $cf_hostname."
+        warn "  Expected an apiToken in ~/.cloudflared/cert.pem (written by"
+        warn "  'cloudflared tunnel login'), or cf_api_token in host.json."
+        warn "  Delete the CNAME in the Cloudflare dashboard, or re-run:"
+        warn "    gpudev cloudflare token-set"
     fi
 
     remove_client_from_registry "$name"
