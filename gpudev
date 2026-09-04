@@ -1648,22 +1648,82 @@ cmd_self_update() {
     if [ -d "${repo_dir}/.git" ]; then
         log "Updating ${repo_dir} via git pull..."
         ( cd "$repo_dir" && git pull --ff-only ) || fail "git pull failed in ${repo_dir}."
+        ( cd "$repo_dir" && git rev-parse HEAD 2>/dev/null ) \
+            > "${repo_dir}/.self-update-sha" 2>/dev/null \
+            || rm -f "${repo_dir}/.self-update-sha"
     else
+        # Pin the download to a resolved COMMIT SHA, never the branch name.
+        # raw.githubusercontent.com serves branch URLs through a CDN with a
+        # multi-minute TTL, so `.../main/gpudev` can still return the previous
+        # commit's bytes right after a push. self-update then reported
+        # "scripts updated" while installing the OLD file — a silent no-op that
+        # claims success (observed: a fix took ~140s to appear on the branch
+        # URL). A SHA-pinned path is immutable, so what comes back is either
+        # that exact commit or an error.
         local repo_raw="${GPUDEV_REPO_RAW:-https://raw.githubusercontent.com/rleyvasal/gpudev/main}"
-        log "Downloading latest host scripts from ${repo_raw}..."
         command_exists curl || fail "curl is required for self-update on non-git installs."
+
+        # Derive owner/repo/ref from the raw base URL so GPUDEV_REPO_RAW keeps working.
+        local repo_path="${repo_raw#https://raw.githubusercontent.com/}"
+        local repo_slug="${GPUDEV_REPO_SLUG:-}" repo_ref="${GPUDEV_REPO_REF:-}"
+        # Only parse owner/repo/ref out of a real raw.githubusercontent.com URL.
+        # A custom mirror leaves repo_path == repo_raw, and slicing that on "/"
+        # yields nonsense like "https:/" in the warning below.
+        if [ -z "$repo_slug" ] && [ "$repo_path" != "$repo_raw" ]; then
+            repo_slug="$(printf '%s' "$repo_path" | cut -d/ -f1-2)"
+            if [ -z "$repo_ref" ]; then
+                repo_ref="$(printf '%s' "$repo_path" | cut -d/ -f3)"
+            fi
+        fi
+        [ -n "$repo_ref" ] || repo_ref="main"
+
+        local sha="" base
+        if [ -n "$repo_slug" ] && command_exists python3; then
+            sha="$(curl -fsSL --max-time 15 \
+                    "https://api.github.com/repos/${repo_slug}/commits/${repo_ref}" 2>/dev/null \
+                  | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["sha"])
+except Exception: pass' 2>/dev/null || true)"
+        fi
+
+        if [ -n "$sha" ]; then
+            base="https://raw.githubusercontent.com/${repo_slug}/${sha}"
+            log "Downloading host scripts from ${repo_slug} @ ${sha:0:7} (SHA-pinned)..."
+        else
+            base="$repo_raw"
+            warn "Could not resolve a commit SHA for ${repo_slug:-$repo_raw}."
+            warn "Falling back to the unpinned URL, which a CDN may serve stale."
+            warn "If a just-pushed change is missing, re-run self-update in a few minutes."
+            log "Downloading host scripts from ${base}..."
+        fi
+
         local f tmp
         for f in linux-setup.sh gpudev gpudev-ssh-dispatch client-setup.sh kernel-manager.sh; do
             tmp="$(mktemp)"
-            if curl -fsSL "${repo_raw}/${f}" -o "$tmp"; then
-                chmod +x "$tmp"
-                mv -f "$tmp" "${repo_dir}/${f}"
-                log "  Updated: ${repo_dir}/${f}"
-            else
+            if ! curl -fsSL --max-time 60 "${base}/${f}" -o "$tmp"; then
                 rm -f "$tmp"
-                fail "Failed to download ${f}."
+                fail "Failed to download ${f} from ${base}."
             fi
+            # A CDN error page or a truncated body is still a 200 with bytes in
+            # it; every file here is a shell script, so require the shebang and
+            # a plausible size before it can replace a working script.
+            if [ "$(head -c2 "$tmp" 2>/dev/null)" != "#!" ] || [ ! -s "$tmp" ]; then
+                rm -f "$tmp"
+                fail "Downloaded ${f} does not look like a script — refusing to install it."
+            fi
+            chmod +x "$tmp"
+            mv -f "$tmp" "${repo_dir}/${f}"
+            log "  Updated: ${repo_dir}/${f}"
         done
+        # Not `[ -n ... ] && ...`: as the last statement of this branch an empty
+        # sha would make the AND-list return non-zero and trip `set -e`.
+        if [ -n "$sha" ]; then
+            printf '%s\n' "$sha" > "${repo_dir}/.self-update-sha"
+        else
+            # Drop a marker from an earlier pinned run: this run could not verify
+            # which commit it installed, so it must not report one.
+            rm -f "${repo_dir}/.self-update-sha"
+        fi
     fi
 
     # Deploy CLI scripts from REPO_DIR into ~/bin using atomic mv. Never cp
@@ -1699,7 +1759,11 @@ cmd_self_update() {
     fi
 
     echo ""
-    echo "gpudev scripts updated."
+    if [ -f "${repo_dir}/.self-update-sha" ]; then
+        echo "gpudev scripts updated (commit $(cut -c1-7 "${repo_dir}/.self-update-sha"))."
+    else
+        echo "gpudev scripts updated."
+    fi
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
