@@ -1158,6 +1158,8 @@ cmd_status() {
     # Listing every other lifecycle verb but not remove reads as "there is no
     # way to remove a client", which is worse than the line it saves.
     echo "  gpudev client remove <name>  delete a client AND its data volume"
+    echo "  gpudev client stop|start <n> stop or start a client container"
+    echo "  gpudev image build cuda-dev  build the profiling image (nvcc/ncu/nsys)"
     echo "  gpudev client logs <name>    tail a client's container logs"
     echo "  gpudev kernel doctor <name>  diagnose a stuck/silent kernel"
     echo "  gpudev gpu                   full nvidia-smi"
@@ -2229,6 +2231,11 @@ Status:
   gpudev gpu
   gpudev cloudflare [status|token-set]
   gpudev disk
+
+SSH / host access:
+  gpudev ssh status
+  gpudev ssh lockdown [--force]
+  gpudev ssh unlock
 
 Power:
   gpudev power setup
