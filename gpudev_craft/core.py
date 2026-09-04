@@ -2148,54 +2148,78 @@ def gpu_setup(line):
         print(f"gpudev client setup failed: {e}")
         return
 
-    select_client(result.name)
-    print("Local gpudev client setup is ready")
-    print(f"  SSH alias:   {result.ssh_alias}")
-    if result.ssh_config_written:
-        print(f"  Endpoint:    {result.hostname}")
-    print(f"  Private key: {result.private_key} (kept only on this client)")
-    print("")
-    # Print the administrator's COMMAND, not a bare key. The user forwards one
-    # line and the administrator pastes one line: nobody has to select a key out
-    # of surrounding output, and nobody has to decide which prompt it goes in.
-    # A public key is not a secret, so putting it on a command line is fine.
-    print("Send this line to your gpudev administrator:")
-    print("")
     variant_arg = f" --variant {variant}" if variant != "default" else ""
     admin_cmd = (
         f'gpudev client add {result.name}{variant_arg} '
         f'--key "{result.public_key_text}"'
     )
-    # A fenced block in a notebook is visually unmistakable and most frontends
-    # attach a copy control to it, which matters because this line is long
-    # enough that a hand-selection tends to clip the trailing quote.
-    if _HAS_RICH_DISPLAY:
-        # print() writes to a buffered OutStream that flushes on a timer, while
-        # display() publishes immediately — so without this the fenced block
-        # jumps ahead of every preceding line and lands at the top of the cell,
-        # leaving a gap where it belongs. Flush the stream first so the two
-        # arrive in the order they were written.
-        sys.stdout.flush()
-        display(Markdown(f"```bash\n{admin_cmd}\n```"))
-    else:
-        print(f"  {admin_cmd}")
-    print("")
-    if variant == "cuda-dev":
-        # Make the privilege visible where it is approved. cuda-dev grants
-        # SYS_ADMIN, which client-setup.sh notes is "close to root on the host".
-        # The administrator can drop the flag before running the line.
-        print("  (cuda-dev adds nvcc/ncu/nsys/TensorRT and grants SYS_ADMIN +")
-        print("   PERFMON to the container — drop --variant for a standard client)")
-        print("")
-    if result.ssh_config_written:
-        print("After the administrator confirms, connect with:")
-        print(f"  %gpu {result.name}")
-    else:
-        print("SSH config not written yet — this client's hostname is not known.")
-        print("When the administrator confirms, connect with:")
-        print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
-        print("(the administrator's `client add` prints the exact line)")
 
+    # Build the whole report as ONE output. Interleaving print() with display()
+    # put the fenced block at the top of the cell, above lines printed before
+    # it: the notebook orders rich output ahead of stream text, and flushing
+    # stdout first did not change that. With a single display there is nothing
+    # to race. select_client() prints, so it runs after this rather than before.
+    #
+    # The command is fenced because it is long — a name, a variant and a full
+    # public key — and hand-selecting it tends to clip the trailing quote,
+    # which then fails at `client add` looking like a key problem.
+    endpoint = f"\n- Endpoint: `{result.hostname}`" if result.ssh_config_written else ""
+    note = ""
+    if variant == "cuda-dev":
+        # Make the privilege visible where it is approved: cuda-dev grants
+        # SYS_ADMIN, which client-setup.sh calls "close to root on the host".
+        note = (
+            "\n_cuda-dev adds nvcc/ncu/nsys/TensorRT and grants SYS_ADMIN + "
+            "PERFMON to the container — drop `--variant` for a standard client._\n"
+        )
+    if result.ssh_config_written:
+        closing = (
+            f"After the administrator confirms, connect with:\n\n"
+            f"```\n%gpu {result.name}\n```"
+        )
+    else:
+        closing = (
+            "SSH config not written yet — this client's hostname is not known.\n\n"
+            "When the administrator confirms, connect with the line their "
+            "`client add` prints:\n\n"
+            f"```\n%gpu {result.name} --hostname {result.name}.<their-domain>\n```"
+        )
+
+    if _HAS_RICH_DISPLAY:
+        display(Markdown(
+            f"**Local gpudev client setup is ready**\n\n"
+            f"- SSH alias: `{result.ssh_alias}`{endpoint}\n"
+            f"- Private key: `{result.private_key}` (kept only on this client)\n\n"
+            f"Send this line to your gpudev administrator:\n\n"
+            f"```bash\n{admin_cmd}\n```\n"
+            f"{note}\n"
+            f"{closing}"
+        ))
+    else:
+        print("Local gpudev client setup is ready")
+        print(f"  SSH alias:   {result.ssh_alias}")
+        if result.ssh_config_written:
+            print(f"  Endpoint:    {result.hostname}")
+        print(f"  Private key: {result.private_key} (kept only on this client)")
+        print("")
+        print("Send this line to your gpudev administrator:")
+        print("")
+        print(f"  {admin_cmd}")
+        print("")
+        if variant == "cuda-dev":
+            print("  (cuda-dev adds nvcc/ncu/nsys/TensorRT and grants SYS_ADMIN +")
+            print("   PERFMON to the container — drop --variant for a standard client)")
+            print("")
+        if result.ssh_config_written:
+            print("After the administrator confirms, connect with:")
+            print(f"  %gpu {result.name}")
+        else:
+            print("SSH config not written yet — this client's hostname is not known.")
+            print("When the administrator confirms, connect with:")
+            print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
+            print("(the administrator's `client add` prints the exact line)")
+
+    select_client(result.name)
 
 def gpu(line):
     try:
