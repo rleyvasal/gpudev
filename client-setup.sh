@@ -343,6 +343,30 @@ verify_client_reachable() {
     banner="$(timeout 8 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}; head -c 8 <&3" 2>/dev/null || true)"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+
+    # A hostname created moments ago is not reachable at Cloudflare's edge
+    # immediately: `tunnel route dns` returns before the CNAME has propagated.
+    # A single probe therefore reports NO SSH BANNER on a client that is
+    # perfectly healthy, and sends the operator to restart a connector that is
+    # already current. Retry before believing the failure.
+    local attempt=2
+    while [ -z "$banner" ] && [ $attempt -le 6 ]; do
+        log "  not reachable yet — DNS may still be propagating (attempt ${attempt}/6)"
+        sleep 10
+        port=$((40000 + RANDOM % 9000))
+        timeout 20 cloudflared access tcp --hostname "$h" --url "127.0.0.1:${port}" \
+            >/dev/null 2>&1 &
+        pid=$!
+        for i in $(seq 1 30); do
+            (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && break
+            sleep 0.3
+        done
+        banner="$(timeout 8 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}; head -c 8 <&3" 2>/dev/null || true)"
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        attempt=$((attempt + 1))
+    done
+
     case "$banner" in
         SSH-2.0*)
             log "  ${h} → OK (the container's sshd answered through the tunnel)"
