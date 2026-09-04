@@ -1326,8 +1326,15 @@ Re-copy the whole single line from ~/.ssh/gpudev-admin.pub."
     fi
 
     if [ "${GPUDEV_NO_LOCKDOWN:-0}" = "1" ]; then
-        log "--no-lockdown: sshd left untouched. Password login is still enabled."
-        log "Finish later with:  gpudev ssh lockdown"
+        # Report the ACTUAL policy, not an assumption. A host locked down by an
+        # earlier run still has passwords disabled, and claiming otherwise sends
+        # the operator to fix something that is not broken.
+        log "--no-lockdown: sshd left untouched."
+        if grep -Eq '^[[:space:]]*PasswordAuthentication[[:space:]]+no' /etc/ssh/sshd_config 2>/dev/null; then
+            log "Password login is already disabled from an earlier run — nothing to do."
+        else
+            log "Password login is still ENABLED. Finish with:  gpudev ssh lockdown"
+        fi
         return 0
     fi
 
@@ -1539,11 +1546,13 @@ p.write_text(json.dumps(d, indent=2))
             chmod 600 "$HOST_CONFIG"
             log "Cloudflare API token saved to host.json."
         else
-            warn "Could not extract a DNS-capable API token from tunnel credentials."
-            warn "  client remove will not auto-delete CNAMEs until you store one:"
-            warn "    gpudev cloudflare token-set"
-            warn "  Create token: dash.cloudflare.com → API Tokens → Edit zone DNS"
-            warn "  (zone = your CF_DOMAIN only)."
+            # Not a problem any more: client remove falls back to the apiToken
+            # inside ~/.cloudflared/cert.pem, which is the same credential
+            # `cloudflared tunnel route dns` uses to CREATE the record.
+            log "  No API token in the tunnel credentials — that is expected."
+            log "  client remove uses the apiToken in ~/.cloudflared/cert.pem instead,"
+            log "  so CNAMEs are still cleaned up. 'gpudev cloudflare token-set' only"
+            log "  matters if you want an explicit token to take precedence."
         fi
     fi
 }
@@ -1790,7 +1799,12 @@ configure_clock_locking() {
     sudo tee "$sudoers_file" >/dev/null <<EOF
 # gpudev: let ${LINUX_USER} lock/reset GPU clocks for benchmark runs without a
 # password. Scoped to nvidia-smi only.
-${LINUX_USER} ALL=(root) NOPASSWD: ${smi} -pm *, ${smi} -lgc *, ${smi} -rgc, ${smi} --lock-gpu-clocks=*, ${smi} --reset-gpu-clocks
+# Short forms only. sudoers parses an argument containing "=" as an environment
+# assignment, so "--lock-gpu-clocks=*" fails visudo, the file is discarded, and
+# clock locking silently never gets configured. Checked against visudo on the
+# host: this line validates; the "=" form does not, and escaping it as \= does
+# not help either.
+${LINUX_USER} ALL=(root) NOPASSWD: ${smi} -pm *, ${smi} -lgc *, ${smi} -rgc, ${smi} --reset-gpu-clocks
 EOF
     sudo chmod 440 "$sudoers_file"
     if sudo visudo -cf "$sudoers_file" >/dev/null 2>&1; then
@@ -2030,8 +2044,16 @@ run_health_check() {
     log "gpudev host setup complete."
     echo ""
     log "To connect from your admin machine, add this to its ~/.ssh/config"
-    log "(access is via the Cloudflare tunnel — port $HOST_SSH_PORT is internal to WSL and"
-    log " is NOT reachable directly, so do not use 'ssh -p $HOST_SSH_PORT ...'):"
+    if [ "$HOST_ENV" = "linux" ]; then
+        # Bare metal: sshd binds a real interface, so the LAN route works and is
+        # the safety net if the tunnel is ever down. Saying otherwise here (the
+        # WSL wording) sends operators away from the one path that still works.
+        log "(over the internet this goes through the Cloudflare tunnel; on the LAN"
+        log " you can also reach it directly with 'ssh -p $HOST_SSH_PORT $LINUX_USER@<lan-ip>'):"
+    else
+        log "(access is via the Cloudflare tunnel — port $HOST_SSH_PORT is internal to WSL and"
+        log " is NOT reachable directly, so do not use 'ssh -p $HOST_SSH_PORT ...'):"
+    fi
     echo ""
     # Canonical ProxyCommand — same form as `gpudev client info` and README.
     log "  Host $LINUX_USER"
