@@ -1212,7 +1212,6 @@ p.write_text(json.dumps(d, indent=2))
 # after a key has demonstrably worked.
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
-SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/10-gpudev-port.conf"
 
 set_sshd_option() {
     local key="$1" value="$2"
@@ -1236,9 +1235,17 @@ ssh_key_in_authorized() {
         'index($0, t) && index($0, b) { found = 1 } END { exit !found }' "$file"
 }
 
-# Ubuntu 23.04+ ships socket activation, and when ssh.socket is enabled the
-# listening port comes from the SOCKET UNIT — `Port` in sshd_config is ignored.
-# That is why a host can answer on 22 while sshd_config says 52100.
+# Ubuntu 23.04+ activates sshd through ssh.socket, but sshd_config is STILL
+# authoritative for the port: openssh-server ships
+# /usr/lib/systemd/system-generators/sshd-socket-generator, which reads `Port`
+# and regenerates /run/systemd/generator/ssh.socket.d/addresses.conf on every
+# daemon-reload. Verified on Ubuntu 24.04 (that file is owned by the generator,
+# not by us, and carries the port from sshd_config).
+#
+# So do NOT hand-write an /etc drop-in for the port. Drop-ins apply in lexical
+# order of filename across directories, and the generator's `addresses.conf`
+# sorts after a numeric prefix like `10-gpudev-port.conf`, so its ListenStream
+# reset would win and silently revert the change.
 ssh_socket_activated() {
     command_exists systemctl && systemctl is-enabled ssh.socket >/dev/null 2>&1
 }
@@ -1310,17 +1317,15 @@ ssh_proof_ok() {
 # at it, so sshd and the ingress must move together or the tunnel breaks.
 apply_ssh_port() {
     local port="$1"
+    set_sshd_option "Port" "$port"
     if ssh_socket_activated; then
-        log "  ssh.socket is active — setting the port on the socket unit."
-        sudo mkdir -p "$(dirname "$SSH_SOCKET_DROPIN")"
-        printf '[Socket]\n# gpudev: replace the packaged ListenStream (22).\nListenStream=\nListenStream=%s\n' \
-            "$port" | sudo tee "$SSH_SOCKET_DROPIN" >/dev/null
+        # daemon-reload re-runs sshd-socket-generator, which reads the Port we
+        # just wrote and rewrites the socket's ListenStream from it.
+        log "  ssh.socket is active — reloading so the generator picks up Port ${port}."
         sudo systemctl daemon-reload
         sudo systemctl restart ssh.socket
-    else
-        set_sshd_option "Port" "$port"
-        sudo systemctl restart ssh
     fi
+    sudo systemctl restart ssh
 }
 
 update_host_tunnel_port() {
@@ -1433,9 +1438,9 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
     if ! ssh_port_listening "$port"; then
         warn "Port ${port} is not listening after the restart — rolling back."
         sudo cp "$backup" "$SSHD_CONFIG"
-        sudo rm -f "$SSH_SOCKET_DROPIN"
         sudo systemctl daemon-reload 2>/dev/null || true
-        sudo systemctl restart ssh.socket 2>/dev/null || sudo systemctl restart ssh
+        sudo systemctl restart ssh.socket 2>/dev/null || true
+        sudo systemctl restart ssh 2>/dev/null || true
         rm -f "$backup"
         fail "Rolled back. Check: systemctl status ssh ssh.socket"
     fi
@@ -1463,14 +1468,7 @@ cmd_ssh_unlock() {
     if ! sudo sshd -t 2>/dev/null; then
         fail "sshd config test failed — not restarting. Inspect $SSHD_CONFIG."
     fi
-    sudo rm -f "$SSH_SOCKET_DROPIN"
-    if ssh_socket_activated; then
-        sudo systemctl daemon-reload
-        sudo systemctl restart ssh.socket
-    else
-        set_sshd_option "Port" "22"
-        sudo systemctl restart ssh
-    fi
+    apply_ssh_port 22
     echo ""
     warn "This host now accepts SSH passwords again."
     warn "Re-run 'gpudev ssh lockdown' once your key works."
