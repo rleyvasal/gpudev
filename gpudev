@@ -322,6 +322,18 @@ EOF
     return 1
 }
 
+# Can the detached reload run without a password? The grant is deliberately
+# scoped to ONE command, so probing anything else answers the wrong question:
+# `sudo -n systemctl show gpudev-tunnel` is DENIED on a correctly granted host,
+# which made this path report "cannot run unattended" while the restart it
+# actually needs was permitted. `sudo -l <cmd>` asks whether exactly that
+# command is allowed, without running it. Blanket passwordless sudo counts too.
+tunnel_restart_permitted() {
+    sudo -n -l /usr/bin/systemctl restart gpudev-tunnel >/dev/null 2>&1 \
+        || sudo -n -l /bin/systemctl restart gpudev-tunnel >/dev/null 2>&1 \
+        || sudo -n true 2>/dev/null
+}
+
 reload_tunnel_connector() {
     local tunnel_name="$1"
     echo ""
@@ -342,10 +354,10 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
         # Restarting now would kill this very shell mid-command. Defer + detach,
         # but the detached process has NO TTY, so it can only use `sudo -n`:
         # make sure that will work before walking away from it.
-        if ! sudo -n systemctl show gpudev-tunnel >/dev/null 2>&1; then
+        if ! tunnel_restart_permitted; then
             install_tunnel_reload_grant || true
         fi
-        if ! sudo -n systemctl show gpudev-tunnel >/dev/null 2>&1; then
+        if ! tunnel_restart_permitted; then
             warn "Ingress updated, but the connector still serves the OLD config and this"
             warn "shell rides the tunnel, so the reload cannot run unattended."
             warn "Run this on the host (console or LAN ssh) to finish:"
