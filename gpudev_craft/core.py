@@ -24,14 +24,24 @@ from .client_setup import (
 )
 try:
     from IPython.core.magic import register_line_magic
-    from IPython.display import HTML, display, clear_output
+    from IPython.display import HTML, Markdown, display, clear_output
+
+    # display() is a no-op in the fallback below, so anything rendered ONLY
+    # through it would vanish outside a notebook. Callers check this flag and
+    # keep a printed form for that case.
+    _HAS_RICH_DISPLAY = True
 except Exception:  # non-notebook import / tests
+    _HAS_RICH_DISPLAY = False
+
     def register_line_magic(fn=None, **_kw):  # type: ignore[misc]
         if fn is None:
             return lambda f: f
         return fn
 
     def HTML(x):  # type: ignore[misc]
+        return x
+
+    def Markdown(x):  # type: ignore[misc]
         return x
 
     def display(*_a, **_k):
@@ -2152,7 +2162,17 @@ def gpu_setup(line):
     print("Send this line to your gpudev administrator:")
     print("")
     variant_arg = f" --variant {variant}" if variant != "default" else ""
-    print(f'  gpudev client add {result.name}{variant_arg} --key "{result.public_key_text}"')
+    admin_cmd = (
+        f'gpudev client add {result.name}{variant_arg} '
+        f'--key "{result.public_key_text}"'
+    )
+    # A fenced block in a notebook is visually unmistakable and most frontends
+    # attach a copy control to it, which matters because this line is long
+    # enough that a hand-selection tends to clip the trailing quote.
+    if _HAS_RICH_DISPLAY:
+        display(Markdown(f"```bash\n{admin_cmd}\n```"))
+    else:
+        print(f"  {admin_cmd}")
     print("")
     if variant == "cuda-dev":
         # Make the privilege visible where it is approved. cuda-dev grants
