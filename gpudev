@@ -1426,6 +1426,15 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
         return 0
     fi
 
+    # Remember the port we are moving FROM, so the closing message can tell the
+    # operator whether their laptop config actually needs an edit. Re-running
+    # lockdown on an already-correct host must not send them to edit a line
+    # that is already right.
+    local prev_port
+    prev_port="$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null \
+                 | awk '{print $2}' | head -1)"
+    [ -n "$prev_port" ] || prev_port=22
+
     local backup
     backup="$(mktemp)"
     sudo cp "$SSHD_CONFIG" "$backup"
@@ -1466,13 +1475,18 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
     fi
 
     echo ""
-    log "Locked down. Password login is disabled; sshd is on port ${port}."
-    log ""
-    log "Update this one line in ~/.ssh/config on your laptop:"
-    log "  Port ${port}"
-    log ""
-    log "KEEP THIS SESSION OPEN until a new 'ssh gpudev' succeeds."
-    log "If it fails, fix the port from here rather than walking to the console."
+    if [ "$prev_port" = "$port" ]; then
+        log "Locked down. Password login is disabled; sshd is on port ${port} (unchanged)."
+        log "Nothing to change on your laptop — your existing ~/.ssh/config still fits."
+    else
+        log "Locked down. Password login is disabled; sshd moved ${prev_port} -> ${port}."
+        log ""
+        log "Update this one line in ~/.ssh/config on your laptop:"
+        log "  Port ${port}"
+        log ""
+        log "KEEP THIS SESSION OPEN until a new 'ssh gpudev' succeeds."
+        log "If it fails, fix the port from here rather than walking to the console."
+    fi
 }
 
 cmd_ssh_unlock() {
