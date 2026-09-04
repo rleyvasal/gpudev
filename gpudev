@@ -364,8 +364,9 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
             warn "  sudo systemctl restart gpudev-tunnel"
             return 0
         fi
-        log "This shell rides the connector, so the restart is deferred a few seconds."
-        log "The session will drop — reconnect and the new hostname is live."
+        log "Tunnel update needed, and this shell rides the connector."
+        log "Restarting in a few seconds — your session WILL drop."
+        log "Reconnect with 'ssh ${tunnel_name}'; the tunnel change is live then."
         setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
         return 0
@@ -391,7 +392,7 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
     local tries=20
     while [ $tries -gt 0 ]; do
         if systemctl is-active gpudev-tunnel >/dev/null 2>&1 && connector_is_current; then
-            log "Connector reloaded and serving the new ingress."
+            log "Connector reloaded; the tunnel change is live."
             return 0
         fi
         sleep 1
