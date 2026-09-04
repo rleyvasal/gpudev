@@ -1158,6 +1158,9 @@ cmd_status() {
     echo "  gpudev kernel doctor <name>  diagnose a stuck/silent kernel"
     echo "  gpudev gpu                   full nvidia-smi"
     echo "  gpudev cloudflare            tunnel + ingress + edge check"
+    echo "  gpudev ssh status            sshd port, password auth, admin key"
+    echo "  gpudev ssh lockdown          disable passwords once a key is proven"
+    echo "  gpudev ssh unlock            re-enable passwords (recovery)"
     echo "  gpudev disk                  disk usage breakdown"
     echo "  gpudev power sleep [60m]     sleep now or schedule it"
     echo "  gpudev power reboot [15m]    reboot now or schedule it"
@@ -1199,6 +1202,278 @@ p.write_text(json.dumps(d, indent=2))
     chmod 600 "$HOST_CONFIG"
     log "cf_api_token saved to $HOST_CONFIG (chmod 600)."
     log "client remove will use it to delete CNAMEs automatically."
+}
+
+# ── gpudev ssh ────────────────────────────────────────────────────────────────
+# Owns every change to the host's sshd. linux-setup.sh deliberately no longer
+# touches it: hardening used to run mid-install against a key the operator had
+# typed at a console, so one wrong character in 80 of base64 meant SSH was gone
+# and only the console could recover it. Here it happens once, last, and only
+# after a key has demonstrably worked.
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/10-gpudev-port.conf"
+
+set_sshd_option() {
+    local key="$1" value="$2"
+    if sudo grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$SSHD_CONFIG"; then
+        sudo sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$SSHD_CONFIG"
+    else
+        echo "${key} ${value}" | sudo tee -a "$SSHD_CONFIG" >/dev/null
+    fi
+}
+
+# Match a key by TYPE + BLOB, never whole-line: gpudev-ssh-dispatch rewrites the
+# admin entry as `command="<dispatcher>" <key>`, so a whole-line test fails on a
+# correctly wrapped key. Same predicate linux-setup.sh uses.
+ssh_key_in_authorized() {
+    local key="$1" file="${2:-${HOME}/.ssh/authorized_keys}" type blob
+    type="$(printf '%s' "$key" | awk '{print $1}')"
+    blob="$(printf '%s' "$key" | awk '{print $2}')"
+    [ -n "$type" ] && [ -n "$blob" ] || return 1
+    [ -f "$file" ] || return 1
+    awk -v t="$type" -v b="$blob" \
+        'index($0, t) && index($0, b) { found = 1 } END { exit !found }' "$file"
+}
+
+# Ubuntu 23.04+ ships socket activation, and when ssh.socket is enabled the
+# listening port comes from the SOCKET UNIT — `Port` in sshd_config is ignored.
+# That is why a host can answer on 22 while sshd_config says 52100.
+ssh_socket_activated() {
+    command_exists systemctl && systemctl is-enabled ssh.socket >/dev/null 2>&1
+}
+
+ssh_port_listening() {
+    local port="$1"
+    ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN
+}
+
+ssh_log_has_publickey() {
+    local pattern="$1" since="${2:-}"
+    local args=(--no-pager -n 3000)
+    [ -n "$since" ] && args+=(--since "$since")
+    if command_exists journalctl \
+       && journalctl "${args[@]}" 2>/dev/null \
+          | grep -Eq "Accepted publickey .*${pattern}"; then
+        return 0
+    fi
+    if [ -r /var/log/auth.log ]; then
+        grep -Eq "Accepted publickey .*${pattern}" /var/log/auth.log 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Which auth method did THIS connection use? SSH_CONNECTION carries the client
+# IP and source port, and the source port is unique per connection, so the log
+# entry it matches is unambiguous.
+session_is_publickey() {
+    local cip cport
+    cip="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $1}')"
+    cport="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $2}')"
+    [ -n "$cip" ] && [ -n "$cport" ] || return 1
+    ssh_log_has_publickey "from ${cip} port ${cport}"
+}
+
+# No stale evidence: a past publickey login may have come from a laptop that is
+# gone, or with a key since removed from authorized_keys. Only a login observed
+# AFTER we ask counts.
+wait_for_fresh_publickey() {
+    local since tries=60
+    since="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    log "Cannot confirm this session used a key."
+    log "On your laptop, run:  ssh gpudev"
+    log "Waiting up to 2 minutes for a key-based login... (Ctrl-C to skip)"
+    while [ $tries -gt 0 ]; do
+        if ssh_log_has_publickey "" "$since"; then
+            log "Key-based login seen. Proceeding."
+            return 0
+        fi
+        sleep 2
+        tries=$((tries - 1))
+    done
+    return 1
+}
+
+ssh_proof_ok() {
+    if [ "${GPUDEV_SSH_FORCE:-0}" = "1" ]; then
+        warn "--force: skipping the key-works check entirely."
+        warn "  If your key does not work, password login is about to be disabled"
+        warn "  and only the console will get you back in."
+        return 0
+    fi
+    session_is_publickey && return 0
+    wait_for_fresh_publickey
+}
+
+# The port is a VALUE, not an optional step: the Cloudflare tunnel ingress points
+# at it, so sshd and the ingress must move together or the tunnel breaks.
+apply_ssh_port() {
+    local port="$1"
+    if ssh_socket_activated; then
+        log "  ssh.socket is active — setting the port on the socket unit."
+        sudo mkdir -p "$(dirname "$SSH_SOCKET_DROPIN")"
+        printf '[Socket]\n# gpudev: replace the packaged ListenStream (22).\nListenStream=\nListenStream=%s\n' \
+            "$port" | sudo tee "$SSH_SOCKET_DROPIN" >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl restart ssh.socket
+    else
+        set_sshd_option "Port" "$port"
+        sudo systemctl restart ssh
+    fi
+}
+
+update_host_tunnel_port() {
+    local port="$1" config_yml="${HOME}/.cloudflared/config.yml" host_hostname
+    host_hostname="$(host_get host_cf_hostname)"
+    [ -f "$config_yml" ] && [ -n "$host_hostname" ] || return 0
+    python3 - "$config_yml" "$host_hostname" "$port" <<'CFPORT'
+import pathlib, re, sys
+path, host, port = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = path.read_text()
+pattern = re.compile(
+    rf"(-\s*hostname:\s*{re.escape(host)}\s*\n\s*service:\s*ssh://localhost:)(\d+)"
+)
+new, n = pattern.subn(rf"\g<1>{port}", text)
+if n and new != text:
+    path.write_text(new)
+    print("changed")
+CFPORT
+}
+
+cmd_ssh_status() {
+    require_host_setup
+    local key port
+    key="$(host_get admin_ssh_key)"
+    port="$(host_get host_ssh_port)"
+    [ -n "$port" ] || port=22
+
+    echo ""
+    echo "gpudev SSH Status"
+    echo ""
+    if ssh_socket_activated; then
+        echo "  Activation:   ssh.socket (the socket unit owns the port; sshd_config Port is ignored)"
+    else
+        echo "  Activation:   ssh.service (sshd_config Port applies)"
+    fi
+    local p listening=""
+    for p in 22 "$port"; do
+        if ssh_port_listening "$p"; then listening="${listening}${p} "; fi
+    done
+    echo "  Listening:    ${listening:-none detected} (configured: ${port})"
+    if grep -Eq '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$SSHD_CONFIG" 2>/dev/null; then
+        echo "  Passwords:    disabled (locked down)"
+    else
+        echo "  Passwords:    ENABLED (not locked down)"
+    fi
+    if [ -z "$key" ]; then
+        echo "  Admin key:    not recorded in host.json"
+    elif ssh_key_in_authorized "$key"; then
+        echo "  Admin key:    recorded and present in authorized_keys"
+    else
+        echo "  Admin key:    recorded but MISSING from authorized_keys"
+    fi
+    # A duplicate silently disables the ssh-gpudev shortcuts: sshd honours the
+    # first matching line, so a bare copy above the wrapped one wins.
+    if [ -n "$key" ]; then
+        local blob count
+        blob="$(printf '%s' "$key" | awk '{print $2}')"
+        count="$(grep -cF "$blob" "${HOME}/.ssh/authorized_keys" 2>/dev/null || true)"
+        [ -n "$count" ] || count=0
+        if [ "$count" -gt 1 ]; then
+            echo "  Duplicates:   $count copies of the admin key — shortcuts may be inactive."
+            echo "                Fix: gpudev-ssh-dispatch --install"
+        fi
+    fi
+    echo ""
+}
+
+cmd_ssh_lockdown() {
+    require_host_setup
+    local key port
+    key="$(host_get admin_ssh_key)"
+    port="$(host_get host_ssh_port)"
+    [ -n "$port" ] || port=22
+
+    [ -n "$key" ] || fail "No admin_ssh_key in host.json. Re-run linux-setup.sh, or add your key first."
+    ssh_key_in_authorized "$key" \
+        || fail "The admin key in host.json is not in ~/.ssh/authorized_keys.
+Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
+
+    if ! ssh_proof_ok; then
+        warn "No key-based login seen — leaving sshd untouched."
+        warn "Password login is still enabled. Re-run once 'ssh gpudev' works:"
+        warn "  gpudev ssh lockdown"
+        return 0
+    fi
+
+    local backup
+    backup="$(mktemp)"
+    sudo cp "$SSHD_CONFIG" "$backup"
+
+    log "Hardening sshd..."
+    set_sshd_option "PubkeyAuthentication"   "yes"
+    set_sshd_option "PasswordAuthentication" "no"
+
+    if ! sudo sshd -t 2>/dev/null; then
+        sudo cp "$backup" "$SSHD_CONFIG"
+        rm -f "$backup"
+        fail "sshd config test failed — rolled back, nothing changed."
+    fi
+
+    apply_ssh_port "$port"
+
+    local waited=0
+    while [ $waited -lt 10 ]; do
+        if ssh_port_listening "$port"; then break; fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if ! ssh_port_listening "$port"; then
+        warn "Port ${port} is not listening after the restart — rolling back."
+        sudo cp "$backup" "$SSHD_CONFIG"
+        sudo rm -f "$SSH_SOCKET_DROPIN"
+        sudo systemctl daemon-reload 2>/dev/null || true
+        sudo systemctl restart ssh.socket 2>/dev/null || sudo systemctl restart ssh
+        rm -f "$backup"
+        fail "Rolled back. Check: systemctl status ssh ssh.socket"
+    fi
+    rm -f "$backup"
+
+    if [ "$(update_host_tunnel_port "$port" || true)" = "changed" ]; then
+        log "Tunnel ingress updated to localhost:${port}."
+        reload_tunnel_connector "$(host_get linux_user)" || true
+    fi
+
+    echo ""
+    log "Locked down. Password login is disabled; sshd is on port ${port}."
+    log ""
+    log "Update this one line in ~/.ssh/config on your laptop:"
+    log "  Port ${port}"
+    log ""
+    log "KEEP THIS SESSION OPEN until a new 'ssh gpudev' succeeds."
+    log "If it fails, fix the port from here rather than walking to the console."
+}
+
+cmd_ssh_unlock() {
+    require_host_setup
+    warn "Re-enabling password login and restoring port 22."
+    set_sshd_option "PasswordAuthentication" "yes"
+    if ! sudo sshd -t 2>/dev/null; then
+        fail "sshd config test failed — not restarting. Inspect $SSHD_CONFIG."
+    fi
+    sudo rm -f "$SSH_SOCKET_DROPIN"
+    if ssh_socket_activated; then
+        sudo systemctl daemon-reload
+        sudo systemctl restart ssh.socket
+    else
+        set_sshd_option "Port" "22"
+        sudo systemctl restart ssh
+    fi
+    echo ""
+    warn "This host now accepts SSH passwords again."
+    warn "Re-run 'gpudev ssh lockdown' once your key works."
 }
 
 cmd_cloudflare() {
@@ -1886,7 +2161,7 @@ Host:
 
 Clients:
   gpudev client list
-  gpudev client add <name> [--variant cuda-dev]
+  gpudev client add <name> [--variant cuda-dev] [--key "<pubkey>" | --key-file <path>]
   gpudev client invite <name>
   gpudev image list
   gpudev image build cuda-dev
@@ -1959,6 +2234,18 @@ main() {
             ;;
         cloudflare)
             cmd_cloudflare "${2:-}" "${3:-}"
+            ;;
+        ssh)
+            case "${2:-}" in
+                status)   cmd_ssh_status ;;
+                lockdown)
+                    # --force skips the key-works check; it must announce that.
+                    if [ "${3:-}" = "--force" ]; then GPUDEV_SSH_FORCE=1; fi
+                    cmd_ssh_lockdown
+                    ;;
+                unlock)   cmd_ssh_unlock ;;
+                *) fail "Usage: gpudev ssh [status|lockdown [--force]|unlock]" ;;
+            esac
             ;;
         disk)
             cmd_disk

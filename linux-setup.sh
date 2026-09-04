@@ -185,20 +185,20 @@ prompt_for_missing_values() {
         [ -n "$CF_DOMAIN" ] || fail "Cloudflare domain is required."
     fi
 
-    if [ -z "${ADMIN_SSH_KEY:-}" ]; then
-        echo ""
-        echo "Paste the admin SSH public key for host access:"
-        echo "(This grants SSH access to the WSL/Linux host for management)"
-        read -r ADMIN_SSH_KEY
-        validate_ssh_public_key "$ADMIN_SSH_KEY" || fail "Invalid SSH public key."
-    fi
+    # The admin key is NOT asked for here any more. It is enrolled in the admin
+    # setup phase at the very end, where ssh-copy-id can supply it and where a
+    # key can be proven to work before password login is disabled. Asking here
+    # meant typing a key at a console, then hardening against it unverified.
 
 }
 
 validate_required_values() {
-    [ -n "${CF_DOMAIN:-}" ]     || fail "CF_DOMAIN is required."
-    [ -n "${ADMIN_SSH_KEY:-}" ] || fail "Admin SSH public key is required."
-    validate_ssh_public_key "$ADMIN_SSH_KEY" || fail "Invalid admin SSH public key."
+    [ -n "${CF_DOMAIN:-}" ] || fail "CF_DOMAIN is required."
+    # ADMIN_SSH_KEY is optional here — admin_setup enrols it at the end. Still
+    # validate one supplied up front (env var, or an existing host.json).
+    if [ -n "${ADMIN_SSH_KEY:-}" ]; then
+        validate_ssh_public_key "$ADMIN_SSH_KEY" || fail "Invalid admin SSH public key."
+    fi
 }
 
 ensure_clients_config() {
@@ -1188,24 +1188,159 @@ gpudev's service model (Restart=always, WantedBy=multi-user.target) depends
 on systemd-as-init. Enable systemd and re-run linux-setup.sh."
 }
 
+admin_key_present() {
+    local file="$1" type blob
+    type="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $1}')"
+    blob="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $2}')"
+    [ -n "$type" ] && [ -n "$blob" ] || return 1
+    [ -f "$file" ] || return 1
+    awk -v t="$type" -v b="$blob" \
+        'index($0, t) && index($0, b) { found = 1 } END { exit !found }' "$file"
+}
+
+# ── Admin setup (last phase) ──────────────────────────────────────────────────
+# Enrolls the admin key, then hands sshd hardening to `gpudev ssh lockdown`,
+# which refuses to disable passwords until a key has actually worked.
+#
+# The key arrives by ssh-copy-id, never by typing. A copied key cannot carry a
+# transcription error, which is the failure this whole ordering exists to avoid:
+# hardening used to run mid-install against a hand-typed key, so one wrong
+# character meant console-only recovery.
+
+# Every non-comment key in authorized_keys, one per line, with any
+# command="..." wrapper and trailing options stripped.
+list_authorized_keys() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    python3 - "$file" <<'AKEYS'
+import pathlib, re, sys
+pattern = re.compile(r"((?:ssh-[a-z0-9]+|ecdsa-sha2-[a-z0-9-]+)\s+[A-Za-z0-9+/=]+(?:\s+\S+)?)\s*$")
+for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    m = pattern.search(line)
+    if m:
+        print(m.group(1))
+AKEYS
+}
+
+key_fingerprint() {
+    printf '%s\n' "$1" > /tmp/.gpudev-fp.$$
+    ssh-keygen -lf /tmp/.gpudev-fp.$$ 2>/dev/null | awk '{print $2, $NF}'
+    rm -f /tmp/.gpudev-fp.$$
+}
+
+# Offer what is already in authorized_keys. ssh-copy-id put it there minutes
+# ago, so on a fresh install this is a confirmation, not a search for leftovers.
+pick_admin_key() {
+    local file="$1" keys count
+    keys="$(list_authorized_keys "$file")"
+    [ -n "$keys" ] || return 1
+    count="$(printf '%s\n' "$keys" | grep -c '')"
+
+    if [ "$count" = "1" ]; then
+        printf '%s
+' "$keys"
+        return 0
+    fi
+
+    echo "" >&2
+    echo "Several keys are in ${file}:" >&2
+    printf '%s\n' "$keys" | nl -w2 -s') ' >&2
+    printf "Which is the admin key? [1-%s, or Enter to skip]: " "$count" >&2
+    local choice
+    IFS= read -r choice
+    [ -n "$choice" ] || return 1
+    printf '%s\n' "$keys" | sed -n "${choice}p"
+}
+
+admin_setup() {
+    local authorized="${HOME}/.ssh/authorized_keys"
+    mkdir -p "${HOME}/.ssh"
+    touch "$authorized"
+    chmod 700 "${HOME}/.ssh"
+    chmod 600 "$authorized"
+
+    local key="${ADMIN_SSH_KEY:-}"
+    [ -n "$key" ] || key="$(pick_admin_key "$authorized" || true)"
+
+    if [ -z "$key" ] && [ "${NON_INTERACTIVE:-}" != "true" ] && [ -t 0 ]; then
+        local ip
+        ip="$(ip -4 addr show scope global 2>/dev/null \
+              | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
+        echo ""
+        echo "No admin key found. On your LAPTOP, run:"
+        echo ""
+        echo "    ssh-copy-id -i ~/.ssh/gpudev-admin.pub ${LINUX_USER}@${ip:-<this-host>}"
+        echo ""
+        echo "(no key yet?  ssh-keygen -t ed25519 -f ~/.ssh/gpudev-admin)"
+        echo ""
+        printf "Press Enter when it succeeds, 'p' to paste a key, or 's' to skip: "
+        local answer
+        IFS= read -r answer
+        case "$answer" in
+            p|P)
+                printf "Paste the admin SSH public key: "
+                IFS= read -r key
+                ;;
+            s|S) key="" ;;
+            *)   key="$(pick_admin_key "$authorized" || true)" ;;
+        esac
+    fi
+
+    if [ -z "$key" ]; then
+        warn "Admin setup skipped — no key enrolled."
+        warn "Password login is still ENABLED and sshd is on its current port."
+        warn "When 'ssh ${LINUX_USER}@<this-host>' works with your key, finish with:"
+        warn "  gpudev ssh lockdown"
+        return 0
+    fi
+
+    validate_ssh_public_key "$key" || fail "That does not look like an SSH public key."
+
+    ADMIN_SSH_KEY="$key"
+    write_host_config
+    log "Admin key recorded: $(key_fingerprint "$key")"
+
+    if ! admin_key_present "$authorized"; then
+        echo "$key" >> "$authorized"
+        chmod 600 "$authorized"
+        log "Admin key added to authorized_keys."
+    fi
+
+    # Wrap the key in the forced command so `ssh gpudev sleep|reboot` work. Its
+    # own replace step is blob-based, so this also collapses any duplicate.
+    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ]; then
+        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG" || true
+    fi
+
+    if [ "${GPUDEV_NO_LOCKDOWN:-0}" = "1" ]; then
+        log "--no-lockdown: sshd left untouched. Password login is still enabled."
+        log "Finish later with:  gpudev ssh lockdown"
+        return 0
+    fi
+
+    if [ -x "${HOME}/bin/gpudev" ]; then
+        "${HOME}/bin/gpudev" ssh lockdown || \
+            warn "Lockdown did not complete. Re-run: gpudev ssh lockdown"
+    else
+        warn "gpudev CLI not installed — cannot lock down automatically."
+        warn "Run once it is available:  gpudev ssh lockdown"
+    fi
+}
+
 setup_host_ssh() {
-    log "Configuring host sshd on port $HOST_SSH_PORT..."
+    log "Installing and enabling host sshd (hardening happens at the end)..."
 
     sudo apt-get install -qy openssh-server 2>/dev/null || true
 
-    set_sshd_option() {
-        local key="$1" value="$2"
-        local config="/etc/ssh/sshd_config"
-        if sudo grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$config"; then
-            sudo sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$config"
-        else
-            echo "${key} ${value}" | sudo tee -a "$config" >/dev/null
-        fi
-    }
-
-    set_sshd_option "Port"                  "$HOST_SSH_PORT"
-    set_sshd_option "PubkeyAuthentication"  "yes"
-    set_sshd_option "PasswordAuthentication" "no"
+    # NOTE: this step deliberately does NOT harden sshd any more. Disabling
+    # password auth and moving the port used to happen right here, mid-install,
+    # against a key the operator had just typed at a console with no clipboard —
+    # one wrong character in 80 of base64 and SSH was gone, console-only
+    # recovery. Both now happen in `gpudev ssh lockdown`, at the very end, and
+    # only after a key has demonstrably worked. See SPEC-admin-setup.md.
 
     sudo mkdir -p /run/sshd
 
@@ -1221,14 +1356,6 @@ setup_host_ssh() {
     # agree on what "this key is already here" means.
     mkdir -p "${HOME}/.ssh"
     touch "${HOME}/.ssh/authorized_keys"
-    admin_key_present() {
-        local file="$1" type blob
-        type="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $1}')"
-        blob="$(printf '%s' "$ADMIN_SSH_KEY" | awk '{print $2}')"
-        [ -n "$type" ] && [ -n "$blob" ] || return 1
-        awk -v t="$type" -v b="$blob" \
-            'index($0, t) && index($0, b) { found = 1 } END { exit !found }' "$file"
-    }
     if ! admin_key_present "${HOME}/.ssh/authorized_keys"; then
         echo "$ADMIN_SSH_KEY" >> "${HOME}/.ssh/authorized_keys"
     fi
@@ -1242,7 +1369,7 @@ setup_host_ssh() {
     sudo systemctl restart ssh
     log "Host sshd is persistent via systemd (auto-starts on boot)."
 
-    log "Host sshd configured on port $HOST_SSH_PORT."
+    log "Host sshd is running. Port and password policy are set by admin setup."
 }
 
 # ── Step 7: Host Cloudflare tunnel ────────────────────────────────────────────
@@ -1927,6 +2054,13 @@ main() {
         exit 0
     fi
 
+    # Unattended runs must never be blocked by, or half-apply, sshd hardening.
+    if [ "${1:-}" = "--no-lockdown" ]; then
+        GPUDEV_NO_LOCKDOWN=1
+        export GPUDEV_NO_LOCKDOWN
+        shift
+    fi
+
     assert_not_root
     assert_sudo
     require_debian_family
@@ -1996,6 +2130,11 @@ main() {
         step "gpudev Step 10d: Wake-on-LAN"
         configure_wake_on_lan
     fi
+
+    # LAST, on purpose. Everything above must be finished before sshd changes:
+    # lockdown restarts sshd and can drop the session running this installer.
+    step "gpudev Step 11: Admin setup"
+    admin_setup
 
     run_health_check
 

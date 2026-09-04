@@ -54,12 +54,29 @@ class LinuxSetupTests(unittest.TestCase):
         # and the installer would append a second UNWRAPPED copy of the key.
         # sshd honours the first matching line, so the bare duplicate silently
         # disables the ssh-gpudev shortcuts.
+        # The predicate is top-level: admin_setup needs it too, and relying on
+        # a nested definition leaking out of setup_host_ssh is fragile.
+        predicate = function_body("admin_key_present")
+        self.assertIn("awk '{print $1}'", predicate)
+        self.assertIn("awk '{print $2}'", predicate)
+        self.assertIn("index($0, t) && index($0, b)", predicate)
+
         body = function_body("setup_host_ssh")
         self.assertNotIn('grep -qxF "$ADMIN_SSH_KEY"', body)
         self.assertIn("admin_key_present", body)
-        # Must compare the key's type and blob fields, not the raw line.
-        self.assertIn("awk '{print $1}'", body)
-        self.assertIn("awk '{print $2}'", body)
+
+    def test_sshd_hardening_moved_out_of_the_install_run(self):
+        # Disabling passwords mid-install, against a key typed at a console,
+        # was the lockout risk. setup_host_ssh must no longer do it; lockdown
+        # owns it and runs only after a key has demonstrably worked.
+        body = function_body("setup_host_ssh")
+        self.assertNotIn("PasswordAuthentication", body)
+        self.assertNotIn('set_sshd_option "Port"', body)
+        # And the phase runs last, after the tunnel and the CLI install.
+        main = function_body("main")
+        self.assertIn("admin_setup", main)
+        self.assertLess(main.index("install_cloudflared_host"), main.index("admin_setup"))
+        self.assertLess(main.index("fetch_companions"), main.index("admin_setup"))
 
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a
