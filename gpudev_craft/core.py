@@ -16,7 +16,12 @@ from pathlib import Path
 import os
 import shutil
 
-from .client_setup import has_ssh_stanza, normalize_client_name, setup_client
+from .client_setup import (
+    derive_domain,
+    has_ssh_stanza,
+    normalize_client_name,
+    setup_client,
+)
 try:
     from IPython.core.magic import register_line_magic
     from IPython.display import HTML, display, clear_output
@@ -2064,7 +2069,11 @@ def _ensure_connected():
     return False
 
 
-def _parse_gpu_setup_args(line: str) -> tuple[str, str | None]:
+# Kept in step with client-setup.sh's resolve_variant_image.
+_KNOWN_VARIANTS = ("default", "cuda-dev")
+
+
+def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
     """Parse ``%gpu_setup <name> [--hostname <host>]``.
 
     ``--hostname`` is OPTIONAL. Requiring it was the only reason the
@@ -2073,32 +2082,41 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str | None]:
     sent onward; the ssh config stanza is written later, on the first
     ``%gpu <name> --hostname <host>``.
     """
+    usage = ("Usage: %gpu_setup <client-name> [--variant cuda-dev] "
+             "[--hostname <client.domain>]")
     tokens = shlex.split(line or "")
     if not tokens:
-        raise ValueError("Usage: %gpu_setup <client-name> [--hostname <client.domain>]")
+        raise ValueError(usage)
 
     name = tokens.pop(0)
     hostname = None
+    variant = "default"
     while tokens:
         token = tokens.pop(0)
         if token == "--hostname" and tokens:
             hostname = tokens.pop(0)
         elif token.startswith("--hostname="):
             hostname = token.split("=", 1)[1]
+        elif token == "--variant" and tokens:
+            variant = tokens.pop(0)
+        elif token.startswith("--variant="):
+            variant = token.split("=", 1)[1]
         else:
-            raise ValueError(
-                f"Unknown argument {token!r}. Usage: %gpu_setup <client-name> "
-                "[--hostname <client.domain>]"
-            )
+            raise ValueError(f"Unknown argument {token!r}. {usage}")
     if hostname is not None and not hostname:
         raise ValueError("--hostname was given an empty value.")
-    return name, hostname
+    if variant not in _KNOWN_VARIANTS:
+        raise ValueError(
+            f"Unknown variant {variant!r}. Known variants: "
+            + ", ".join(_KNOWN_VARIANTS)
+        )
+    return name, hostname, variant
 
 
 def gpu_setup(line):
     """One-time, idempotent SolveIt-side SSH/key setup for a client."""
     try:
-        name, hostname = _parse_gpu_setup_args(line)
+        name, hostname, variant = _parse_gpu_setup_args(line)
         name = normalize_client_name(name)
     except ValueError as e:
         print(e)
@@ -2106,6 +2124,13 @@ def gpu_setup(line):
 
     if not install_cloudflared():
         return
+
+    # Any client already configured here records the domain in its stanza, so
+    # only the very first client on a fresh notebook has to be told a hostname.
+    if hostname is None:
+        domain = derive_domain()
+        if domain:
+            hostname = f"{name}.{domain}"
 
     try:
         result = setup_client(name, hostname)
@@ -2126,8 +2151,16 @@ def gpu_setup(line):
     # A public key is not a secret, so putting it on a command line is fine.
     print("Send this line to your gpudev administrator:")
     print("")
-    print(f'  gpudev client add {result.name} --key "{result.public_key_text}"')
+    variant_arg = f" --variant {variant}" if variant != "default" else ""
+    print(f'  gpudev client add {result.name}{variant_arg} --key "{result.public_key_text}"')
     print("")
+    if variant == "cuda-dev":
+        # Make the privilege visible where it is approved. cuda-dev grants
+        # SYS_ADMIN, which client-setup.sh notes is "close to root on the host".
+        # The administrator can drop the flag before running the line.
+        print("  (cuda-dev adds nvcc/ncu/nsys/TensorRT and grants SYS_ADMIN +")
+        print("   PERFMON to the container — drop --variant for a standard client)")
+        print("")
     if result.ssh_config_written:
         print("After the administrator confirms, connect with:")
         print(f"  %gpu {result.name}")

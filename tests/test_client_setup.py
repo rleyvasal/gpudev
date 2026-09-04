@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gpudev_craft.client_setup import (
     normalize_client_name,
+    derive_domain,
     has_ssh_stanza,
     setup_client,
     validate_hostname,
@@ -116,6 +117,30 @@ class ClientInviteTests(unittest.TestCase):
             malformed = run("--key", "not-a-key at all")
             self.assertNotEqual(malformed.returncode, 0)
             self.assertIn("does not look like an SSH public key", malformed.stderr)
+
+    def test_domain_is_learned_from_an_existing_stanza(self):
+        # The notebook cannot know the domain, which is the only reason
+        # %gpu_setup ever needed --hostname. Any client already configured
+        # records it, so only the first client on a machine has to be told.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self.assertEqual(derive_domain(home=home), "")
+            setup_client("solveitrc", "solveitrc.qsoftss.com", home=home)
+            self.assertEqual(derive_domain(home=home), "qsoftss.com")
+
+    def test_gpu_setup_parses_variant(self):
+        from gpudev_craft.core import _parse_gpu_setup_args
+
+        self.assertEqual(_parse_gpu_setup_args("a"), ("a", None, "default"))
+        self.assertEqual(
+            _parse_gpu_setup_args("a --variant cuda-dev"), ("a", None, "cuda-dev")
+        )
+        self.assertEqual(
+            _parse_gpu_setup_args("a --variant=cuda-dev --hostname a.x.com"),
+            ("a", "a.x.com", "cuda-dev"),
+        )
+        with self.assertRaises(ValueError):
+            _parse_gpu_setup_args("a --variant bogus")
 
     def test_invite_prints_complete_non_mutating_bootstrap(self):
         with tempfile.TemporaryDirectory() as td:

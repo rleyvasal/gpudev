@@ -96,6 +96,36 @@ def _resolved_hostname(alias: str) -> str:
     return ""
 
 
+def derive_domain(*, home: Path | None = None) -> str:
+    """Learn the Cloudflare domain from any gpudev stanza already in ssh config.
+
+    The notebook cannot know the domain on its own, which is the only reason
+    ``%gpu_setup`` ever had to ask for ``--hostname``. But any client already
+    configured on this machine records it: ``HostName <name>.<domain>``. Reading
+    it back means the second and every later client needs no hostname at all.
+
+    Returns "" when nothing is configured yet — the genuinely-first client on a
+    fresh notebook, which still falls back to the deferred path.
+    """
+    home = (home or Path.home()).expanduser()
+    config_path = home / ".ssh" / "config"
+    if not config_path.exists():
+        return ""
+    in_gpudev_block = False
+    for raw_line in config_path.read_text().splitlines():
+        fields = raw_line.split("#", 1)[0].strip().split()
+        if not fields:
+            continue
+        keyword = fields[0].lower()
+        if keyword == "host":
+            in_gpudev_block = any(f.startswith("gpudev-") for f in fields[1:])
+        elif in_gpudev_block and keyword == "hostname" and len(fields) >= 2:
+            host = fields[1].strip().lower().rstrip(".")
+            if "." in host:
+                return host.split(".", 1)[1]
+    return ""
+
+
 def has_ssh_stanza(name: str, *, home: Path | None = None) -> bool:
     """Is there an SSH entry this client can actually connect through?
 
