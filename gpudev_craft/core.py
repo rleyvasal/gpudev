@@ -2102,16 +2102,16 @@ def gpu_setup(line):
         name = normalize_client_name(name)
     except ValueError as e:
         print(e)
-        return False
+        return
 
     if not install_cloudflared():
-        return False
+        return
 
     try:
         result = setup_client(name, hostname)
     except Exception as e:
         print(f"gpudev client setup failed: {e}")
-        return False
+        return
 
     select_client(result.name)
     print("Local gpudev client setup is ready")
@@ -2136,7 +2136,6 @@ def gpu_setup(line):
         print("When the administrator confirms, connect with:")
         print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
         print("(the administrator's `client add` prints the exact line)")
-    return True
 
 
 def gpu(line):
