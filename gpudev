@@ -1357,7 +1357,7 @@ cmd_ssh_status() {
     echo "gpudev SSH Status"
     echo ""
     if ssh_socket_activated; then
-        echo "  Activation:   ssh.socket (the socket unit owns the port; sshd_config Port is ignored)"
+        echo "  Activation:   ssh.socket (sshd-socket-generator carries Port from sshd_config)"
     else
         echo "  Activation:   ssh.service (sshd_config Port applies)"
     fi
