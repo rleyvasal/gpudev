@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (ROOT / "linux-setup.sh").read_text(encoding="utf-8")
+CLIENT_SETUP = (ROOT / "client-setup.sh").read_text(encoding="utf-8")
 
 
 def function_body(name: str) -> str:
@@ -33,6 +34,18 @@ class LinuxSetupTests(unittest.TestCase):
         self.assertIn("GPUDEV_UV_NO_CACHE", helper)
         for writer in ("write_dockerfile", "write_cuda_dev_dockerfile"):
             self.assertIn("strip_uv_cache_mounts", function_body(writer))
+
+    def test_no_trailing_and_list_aborts_a_function_under_set_e(self):
+        # `[ cond ] && cmd` as the LAST statement of a function returns non-zero
+        # when cond is false, so `set -e` aborts the caller. In start_container
+        # that rolled back every default-variant client add right after the
+        # container started; only cuda-dev, whose flags are non-empty, escaped.
+        import re
+        for name, text in (("linux-setup.sh", SCRIPT), ("client-setup.sh", CLIENT_SETUP)):
+            lines = text.splitlines()
+            for i, line in enumerate(lines[:-1]):
+                if re.match(r"^\s*\[ .* \] && ", line) and lines[i + 1].startswith("}"):
+                    self.fail(f"{name}:{i + 1} ends a function with an AND-list: {line.strip()}")
 
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a

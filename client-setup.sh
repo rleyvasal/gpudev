@@ -536,7 +536,14 @@ start_container() {
         "${CONTAINER_HOME}/start.sh"
 
     log "Container '$name' started (variant: ${GPUDEV_VARIANT}, shm: ${CLIENT_SHM_SIZE})."
-    [ -n "$extra_flags" ] && log "  Extra capabilities: ${extra_flags}"
+    # NOT `[ -n ... ] && log ...`: the default variant has no extra flags, so as
+    # the last statement of this function the AND-list returns non-zero, the
+    # function returns non-zero, and `set -e` aborts the caller — which fired the
+    # EXIT trap and rolled the whole client back right after the container came
+    # up. Only cuda-dev (non-empty flags) escaped it, which is why this survived.
+    if [ -n "$extra_flags" ]; then
+        log "  Extra capabilities: ${extra_flags}"
+    fi
 }
 
 # ── Health check ──────────────────────────────────────────────────────────────
