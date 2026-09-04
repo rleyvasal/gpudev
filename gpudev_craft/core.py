@@ -140,6 +140,25 @@ def _strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
+# cloudflared accepts the local connection, then finds no origin behind it.
+# Seen when a client's DNS route has not propagated yet, or while the connector
+# restarts to pick up new ingress — both transient, both clear in about a
+# minute. Distinguished from a real misconfiguration, which fails earlier with
+# "Could not resolve hostname" or a ProxyCommand error.
+_TUNNEL_NOT_READY_SIGNS = (
+    "kex_exchange_identification",
+    "Connection closed by UNKNOWN",
+    "websocket: bad handshake",
+    "Connection closed by remote host",
+)
+_TUNNEL_SETTLE_ATTEMPTS = 4
+_TUNNEL_SETTLE_DELAY = 10
+
+
+def _looks_like_tunnel_not_ready(stderr: str) -> bool:
+    return any(sign in (stderr or "") for sign in _TUNNEL_NOT_READY_SIGNS)
+
+
 def select_client(raw_name: str, *, quiet: bool = False) -> str:
     """Select one remote identity for this notebook kernel.
 
@@ -1467,13 +1486,44 @@ class RemoteExecutionManager:
         if probe.returncode == 0 and "SSH_OK" in (probe.stdout or ""):
             return True
 
-        print(f"Cannot reach '{SSH_HOST}' over SSH. Check that:")
-        print(f"  • ~/.ssh/config has a matching 'Host {SSH_HOST}' entry")
-        print(f"    (the host can print it: gpudev client info {CLIENT_NAME})")
-        print("  • cloudflared is installed and on your PATH")
-        print("  • the container is running on the host")
-
         err = (probe.stderr or "").strip()
+
+        # A hostname minted moments ago is not live at Cloudflare's edge yet:
+        # `tunnel route dns` returns before the record propagates, and the
+        # connector may still be restarting to pick up the new ingress. Both
+        # look like this — cloudflared accepts the local connection and finds no
+        # origin behind it — and both clear on their own within about a minute.
+        # Printing the config checklist here sends the operator to audit a
+        # config that is fine, so wait it out before saying anything.
+        for attempt in range(1, _TUNNEL_SETTLE_ATTEMPTS + 1):
+            if not _looks_like_tunnel_not_ready(err):
+                break
+            print(
+                f"  tunnel is not serving '{CLIENT_NAME}' yet — "
+                f"retrying in {_TUNNEL_SETTLE_DELAY}s "
+                f"({attempt}/{_TUNNEL_SETTLE_ATTEMPTS})"
+            )
+            time.sleep(_TUNNEL_SETTLE_DELAY)
+            probe = _ssh("echo SSH_OK", capture_output=True, check=False)
+            if probe.returncode == 0 and "SSH_OK" in (probe.stdout or ""):
+                return True
+            err = (probe.stderr or "").strip()
+
+        if _looks_like_tunnel_not_ready(err):
+            print(f"Cannot reach '{SSH_HOST}': the tunnel is not serving it.")
+            print("  Your ssh config and cloudflared are probably fine — this is")
+            print("  what a client looks like before its DNS route goes live,")
+            print("  which can take a minute after 'gpudev client add'.")
+            print("  Wait a moment and run the same command again.")
+            print(f"  Still failing? On the host:  gpudev cloudflare")
+            print("  (it reports per-hostname reachability and connector staleness)")
+        else:
+            print(f"Cannot reach '{SSH_HOST}' over SSH. Check that:")
+            print(f"  • ~/.ssh/config has a matching 'Host {SSH_HOST}' entry")
+            print(f"    (the host can print it: gpudev client info {CLIENT_NAME})")
+            print("  • cloudflared is installed and on your PATH")
+            print("  • the container is running on the host")
+
         if err:
             print("\nssh reported:")
             print("  " + err.replace("\n", "\n  "))
