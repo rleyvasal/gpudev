@@ -283,7 +283,23 @@ schedule_tunnel_reload() {
     log "(detached, in a few seconds). This briefly drops tunnel connections — if you"
     log "are connected via 'ssh gpudev', this shell will drop; just reconnect."
     if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        setsid bash -c 'sleep 3; sudo systemctl restart gpudev-tunnel' \
+        # The detached reload has NO TTY, so a password-prompting sudo dies with
+        # "sudo: A terminal is required to authenticate" into reload.log and the
+        # ingress change never takes effect — the new client's hostname answers
+        # "websocket: bad handshake" forever. linux-setup.sh installs a NOPASSWD
+        # grant for exactly this command; if it is missing (host set up before
+        # that change), say so HERE rather than failing silently.
+        if ! sudo -n systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
+            warn "Cannot restart gpudev-tunnel without a password prompt."
+            warn "The tunnel ingress was updated but the connector still serves the OLD config,"
+            warn "so this client's hostname will not resolve through the tunnel yet."
+            warn "Run this on the host to finish:"
+            warn "  sudo systemctl restart gpudev-tunnel"
+            warn "Then re-run 'linux-setup.sh' once to install the NOPASSWD grant that"
+            warn "lets future client add/remove reload the connector automatically."
+            return 0
+        fi
+        setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
     else
         setsid bash -c "sleep 3

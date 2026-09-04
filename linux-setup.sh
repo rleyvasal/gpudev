@@ -1344,6 +1344,7 @@ EOF
         sudo systemctl daemon-reload
     fi
     sudo systemctl enable gpudev-tunnel
+    grant_tunnel_reload_sudo
 
     if systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
         if [ "$config_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ]; then
@@ -1498,6 +1499,30 @@ install_gpudev_cli() {
 # `gpudev power`, e.g. from CRAFT's %reboot / %sleep). On WSL2 the power action
 # targets the *Windows* host via interop — gpudev handles that itself, so there
 # is nothing to configure on the Linux side beyond a sanity check.
+# `gpudev client add|remove` rewrites the tunnel ingress, then reloads the
+# connector from a DETACHED setsid process (so the command can return before the
+# connector drops the caller's own ssh session). That process has no TTY, so a
+# password-prompting `sudo systemctl restart gpudev-tunnel` cannot authenticate:
+# it failed with "sudo: A terminal is required to authenticate" into
+# ~/.cloudflared/reload.log, which nobody reads. The visible symptom is a new
+# client whose hostname never starts working — cloudflared keeps serving the
+# ingress it loaded at boot, so the client's tunnel answers
+# "websocket: bad handshake". Same narrow-grant pattern as gpudev-power above.
+grant_tunnel_reload_sudo() {
+    local sudoers_file="/etc/sudoers.d/gpudev-tunnel"
+    sudo tee "$sudoers_file" >/dev/null <<EOF
+# gpudev: allow ${LINUX_USER} to reload the tunnel connector after a client change.
+${LINUX_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart gpudev-tunnel, /bin/systemctl restart gpudev-tunnel
+EOF
+    sudo chmod 440 "$sudoers_file"
+    if sudo visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        log "  sudoers: ${LINUX_USER} may restart gpudev-tunnel without a password."
+    else
+        warn "tunnel sudoers file failed validation — removing it to avoid breaking sudo."
+        sudo rm -f "$sudoers_file"
+    fi
+}
+
 configure_power_management() {
     # Scheduled sleep/reboot operations use the user's transient systemd
     # timers. Linger keeps that manager and its timers alive after SSH logout.

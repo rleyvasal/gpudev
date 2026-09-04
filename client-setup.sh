@@ -205,7 +205,7 @@ schedule_tunnel_reload() {
     log "(detached, in a few seconds). This briefly drops tunnel connections — if you"
     log "are connected via 'ssh gpudev', this shell will drop; just reconnect."
     if command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        setsid bash -c 'sleep 3; sudo systemctl restart gpudev-tunnel' \
+        setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
     else
         setsid bash -c "sleep 3
@@ -445,7 +445,7 @@ p.write_text(''.join(out))
     local tunnel_name
     tunnel_name="$(host_get linux_user 2>/dev/null || true)"
     if [ -n "$tunnel_name" ] && command_exists systemctl && systemctl is-active gpudev-tunnel >/dev/null 2>&1; then
-        sudo systemctl restart gpudev-tunnel 2>/dev/null || true
+        sudo -n systemctl restart gpudev-tunnel 2>/dev/null || true
     fi
 }
 
