@@ -282,10 +282,33 @@ configure_docker_group() {
     NEED_DOCKER_RELOGIN=true
 }
 
-ensure_docker_running() {
-    if sudo docker info >/dev/null 2>&1; then
-        log "Docker daemon is running."
+# Probe UNPRIVILEGED FIRST. Once the invoking user is in the docker group (or
+# the host runs rootless docker), plain `docker` works and sudo buys nothing —
+# but `sudo` needs a TTY, so leading with it breaks every non-interactive run
+# (`gpudev image build cuda-dev` over ssh, CI, cron) with
+# "sudo: A terminal is required to authenticate" even though the daemon is up
+# and reachable. On a FIRST install the group membership is not active in this
+# shell yet (configure_docker_group sets NEED_DOCKER_RELOGIN), so the plain
+# probe fails and the sudo path below still carries the install.
+docker_probe() {
+    if docker info >/dev/null 2>&1; then
+        DOCKER="docker"
+        return 0
+    fi
+    if sudo -n true 2>/dev/null && sudo docker info >/dev/null 2>&1; then
         DOCKER="sudo docker"
+        return 0
+    fi
+    if [ -t 0 ] && sudo docker info >/dev/null 2>&1; then
+        DOCKER="sudo docker"
+        return 0
+    fi
+    return 1
+}
+
+ensure_docker_running() {
+    if docker_probe; then
+        log "Docker daemon is running (via '${DOCKER}')."
         return 0
     fi
 
@@ -296,14 +319,13 @@ ensure_docker_running() {
 
     local tries=15
     while [ $tries -gt 0 ]; do
-        sudo docker info >/dev/null 2>&1 && break
+        docker_probe && break
         sleep 1
         tries=$((tries - 1))
     done
 
-    sudo docker info >/dev/null 2>&1 || fail "Docker daemon failed to start. Check: sudo systemctl status docker"
-    DOCKER="sudo docker"
-    log "Docker daemon is running."
+    docker_probe || fail "Docker daemon failed to start. Check: sudo systemctl status docker"
+    log "Docker daemon is running (via '${DOCKER}')."
 }
 
 restart_docker() {

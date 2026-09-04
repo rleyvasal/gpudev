@@ -26,6 +26,24 @@ class LinuxSetupTests(unittest.TestCase):
             2,
         )
 
+    def test_uv_cache_mount_can_be_stripped_for_both_images(self):
+        # GPUDEV_UV_NO_CACHE=1 must reach BOTH generated Dockerfiles, not just
+        # the default base: a poisoned cache mount breaks either build.
+        helper = function_body("strip_uv_cache_mounts")
+        self.assertIn("GPUDEV_UV_NO_CACHE", helper)
+        for writer in ("write_dockerfile", "write_cuda_dev_dockerfile"):
+            self.assertIn("strip_uv_cache_mounts", function_body(writer))
+
+    def test_docker_probe_prefers_unprivileged_access(self):
+        # sudo needs a TTY, so probing it first breaks non-interactive runs on a
+        # host where docker-group membership already grants access.
+        probe = function_body("docker_probe")
+        plain = probe.index("docker info")
+        self.assertLess(plain, probe.index("sudo docker info"))
+        self.assertIn("sudo -n true", probe)
+        self.assertIn("[ -t 0 ]", probe)
+        self.assertIn("docker_probe", function_body("ensure_docker_running"))
+
     def test_torch_and_base_requirements_use_separate_cached_layers(self):
         torch_install = SCRIPT.index("-r /tmp/gpudev-req/pylock.gpudev-torch.toml")
         base_install = SCRIPT.index("-r /tmp/gpudev-req/requirements-base.txt")
