@@ -335,7 +335,7 @@ sleep 1
 nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log' 2>&1" \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
         log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
-        return 0
+        return 2
     fi
 
     if session_rides_tunnel; then
@@ -366,13 +366,13 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
             install_tunnel_reload_grant || true
             sudo systemctl restart gpudev-tunnel || {
                 warn "Could not restart gpudev-tunnel. Run: sudo systemctl restart gpudev-tunnel"
-                return 0
+                return 2
             }
         else
             warn "Ingress updated, but restarting the connector needs a password."
             warn "Run this on the host to finish:"
             warn "  sudo systemctl restart gpudev-tunnel"
-            return 0
+            return 2
         fi
     fi
 
@@ -566,7 +566,9 @@ p.write_text(''.join(out))
     # Apply the ingress removal last and detached, so it can't drop this session
     # before the cleanup above finished.
     if [ "$_need_tunnel_reload" = "1" ]; then
-        reload_tunnel_connector "$tunnel_name"
+        # Returns non-zero when the reload was deferred or needs a manual step;
+        # `client remove` has nothing to verify afterwards, so don't trip `set -e`.
+        reload_tunnel_connector "$tunnel_name" || true
     fi
 }
 

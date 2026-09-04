@@ -256,7 +256,7 @@ sleep 1
 nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log' 2>&1" \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
         log "Tunnel reload scheduled (detached) — log: ~/.cloudflared/reload.log"
-        return 0
+        return 2
     fi
 
     if session_rides_tunnel; then
@@ -271,13 +271,13 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
             warn "shell rides the tunnel, so the reload cannot run unattended."
             warn "Run this on the host (console or LAN ssh) to finish:"
             warn "  sudo systemctl restart gpudev-tunnel"
-            return 0
+            return 2
         fi
         log "This shell rides the connector, so the restart is deferred a few seconds."
         log "The session will drop — reconnect and the new hostname is live."
         setsid bash -c 'sleep 3; sudo -n systemctl restart gpudev-tunnel' \
             >"${HOME}/.cloudflared/reload.log" 2>&1 </dev/null &
-        return 0
+        return 2
     fi
 
     # Not riding the tunnel: restart inline and prove it worked.
@@ -287,13 +287,13 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
             install_tunnel_reload_grant || true
             sudo systemctl restart gpudev-tunnel || {
                 warn "Could not restart gpudev-tunnel. Run: sudo systemctl restart gpudev-tunnel"
-                return 0
+                return 2
             }
         else
             warn "Ingress updated, but restarting the connector needs a password."
             warn "Run this on the host to finish:"
             warn "  sudo systemctl restart gpudev-tunnel"
-            return 0
+            return 2
         fi
     fi
 
@@ -308,6 +308,44 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
     done
     warn "Connector did not report current within 20s."
     warn "Check: systemctl status gpudev-tunnel"
+    return 2
+}
+
+# Prove the new client is actually reachable the way the notebook will reach it:
+# DNS -> Cloudflare edge -> connector ingress -> the container's sshd. An HTTPS
+# probe cannot show this — Cloudflare Access answers at the edge with a login
+# page (HTTP 200) before the connector is consulted, and an unserved hostname
+# falls to the http_status:404 catch-all, so both read as "reachable". Reading
+# the origin's SSH banner takes the real path. ~0.6s.
+verify_client_reachable() {
+    local h="$1" port=$((40000 + RANDOM % 9000)) pid banner="" i
+    command_exists cloudflared || return 0
+    step "Verifying the client through the tunnel"
+    timeout 20 cloudflared access tcp --hostname "$h" --url "127.0.0.1:${port}" \
+        >/dev/null 2>&1 &
+    pid=$!
+    for i in $(seq 1 30); do
+        (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && break
+        sleep 0.3
+    done
+    banner="$(timeout 8 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}; head -c 8 <&3" 2>/dev/null || true)"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    case "$banner" in
+        SSH-2.0*)
+            log "  ${h} → OK (the container's sshd answered through the tunnel)"
+            log "  The client can connect now."
+            return 0 ;;
+        "")
+            warn "  ${h} → NO SSH BANNER: the tunnel does not reach this client yet."
+            warn "  The container is created; only the tunnel path is failing."
+            warn "  Try:  sudo systemctl restart gpudev-tunnel"
+            warn "  Then: gpudev cloudflare    (shows connector staleness per hostname)"
+            return 1 ;;
+        *)
+            warn "  ${h} → unexpected reply through the tunnel: ${banner}"
+            return 1 ;;
+    esac
 }
 
 # ── Container init ────────────────────────────────────────────────────────────
@@ -687,7 +725,16 @@ Variant '${GPUDEV_VARIANT}' needs its image built first:
     # Reload the connector LAST and detached, so applying the new route can't drop
     # this session before the client is built (see reload_tunnel_connector).
     if [ "${NEED_TUNNEL_RELOAD:-0}" = "1" ]; then
-        reload_tunnel_connector "$RELOAD_TUNNEL_NAME"
+        if reload_tunnel_connector "$RELOAD_TUNNEL_NAME"; then
+            # Connector confirmed current, so the probe is meaningful now.
+            verify_client_reachable "$CF_HOSTNAME" || true
+        else
+            # Reload was deferred (this shell rides the tunnel) or needs a manual
+            # step. Probing now would fail for a reason that says nothing useful.
+            log ""
+            log "Once the connector has reloaded, confirm the client is reachable with:"
+            log "  gpudev cloudflare"
+        fi
     fi
 }
 
