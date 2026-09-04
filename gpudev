@@ -1489,17 +1489,33 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
     fi
 }
 
+# Restores ACCESS, not the port. Moving sshd back to 22 here was wrong twice
+# over: the Cloudflare tunnel ingress points at host_ssh_port, so resetting the
+# port desynchronized the two and broke `ssh gpudev` through the tunnel — the
+# exact failure lockdown syncs the ingress to avoid. And 22 is the port every
+# scanner hits, so pairing it with freshly re-enabled passwords produced the
+# least safe combination available. If you are locked out badly enough to need
+# this, you are at the console, where the port is irrelevant anyway.
 cmd_ssh_unlock() {
     require_host_setup
     require_interactive_sudo "unlock"
-    warn "Re-enabling password login and restoring port 22."
+    local port
+    port="$(host_get host_ssh_port)"
+    [ -n "$port" ] || port=22
+
+    warn "Re-enabling password login. The port is left as it is."
     set_sshd_option "PasswordAuthentication" "yes"
     if ! sudo sshd -t 2>/dev/null; then
         fail "sshd config test failed — not restarting. Inspect $SSHD_CONFIG."
     fi
-    apply_ssh_port 22
+    if ssh_socket_activated; then
+        sudo systemctl daemon-reload
+        sudo systemctl restart ssh.socket
+    fi
+    sudo systemctl restart ssh
+
     echo ""
-    warn "This host now accepts SSH passwords again."
+    warn "This host now accepts SSH passwords again, on port ${port}."
     warn "Re-run 'gpudev ssh lockdown' once your key works."
 }
 

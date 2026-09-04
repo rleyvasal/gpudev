@@ -78,6 +78,18 @@ class LinuxSetupTests(unittest.TestCase):
         self.assertLess(main.index("install_cloudflared_host"), main.index("admin_setup"))
         self.assertLess(main.index("fetch_companions"), main.index("admin_setup"))
 
+    def test_unlock_does_not_move_the_ssh_port(self):
+        # The tunnel ingress points at host_ssh_port. Resetting the port in
+        # unlock desynchronized the two and broke `ssh gpudev` through the
+        # tunnel; it also paired re-enabled passwords with port 22, the most
+        # scanned port there is. unlock restores access, not the port.
+        gpudev = (ROOT / "gpudev").read_text(encoding="utf-8")
+        start = gpudev.index("cmd_ssh_unlock() {")
+        body = gpudev[start : gpudev.index("\n}", start)]
+        self.assertIn("PasswordAuthentication", body)
+        self.assertNotIn("apply_ssh_port", body)
+        self.assertNotIn('set_sshd_option "Port"', body)
+
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a
         # host where docker-group membership already grants access.
