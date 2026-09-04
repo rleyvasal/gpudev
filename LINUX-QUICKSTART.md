@@ -4,10 +4,14 @@ A start-to-finish guide for a dedicated Linux box on your LAN. This is the
 bare-metal path — it differs from the Windows/WSL2 path in `README.md`, mainly
 because you have a physical console and no Windows host underneath.
 
-> **Part 1 of 2 — admin setup.** Covers everything up to a working `ssh` login
-> and a finished `linux-setup.sh`. Onboarding notebook clients is Part 2.
+**Part 1 — admin setup**: from a fresh Ubuntu install to a working `ssh gpudev`
+and a finished `linux-setup.sh`.
+**Part 2 — onboarding a notebook client**: `client invite` → `%gpu_setup` →
+`client add` → `%gpu`.
 
 ---
+
+# Part 1 — admin setup
 
 ## Before you touch the server
 
@@ -201,7 +205,176 @@ affected by sshd config:
 
 ---
 
-## Next
+# Part 2 — onboarding a notebook client
 
-Part 2 — onboarding a notebook client (`gpudev client invite` → `%gpu_setup` →
-`gpudev client add`).
+Part 1 left you with a working host. This part adds one **client**: a container
+with its own GPU access, its own SSH identity, and its own tunnel hostname,
+which a SolveIt notebook connects to with `%gpu <name>`.
+
+Two people are usually involved — the **administrator** on the host, and the
+**user** in the notebook. The steps say which is which. If you are both, you
+still do all of them; you just email yourself less.
+
+## The one thing that cannot be automated
+
+The user's private key never leaves the notebook. Only the **public** key
+travels to the host. There is no `ssh-copy-id` here — the notebook holds no
+credential on the gpudev host, so nothing can push the key for you.
+
+So exactly one line crosses the gap in each direction. That is the floor, and
+the flow below hits it.
+
+---
+
+## Step 1 (admin) — invite
+
+```bash
+gpudev client invite solveit
+```
+
+This makes **no changes** to the host. It prints the two cells the user pastes
+into SolveIt, with the client's hostname already filled in. Send that output to
+the user.
+
+> Only needed the first time, or when you want the hostname filled in for
+> someone. A user who already knows the domain can skip straight to Step 2.
+
+## Step 2 (user) — run the two cells in SolveIt
+
+Cell 1 installs or updates CRAFT:
+
+```
+%%bash
+set -e
+mkdir -p /app/data/gpudevd
+if [ -d /app/data/gpudevd/gpudev/.git ]; then
+  git -C /app/data/gpudevd/gpudev pull --ff-only
+else
+  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
+fi
+```
+
+Cell 2 creates the key and the SSH entry:
+
+```
+%run /app/data/gpudevd/gpudev/CRAFT.py
+%gpu_setup solveit --hostname solveit.example.com
+```
+
+`%gpu_setup` is idempotent — re-running it reuses the existing key rather than
+replacing it, so it is safe to paste again.
+
+### Without a hostname
+
+If you do not know the hostname yet, leave it off:
+
+```
+%gpu_setup solveit
+```
+
+The key is still created and you still get the line to send. Only the SSH entry
+waits — `%gpu` will tell you the exact command to finish it later.
+
+## Step 3 (user → admin) — send one line
+
+`%gpu_setup` prints the administrator's whole command:
+
+```
+Send this line to your gpudev administrator:
+
+  gpudev client add solveit --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... gpudev-solveit"
+```
+
+Send **that line**. Do not send the private key path, and do not retype the
+key — forward the line as printed.
+
+## Step 4 (admin) — add the client
+
+Paste it on the host:
+
+```bash
+gpudev client add solveit --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... gpudev-solveit"
+```
+
+Add `--variant cuda-dev` for a client that needs `nvcc`, `ncu`, `nsys` or
+TensorRT. Build that image first with `gpudev image build cuda-dev`.
+
+This creates the volume, the container, the tunnel route and the ingress rule,
+reloads the connector, and then proves the client answers through the tunnel:
+
+```
+=== Verifying the client through the tunnel ===
+  solveit.example.com → OK (the container's sshd answered through the tunnel)
+  The client can connect now.
+```
+
+If that says `NO SSH BANNER`, the container is fine but the tunnel path is not —
+see **Troubleshooting** below.
+
+It finishes by printing the line to send back:
+
+```
+Send this line back to the client:
+
+  %gpu solveit --hostname solveit.example.com
+```
+
+## Step 5 (user) — connect
+
+```
+%gpu solveit
+```
+
+Or, if you skipped the hostname in Step 2, the line the admin sent back:
+
+```
+%gpu solveit --hostname solveit.example.com
+```
+
+That writes the SSH entry and connects. Afterwards plain `%gpu solveit` is
+enough, in this and every other notebook.
+
+---
+
+## Troubleshooting
+
+**`No SSH config for 'solveit' yet`** — the hostname was never supplied. Run
+the `%gpu <name> --hostname <host>` line the administrator printed.
+
+**`Could not resolve hostname gpudev-solveit`** — you used the alias without
+the entry existing. Same fix as above.
+
+**`NO SSH BANNER` during Step 4** — the container is up but the tunnel does not
+reach it. Usually the connector is serving an older config. On the host:
+
+```bash
+gpudev cloudflare
+```
+
+`Config: STALE` confirms it. Then:
+
+```bash
+sudo systemctl restart gpudev-tunnel
+```
+
+**Nothing happens on `%gpu`** — check the client is running:
+
+```bash
+gpudev client list
+```
+
+---
+
+## Admin reference
+
+```bash
+gpudev client list                      # every client and its status
+gpudev client info solveit              # ssh config, hostnames, bootstrap
+gpudev client rebuild solveit           # recreate the container, keep the volume
+gpudev client remove solveit --yes      # delete the client AND its data
+gpudev kernel status solveit            # the notebook kernel inside the client
+```
+
+`remove` deletes the volume, so the client's home directory goes with it. The
+tunnel ingress is cleaned up automatically; so is the DNS record, using
+cloudflared's own credentials.
