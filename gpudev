@@ -1154,6 +1154,10 @@ cmd_status() {
     echo "  gpudev client invite <name>  print complete SolveIt onboarding"
     echo "  gpudev client info <name>    print SSH config stanza for a client"
     echo "  gpudev client restart <name> restart a client container"
+    echo "  gpudev client rebuild <name> recreate the container, keep the volume"
+    # Listing every other lifecycle verb but not remove reads as "there is no
+    # way to remove a client", which is worse than the line it saves.
+    echo "  gpudev client remove <name>  delete a client AND its data volume"
     echo "  gpudev client logs <name>    tail a client's container logs"
     echo "  gpudev kernel doctor <name>  diagnose a stuck/silent kernel"
     echo "  gpudev gpu                   full nvidia-smi"
