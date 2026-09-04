@@ -140,8 +140,13 @@ def _strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
-def select_client(raw_name: str) -> str:
-    """Select one remote identity for this notebook kernel."""
+def select_client(raw_name: str, *, quiet: bool = False) -> str:
+    """Select one remote identity for this notebook kernel.
+
+    ``quiet`` suppresses the confirmation line. %gpu_setup already names the
+    client in its own report, and printing after that report put a stray stream
+    line inside the trailing code block the notebook had just rendered.
+    """
     global CLIENT_NAME, SSH_HOST, _exec_mgr
 
     name = normalize_client_name(raw_name)
@@ -160,7 +165,8 @@ def select_client(raw_name: str) -> str:
     CLIENT_NAME = name
     SSH_HOST = f"gpudev-{name}"
     _inject_user_ns()
-    print(f"Selected gpudev client '{name}' for this notebook")
+    if not quiet:
+        print(f"Selected gpudev client '{name}' for this notebook")
     return name
 
 
@@ -2219,7 +2225,7 @@ def gpu_setup(line):
             print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
             print("(the administrator's `client add` prints the exact line)")
 
-    select_client(result.name)
+    select_client(result.name, quiet=True)
 
 def gpu(line):
     try:
