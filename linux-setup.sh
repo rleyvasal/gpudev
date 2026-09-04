@@ -1299,9 +1299,19 @@ admin_setup() {
 
     validate_ssh_public_key "$key" || fail "That does not look like an SSH public key."
 
+    # validate_ssh_public_key only checks the type prefix, so a mangled blob
+    # passes it. ssh-keygen actually parses the key, which is the cheap way to
+    # catch a truncated or mistyped paste at enrolment rather than discovering
+    # it later. Lockdown's proof gate would also catch it, but by then the
+    # operator has been told the key is recorded.
+    local fingerprint
+    fingerprint="$(key_fingerprint "$key")"
+    [ -n "$fingerprint" ] || fail "ssh-keygen cannot read that key — it looks truncated or mistyped.
+Re-copy the whole single line from ~/.ssh/gpudev-admin.pub."
+
     ADMIN_SSH_KEY="$key"
     write_host_config
-    log "Admin key recorded: $(key_fingerprint "$key")"
+    log "Admin key recorded: ${fingerprint}"
 
     if ! admin_key_present "$authorized"; then
         echo "$key" >> "$authorized"
