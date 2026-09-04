@@ -1679,7 +1679,10 @@ cmd_self_update() {
 
         local sha="" base
         if [ -n "$repo_slug" ] && command_exists python3; then
-            sha="$(curl -fsSL --max-time 15 \
+            # The API has its own short cache; ask it not to serve one. This
+            # narrows the window but does not close it, so the installed commit
+            # is always reported rather than assumed.
+            sha="$(curl -fsSL --max-time 15 -H "Cache-Control: no-cache" \
                     "https://api.github.com/repos/${repo_slug}/commits/${repo_ref}" 2>/dev/null \
                   | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["sha"])
