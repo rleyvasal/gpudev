@@ -49,6 +49,8 @@ class ClientSetupResult:
     public_key_text: str
     key_created: bool
     ssh_config_changed: bool
+    # False when setup ran without a hostname, so no stanza could be written.
+    ssh_config_written: bool = True
 
 
 def _atomic_write(path: Path, text: str, mode: int) -> None:
@@ -92,6 +94,21 @@ def _resolved_hostname(alias: str) -> str:
         if line.lower().startswith("hostname "):
             return line.split(None, 1)[1].strip().lower().rstrip(".")
     return ""
+
+
+def has_ssh_stanza(name: str, *, home: Path | None = None) -> bool:
+    """Is there an SSH entry this client can actually connect through?
+
+    ``%gpu`` dials the alias ``gpudev-<name>``, so a missing stanza surfaces as
+    a generic "could not resolve hostname" from ssh, which says nothing about
+    gpudev. Checking first lets the caller name the exact command to run.
+    """
+    name = normalize_client_name(name)
+    home = (home or Path.home()).expanduser()
+    config_path = home / ".ssh" / "config"
+    if not config_path.exists():
+        return False
+    return _has_exact_host_alias(config_path.read_text(), f"gpudev-{name}")
 
 
 def ensure_client_key(name: str, *, home: Path | None = None) -> tuple[Path, Path, bool]:
@@ -209,19 +226,37 @@ def ensure_ssh_config(
     return True
 
 
-def setup_client(name: str, hostname: str, *, home: Path | None = None) -> ClientSetupResult:
-    """Ensure the local key and SSH alias for one gpudev client identity."""
+def setup_client(
+    name: str,
+    hostname: str | None = None,
+    *,
+    home: Path | None = None,
+) -> ClientSetupResult:
+    """Ensure the local key, and the SSH alias once the hostname is known.
+
+    ``hostname`` is optional so a notebook can generate its key before the
+    administrator has provisioned anything. Nothing at connect time needs it:
+    ``%gpu`` dials the alias ``gpudev-<name>``, and the hostname is consumed
+    only here, to write the ``~/.ssh/config`` stanza. Omitting it yields a key
+    and a public key to send onward, with ``ssh_config_written`` False.
+    """
     name = normalize_client_name(name)
-    hostname = validate_hostname(hostname)
     private_key, public_key, key_created = ensure_client_key(name, home=home)
-    changed = ensure_ssh_config(name, hostname, private_key, home=home)
+
+    resolved = ""
+    changed = False
+    if hostname is not None:
+        resolved = validate_hostname(hostname)
+        changed = ensure_ssh_config(name, resolved, private_key, home=home)
+
     return ClientSetupResult(
         name=name,
-        hostname=hostname,
+        hostname=resolved,
         ssh_alias=f"gpudev-{name}",
         private_key=private_key,
         public_key=public_key,
         public_key_text=public_key.read_text().strip(),
         key_created=key_created,
         ssh_config_changed=changed,
+        ssh_config_written=hostname is not None,
     )

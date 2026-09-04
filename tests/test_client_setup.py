@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gpudev_craft.client_setup import (
     normalize_client_name,
+    has_ssh_stanza,
     setup_client,
     validate_hostname,
 )
@@ -67,6 +68,55 @@ class ClientSetupTests(unittest.TestCase):
 
 
 class ClientInviteTests(unittest.TestCase):
+    def test_setup_without_hostname_defers_the_ssh_stanza(self):
+        # The notebook must be able to generate its key before the
+        # administrator has provisioned anything: requiring --hostname was the
+        # only reason the admin had to go first.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            first = setup_client("solveite", home=home)
+            self.assertTrue(first.key_created)
+            self.assertFalse(first.ssh_config_written)
+            self.assertEqual(first.hostname, "")
+            self.assertFalse(has_ssh_stanza("solveite", home=home))
+
+            # Hostname arrives later: same key, stanza now written.
+            second = setup_client("solveite", "solveite.example.com", home=home)
+            self.assertFalse(second.key_created)
+            self.assertTrue(second.ssh_config_written)
+            self.assertTrue(has_ssh_stanza("solveite", home=home))
+            self.assertEqual(first.public_key_text, second.public_key_text)
+
+    def test_client_add_rejects_bad_key_arguments_before_provisioning(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            config_dir = home / ".config" / "gpudev"
+            config_dir.mkdir(parents=True)
+            (config_dir / "host.json").write_text(
+                json.dumps({"cf_domain": "example.com", "linux_user": "gpudev"})
+            )
+            (config_dir / "clients.json").write_text(json.dumps({"clients": []}))
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            def run(*args):
+                return subprocess.run(
+                    [str(REPO_ROOT / "gpudev"), "client", "add", "t", *args],
+                    cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+                )
+
+            both = run("--key", "ssh-ed25519 AAAA x", "--key-file", "/tmp/x.pub")
+            self.assertNotEqual(both.returncode, 0)
+            self.assertIn("not both", both.stderr)
+
+            missing = run("--key-file", str(home / "nope.pub"))
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("Key file not found", missing.stderr)
+
+            malformed = run("--key", "not-a-key at all")
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertIn("does not look like an SSH public key", malformed.stderr)
+
     def test_invite_prints_complete_non_mutating_bootstrap(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)

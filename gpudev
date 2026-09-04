@@ -401,17 +401,27 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
     warn "Check: systemctl status gpudev-tunnel"
 }
 
+CLIENT_ADD_USAGE="Usage: gpudev client add <name> [--variant cuda-dev] [--key \"<pubkey>\" | --key-file <path>]"
+
 cmd_client_add() {
-    local name="" variant="default"
+    local name="" variant="default" ssh_key="" key_file=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --variant)   variant="${2:-}"; shift 2 ;;
-            --variant=*) variant="${1#*=}"; shift ;;
-            -*)          fail "Unknown option '$1'. Usage: gpudev client add <name> [--variant cuda-dev]" ;;
-            *)           [ -z "$name" ] && name="$1" || fail "Unexpected argument '$1'."; shift ;;
+            --variant)    variant="${2:-}"; shift 2 ;;
+            --variant=*)  variant="${1#*=}"; shift ;;
+            # A public key is NOT a secret — it is the half meant to be
+            # published — so accepting it on the command line is fine, and it is
+            # what lets `%gpu_setup` hand the operator one pasteable line
+            # instead of a bare key to relay into a prompt.
+            --key)        ssh_key="${2:-}"; shift 2 ;;
+            --key=*)      ssh_key="${1#*=}"; shift ;;
+            --key-file)   key_file="${2:-}"; shift 2 ;;
+            --key-file=*) key_file="${1#*=}"; shift ;;
+            -*)           fail "Unknown option '$1'. $CLIENT_ADD_USAGE" ;;
+            *)            [ -z "$name" ] && name="$1" || fail "Unexpected argument '$1'."; shift ;;
         esac
     done
-    [ -n "$name" ] || fail "Usage: gpudev client add <name> [--variant cuda-dev]"
+    [ -n "$name" ] || fail "$CLIENT_ADD_USAGE"
     [ -n "$variant" ] || fail "--variant needs a value (default, cuda-dev)."
     [ -f "$CLIENT_SETUP" ] || fail "client-setup.sh not found at $CLIENT_SETUP"
 
@@ -420,13 +430,44 @@ cmd_client_add() {
         *) fail "Unknown variant '$variant'. Known variants: default, cuda-dev." ;;
     esac
 
-    echo ""
-    echo "Paste the SSH public key for client '${name}':"
-    local ssh_key
-    IFS= read -r ssh_key
-    [ -n "$ssh_key" ] || fail "SSH public key is required."
+    if [ -n "$ssh_key" ] && [ -n "$key_file" ]; then
+        fail "Use --key or --key-file, not both."
+    fi
+
+    if [ -n "$key_file" ]; then
+        [ -f "$key_file" ] || fail "Key file not found: $key_file"
+        ssh_key="$(head -n1 "$key_file")"
+        [ -n "$ssh_key" ] || fail "Key file is empty: $key_file"
+    fi
+
+    if [ -z "$ssh_key" ]; then
+        echo ""
+        echo "Paste the SSH public key for client '${name}':"
+        IFS= read -r ssh_key
+        [ -n "$ssh_key" ] || fail "SSH public key is required."
+    fi
+
+    # Shape check here so a wrong argument fails instantly. client-setup.sh
+    # validates authoritatively, before it provisions anything.
+    case "$ssh_key" in
+        ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-nistp*\ *) ;;
+        *) fail "That does not look like an SSH public key. Expected a line starting
+with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-file." ;;
+    esac
 
     GPUDEV_VARIANT="$variant" bash "$CLIENT_SETUP" "$name" "$ssh_key"
+
+    # Close the loop: the notebook still needs the hostname to write its ssh
+    # config stanza, and this is the only place that knows it for certain.
+    local cf_domain
+    cf_domain="$(host_get cf_domain 2>/dev/null || true)"
+    if [ -n "$cf_domain" ]; then
+        echo ""
+        echo "Send this line back to the client:"
+        echo ""
+        echo "  %gpu ${name} --hostname ${name}.${cf_domain}"
+        echo ""
+    fi
 }
 
 # ── gpudev image build <variant> ──────────────────────────────────────────────
@@ -900,8 +941,12 @@ EOF
 %gpu_setup ${name} --hostname ${hostname}
 EOF
     echo ""
-    echo "Step 3 of 4 — the private key stays in SolveIt. Paste only the PUBLIC"
-    echo "key printed by setup into: gpudev client add ${name}"
+    # Deliberately NOT "paste the public key into gpudev client add": this same
+    # function is printed by `client add` itself, so that instruction told the
+    # operator to redo the step they had just completed. %gpu_setup now prints
+    # the administrator's whole command, so the user forwards one line.
+    echo "Step 3 of 4 — the private key never leaves SolveIt. Setup prints a"
+    echo "single 'gpudev client add ...' line; send that to your administrator."
     echo "Step 4 of 4 — connect each notebook independently with: %gpu ${name}"
     echo "No JSON file, manual SSH edit, terminal login, or host-key prompt is needed."
     echo ""

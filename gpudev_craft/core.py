@@ -16,7 +16,7 @@ from pathlib import Path
 import os
 import shutil
 
-from .client_setup import normalize_client_name, setup_client
+from .client_setup import has_ssh_stanza, normalize_client_name, setup_client
 try:
     from IPython.core.magic import register_line_magic
     from IPython.display import HTML, display, clear_output
@@ -2064,13 +2064,21 @@ def _ensure_connected():
     return False
 
 
-def _parse_gpu_setup_args(line: str) -> tuple[str, str]:
+def _parse_gpu_setup_args(line: str) -> tuple[str, str | None]:
+    """Parse ``%gpu_setup <name> [--hostname <host>]``.
+
+    ``--hostname`` is OPTIONAL. Requiring it was the only reason the
+    administrator had to go first: the hostname is per-client, so the notebook
+    could not know it unaided. Without it the key is still generated and can be
+    sent onward; the ssh config stanza is written later, on the first
+    ``%gpu <name> --hostname <host>``.
+    """
     tokens = shlex.split(line or "")
     if not tokens:
-        raise ValueError("Usage: %gpu_setup <client-name> --hostname <client.domain>")
+        raise ValueError("Usage: %gpu_setup <client-name> [--hostname <client.domain>]")
 
     name = tokens.pop(0)
-    hostname = ""
+    hostname = None
     while tokens:
         token = tokens.pop(0)
         if token == "--hostname" and tokens:
@@ -2080,10 +2088,10 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str]:
         else:
             raise ValueError(
                 f"Unknown argument {token!r}. Usage: %gpu_setup <client-name> "
-                "--hostname <client.domain>"
+                "[--hostname <client.domain>]"
             )
-    if not hostname:
-        raise ValueError("Missing --hostname. Usage: %gpu_setup <name> --hostname <host>")
+    if hostname is not None and not hostname:
+        raise ValueError("--hostname was given an empty value.")
     return name, hostname
 
 
@@ -2108,17 +2116,26 @@ def gpu_setup(line):
     select_client(result.name)
     print("Local gpudev client setup is ready")
     print(f"  SSH alias:   {result.ssh_alias}")
-    print(f"  Endpoint:    {result.hostname}")
+    if result.ssh_config_written:
+        print(f"  Endpoint:    {result.hostname}")
     print(f"  Private key: {result.private_key} (kept only on this client)")
     print("")
-    print("Give this PUBLIC key to the gpudev administrator:")
-    print(result.public_key_text)
+    # Print the administrator's COMMAND, not a bare key. The user forwards one
+    # line and the administrator pastes one line: nobody has to select a key out
+    # of surrounding output, and nobody has to decide which prompt it goes in.
+    # A public key is not a secret, so putting it on a command line is fine.
+    print("Send this line to your gpudev administrator:")
     print("")
-    print("Administrator: run this on the gpudev host, then paste the public key:")
-    print(f"  gpudev client add {result.name}")
+    print(f'  gpudev client add {result.name} --key "{result.public_key_text}"')
     print("")
-    print("After the administrator finishes, connect from this notebook with:")
-    print(f"  %gpu {result.name}")
+    if result.ssh_config_written:
+        print("After the administrator confirms, connect with:")
+        print(f"  %gpu {result.name}")
+    else:
+        print("SSH config not written yet — this client's hostname is not known.")
+        print("When the administrator confirms, connect with:")
+        print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
+        print("(the administrator's `client add` prints the exact line)")
     return True
 
 
@@ -2128,17 +2145,51 @@ def gpu(line):
     except ValueError as e:
         print(f"Invalid %gpu arguments: {e}")
         return
-    if len(tokens) > 1:
-        print("Usage: %gpu <client-name>")
-        return
-    if tokens:
-        try:
-            select_client(tokens[0])
-        except ValueError as e:
-            print(e)
+
+    # --hostname is accepted here so a notebook that ran `%gpu_setup <name>`
+    # before the administrator provisioned anything can supply the hostname on
+    # its first connect. Writing the stanza is all it is needed for.
+    name = ""
+    hostname = None
+    while tokens:
+        token = tokens.pop(0)
+        if token == "--hostname" and tokens:
+            hostname = tokens.pop(0)
+        elif token.startswith("--hostname="):
+            hostname = token.split("=", 1)[1]
+        elif token.startswith("-"):
+            print(f"Unknown argument {token!r}. Usage: %gpu <client-name> "
+                  "[--hostname <client.domain>]")
             return
-    elif not CLIENT_NAME:
+        elif not name:
+            name = token
+        else:
+            print("Usage: %gpu <client-name> [--hostname <client.domain>]")
+            return
+
+    if not name and not CLIENT_NAME:
         print("No client selected. Use: %gpu <client-name>")
+        return
+    name = name or CLIENT_NAME
+
+    if hostname:
+        try:
+            setup_client(name, hostname)
+        except Exception as e:
+            print(f"Could not write the SSH config for {name!r}: {e}")
+            return
+    elif not has_ssh_stanza(name):
+        # Without a stanza ssh fails with "could not resolve hostname
+        # gpudev-<name>", which names nothing about gpudev. Say what to run.
+        print(f"No SSH config for '{name}' yet — its hostname is not known here.")
+        print("Run this once, with the hostname your administrator confirmed:")
+        print(f"  %gpu {name} --hostname {name}.<their-domain>")
+        return
+
+    try:
+        select_client(name)
+    except ValueError as e:
+        print(e)
         return
 
     if _ensure_connected():
