@@ -531,6 +531,31 @@ the host-side scripts or repository history. Setup then installs/checks
 `cloudflared`, generates `~/.ssh/gpudev-alice`, and writes the SSH stanza. It
 never replaces an existing private key, and the private key stays in SolveIt.
 
+#### Choosing where the files go
+
+By default the runtime is installed to `/app/data/gpudevd/gpudev` — SolveIt's
+persistent storage, so it survives kernel restarts. Set `GPUDEV_DIR` on line 1
+to put it anywhere else:
+
+```text
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh
+%run ~/.gpudev-client/CRAFT.py alice --domain example.com
+```
+
+**Line 2 does not change.** The bootstrap points `~/.gpudev-client` at whatever
+you chose, so the cell is correct wherever you install — see
+[below](#why-the-cell-says-gpudev-client) for why it works this way. The script
+prints both paths, so a non-default install is never silent:
+
+```text
+  path:    /home/you/gpudev-client
+  entry:   ~/.gpudev-client → /home/you/gpudev-client
+```
+
+Worth setting on a **local Jupyter or Colab**, where `/app/data` does not exist.
+Pick somewhere persistent: a temp directory means re-fetching after every
+restart.
+
 If this client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA
 compilation, add the variant to the same line:
 

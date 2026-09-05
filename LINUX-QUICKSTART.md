@@ -467,14 +467,29 @@ the flow below hits it.
 %run ~/.gpudev-client/CRAFT.py solveit --domain example.com
 ```
 
-The first line installs the client runtime into `/app/data`, which is
-persistent, so it survives kernel restarts. It fetches only the ten files a
-client actually runs (~192 KB) — not the host-side scripts, and not repository
-history.
+The first line installs the client runtime into `/app/data/gpudevd/gpudev` —
+SolveIt's persistent storage, so it survives kernel restarts. It fetches only
+the ten files a client actually runs (~192 KB), not the host-side scripts and
+not repository history.
 
 The second line loads CRAFT **and** runs setup: `%run script.py args` fills
 `sys.argv`, and `CRAFT.py` is already the `%run` entry point. Two lines is the
 floor here, because a cold client has to fetch something before it can run it.
+
+### Choosing the install directory
+
+Set `GPUDEV_DIR` on the first line to install somewhere else — worth doing on a
+local Jupyter, where `/app/data` does not exist:
+
+```
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh
+%run ~/.gpudev-client/CRAFT.py solveit --domain example.com
+```
+
+The second line is unchanged: the bootstrap points `~/.gpudev-client` at
+whatever you chose, and prints both paths so a non-default install is never
+silent. Choose somewhere persistent — a temp directory means re-fetching after
+every kernel restart.
 
 Setup is idempotent: re-running reuses the existing key rather than replacing
 it, so it is safe to paste again.
