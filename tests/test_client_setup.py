@@ -166,7 +166,13 @@ class ClientInviteTests(unittest.TestCase):
             )
 
             self.assertIn("solveite.example.com", result.stdout)
-            self.assertIn("git clone https://github.com/rleyvasal/gpudev.git", result.stdout)
+            self.assertIn("https://github.com/rleyvasal/gpudev.git", result.stdout)
+            # One cell, not two. %%bash is a CELL magic and cannot share a cell
+            # with %run, which is the only reason the bootstrap was ever split;
+            # `!` escapes can, verified in SolveIt. Reintroducing %%bash would
+            # silently split it again.
+            self.assertNotIn("%%bash", result.stdout)
+            self.assertIn("!if [ -d /app/data/gpudevd/gpudev/.git ]", result.stdout)
             self.assertIn("%run /app/data/gpudevd/gpudev/CRAFT.py", result.stdout)
             self.assertIn(
                 "%gpu_setup solveite --hostname solveite.example.com", result.stdout

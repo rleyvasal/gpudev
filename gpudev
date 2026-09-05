@@ -922,32 +922,24 @@ print_solveit_bootstrap() {
 
     echo "── SolveIt bootstrap ──"
     echo ""
-    echo "Step 2 of 4 — paste Cell 1 into SolveIt to install or update CRAFT:"
+    echo "Step 2 of 4 — paste ONE cell into SolveIt:"
     echo ""
-    cat <<'EOF'
-%%bash
-set -e
-mkdir -p /app/data/gpudevd
-if [ -d /app/data/gpudevd/gpudev/.git ]; then
-  git -C /app/data/gpudevd/gpudev pull --ff-only
-else
-  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
-fi
-EOF
-    echo ""
-    echo "Still Step 2 — paste Cell 2 to create/reuse the key and SSH connection:"
-    echo ""
+    # One cell, not two. `!` shell escapes coexist with %run and a line magic in
+    # the same cell; only %%bash forced the split, because a cell magic must be
+    # alone. Verified in SolveIt. No `mkdir -p` either: git clone creates its
+    # leading directories, checked against a three-level missing path.
+    # -q on both keeps git's progress out of the cell, which would otherwise
+    # land BELOW the setup report — the notebook renders stream output after
+    # rich output regardless of when it was written.
     cat <<EOF
+!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
 %run /app/data/gpudevd/gpudev/CRAFT.py
 %gpu_setup ${name} --hostname ${hostname}
 EOF
     echo ""
-    # Deliberately NOT "paste the public key into gpudev client add": this same
-    # function is printed by `client add` itself, so that instruction told the
-    # operator to redo the step they had just completed. %gpu_setup now prints
-    # the administrator's whole command, so the user forwards one line.
     echo "Step 3 of 4 — the private key never leaves SolveIt. Setup prints a"
     echo "single 'gpudev client add ...' line; send that to your administrator."
+    echo "  (add --variant cuda-dev to that command for nvcc/ncu/nsys/TensorRT)"
     echo "Step 4 of 4 — connect each notebook independently with: %gpu ${name}"
     echo "No JSON file, manual SSH edit, terminal login, or host-key prompt is needed."
     echo ""

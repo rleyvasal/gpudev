@@ -260,41 +260,32 @@ the user.
 > Only needed the first time, or when you want the hostname filled in for
 > someone. A user who already knows the domain can skip straight to Step 2.
 
-## Step 2 (user) — run the two cells in SolveIt
-
-Cell 1 installs or updates CRAFT:
+## Step 2 (user) — run one cell in SolveIt
 
 ```
-%%bash
-set -e
-mkdir -p /app/data/gpudevd
-if [ -d /app/data/gpudevd/gpudev/.git ]; then
-  git -C /app/data/gpudevd/gpudev pull --ff-only
-else
-  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
-fi
-```
-
-Cell 2 creates the key and the SSH entry:
-
-```
+!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
 %run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup solveit --hostname solveit.example.com
+%gpu_setup solveit --variant cuda-dev
 ```
 
-`%gpu_setup` is idempotent — re-running it reuses the existing key rather than
+The first line installs or updates CRAFT into `/app/data`, which is persistent,
+so it survives kernel restarts. Re-running pulls instead of cloning — that is
+how a notebook picks up fixes.
+
+`%gpu_setup` is idempotent: re-running reuses the existing key rather than
 replacing it, so it is safe to paste again.
 
-### Without a hostname
+`--variant cuda-dev` is optional and asks for the profiling image
+(nvcc/ncu/nsys/TensorRT). It travels in the line you send the administrator,
+who can drop it — it grants SYS_ADMIN to the container, so it is a request
+rather than a decision.
 
-If you do not know the hostname yet, leave it off:
+### Hostnames
 
-```
-%gpu_setup solveit
-```
-
-The key is still created and you still get the line to send. Only the SSH entry
-waits — `%gpu` will tell you the exact command to finish it later.
+You will not normally type one. If any gpudev client is already set up on this
+machine, the domain is read from its SSH entry. Only the very first client on a
+fresh notebook needs `--hostname <name>.<domain>`, and if you omit it there,
+`%gpu` prints the exact line to run once the administrator confirms.
 
 ## Step 3 (user → admin) — send one line
 
