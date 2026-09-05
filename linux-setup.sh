@@ -1848,48 +1848,17 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo enabled > /sys/class/net/${iface}/device/power/wakeup 2>/dev/null || true; exec $(command -v ethtool) -s ${iface} wol g'
+ExecStart=$(command -v ethtool) -s ${iface} wol g
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    # Arming once at boot is not enough on Realtek r8169 parts (RTL8125 and
-    # relatives), which this board uses. ethtool keeps reporting "Wake-on: g"
-    # from the driver's cached setting while the PHY itself is no longer armed
-    # after a resume — so the flag reads correct and the machine still will not
-    # wake. Observed here: the first two suspends of a boot woke from a magic
-    # packet, including one after 3.5 hours, and a third suspend entered shortly
-    # after a resume ignored every packet while ethtool still said "g".
-    #
-    # Re-writing the setting immediately before each sleep re-arms the PHY. It
-    # costs nothing on NICs that did not need it.
-    sudo tee /etc/systemd/system/gpudev-wol-resume.service >/dev/null <<EOF
-[Unit]
-Description=gpudev: re-arm wake-on-LAN on ${iface} before sleep
-Before=sleep.target
-StopWhenUnneeded=yes
-
-[Service]
-Type=oneshot
-# TWO independent gates, and arming only the first is not enough. `ethtool wol g`
-# arms the NIC's magic-packet detector; power/wakeup decides whether the PCI
-# device may wake the system at all. A resume can leave the second disabled
-# while ethtool still reports "Wake-on: g", which is why re-arming ethtool alone
-# did not fix the second-suspend failure on this RTL8125D.
-ExecStart=/bin/sh -c 'echo enabled > /sys/class/net/${iface}/device/power/wakeup 2>/dev/null || true; exec $(command -v ethtool) -s ${iface} wol g'
-
-[Install]
-WantedBy=sleep.target
-EOF
-
     sudo systemctl daemon-reload
     sudo systemctl enable --now gpudev-wol.service >/dev/null 2>&1
-    sudo systemctl enable gpudev-wol-resume.service >/dev/null 2>&1
     local mac
     mac="$(cat /sys/class/net/${iface}/address 2>/dev/null)"
-    log "  wake-on-LAN armed on ${iface} (MAC ${mac})."
-    log "    Re-armed at every boot AND before every suspend (r8169 needs the latter)."
+    log "  wake-on-LAN armed on ${iface} (MAC ${mac}), re-armed at every boot."
     log "    Firmware must also allow it: WoL/PME enabled, ErP disabled."
 }
 
