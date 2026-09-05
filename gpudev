@@ -2166,8 +2166,10 @@ gpudev_system_files() {
 PATHS
 }
 
+# mode=uninstall suppresses the KEEP lines that uninstall contradicts, so the
+# two halves of its manifest cannot claim opposite things about sshd.
 reset_manifest() {
-    local purge_data="$1"
+    local purge_data="$1" mode="${2:-reset}"
     local names cf_domain
     names="$(all_client_names 2>/dev/null || true)"
     cf_domain="$(host_get cf_domain)"
@@ -2195,13 +2197,15 @@ reset_manifest() {
     echo ""
     echo "This will KEEP:"
     echo ""
-    echo "  Docker, NVIDIA toolkit, cloudflared   (may serve other workloads)"
-    echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
-    echo "  images gpudev-base*                   (replaced by the next build)"
+    if [ "$mode" = "reset" ]; then
+        echo "  Docker, NVIDIA toolkit, cloudflared   (may serve other workloads)"
+        echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
+        echo "  images gpudev-base*                   (replaced by the next build)"
+        echo "  every sshd/SSH setting                (port, password policy, your key)"
+    fi
     if [ "$purge_data" != "1" ]; then
         echo "  client data volumes                   (re-adopted by name; --purge-data to remove)"
     fi
-    echo "  every sshd/SSH setting                (port, password policy, your key)"
     echo "  ~/.cloudflared/cert.pem               (account login; avoids a browser round-trip)"
     echo ""
 }
@@ -2326,6 +2330,254 @@ Or --force if you accept being disconnected."
     log ""
     log "Reinstall with:"
     log "  bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)"
+}
+
+# ── gpudev uninstall ──────────────────────────────────────────────────────────
+# Everything reset does, plus images, the build cache, the SSH revert and the
+# key unwrap.
+#
+# The ordering exists because of one trap: the admin key is not a plain
+# authorized_keys entry. gpudev-ssh-dispatch rewrites it as
+#   command="/home/<user>/bin/gpudev-ssh-dispatch" ssh-ed25519 AAAA... comment
+# so deleting ~/bin makes every login run a missing binary. The key stays valid,
+# sshd keeps accepting it, and there is still no shell. The key must therefore
+# be unwrapped BEFORE ~/bin is touched, and access proven before anything
+# irreversible happens.
+
+# Rewrite the admin entry as a bare key, dropping any forced-command prefix.
+# Matches on type + blob so a wrapped entry is recognised, the same predicate
+# linux-setup.sh and gpudev-ssh-dispatch use.
+unwrap_admin_key() {
+    local key="$1" file="${HOME}/.ssh/authorized_keys"
+    [ -f "$file" ] || return 0
+    KEY_VAL="$key" python3 - "$file" <<'PY'
+import os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+parts = os.environ["KEY_VAL"].split()
+if len(parts) < 2:
+    raise SystemExit(0)
+key_type, blob = parts[0], parts[1]
+out, changed = [], False
+for line in path.read_text().splitlines():
+    if key_type in line and blob in line and line.strip().startswith("command="):
+        out.append(" ".join(parts))
+        changed = True
+    else:
+        out.append(line)
+if changed:
+    path.write_text("\n".join(out) + "\n")
+    print("unwrapped")
+PY
+}
+
+# Re-enabling password auth on an account that has none moves the port, removes
+# the forced-command wrapper, and leaves no way back in. P = usable password.
+account_has_password() {
+    local user="${1:-$(whoami)}"
+    sudo -n passwd -S "$user" 2>/dev/null | awk '{print $2}' | grep -qx P
+}
+
+# Provenance says whether gpudev installed a component; this says whether
+# anything ELSE is now relying on it. Someone may have started using this Docker
+# after gpudev installed it, which makes the flag correct and still wrong.
+foreign_docker_workloads() {
+    local names known found=""
+    names="$(all_client_names 2>/dev/null || true)"
+    local c
+    while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        if ! printf '%s\n' "$names" | grep -qx "$c"; then
+            found="${found}  container ${c}\n"
+        fi
+    done < <(docker_cmd ps -a --format '{{.Names}}' 2>/dev/null || true)
+    local v
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        if ! printf '%s\n' "$names" | grep -qx "${v%-data}"; then
+            found="${found}  volume ${v}\n"
+        fi
+    done < <(docker_cmd volume ls --format '{{.Name}}' 2>/dev/null || true)
+    local i
+    while IFS= read -r i; do
+        case "$i" in
+            gpudev-base*|nvidia/cuda*|python*|"") continue ;;
+            *) found="${found}  image ${i}\n" ;;
+        esac
+    done < <(docker_cmd images --format '{{.Repository}}' 2>/dev/null | sort -u || true)
+    [ -z "$found" ] && return 1
+    printf '%b' "$found"
+}
+
+provenance_says_ours() {
+    local component="$1" answer
+    answer="$(python3 -c "
+import json, pathlib, sys
+try:
+    d = json.loads(pathlib.Path('${HOST_CONFIG}').read_text())
+except Exception:
+    print('unknown'); raise SystemExit
+p = d.get('installed_by_gpudev', {})
+print('yes' if p.get('${component}') is True else ('no' if '${component}' in p else 'unknown'))
+" 2>/dev/null || echo unknown)"
+    printf '%s' "$answer"
+}
+
+cmd_uninstall() {
+    local dry_run=0 purge_data=0 keep_ssh=0 assume_yes=0 force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run)    dry_run=1; shift ;;
+            --purge-data) purge_data=1; shift ;;
+            --keep-ssh)   keep_ssh=1; shift ;;
+            --yes)        assume_yes=1; shift ;;
+            --force)      force=1; shift ;;
+            *) fail "Unknown option '$1'. Usage: gpudev uninstall [--dry-run] [--purge-data] [--keep-ssh] [--yes] [--force]" ;;
+        esac
+    done
+
+    require_host_setup
+    local user admin_key
+    user="$(host_get linux_user)"
+    admin_key="$(host_get admin_ssh_key)"
+
+    echo ""
+    echo "gpudev uninstall — this removes gpudev from this host."
+    reset_manifest "$purge_data" uninstall
+    echo "ALSO removed, beyond 'gpudev reset':"
+    echo ""
+    echo "  images      gpudev-base, gpudev-base-cuda-dev"
+    echo "  build cache the whole BuildKit cache"
+    if [ "$keep_ssh" = "1" ]; then
+        echo "  sshd        unchanged (--keep-ssh)"
+    else
+        echo "  sshd        reverted to port 22 with password login re-enabled"
+        echo "  admin key   unwrapped from its forced-command prefix"
+    fi
+    echo ""
+    local comp state
+    echo "Shared components:"
+    for comp in docker nvidia_container_toolkit cloudflared; do
+        state="$(provenance_says_ours "$comp")"
+        case "$state" in
+            yes)     echo "  ${comp}: installed by gpudev — you will be asked" ;;
+            no)      echo "  ${comp}: was already present — keeping" ;;
+            *)       echo "  ${comp}: provenance unknown — keeping" ;;
+        esac
+    done
+    echo ""
+
+    if [ "$dry_run" = "1" ]; then
+        log "--dry-run: nothing was changed."
+        return 0
+    fi
+
+    if session_rides_tunnel && [ "$force" != "1" ]; then
+        fail "This session arrives over the tunnel, which uninstall deletes.
+Re-run from the console or a LAN session, or --force to accept losing access."
+    fi
+
+    if [ "$keep_ssh" != "1" ] && [ "$force" != "1" ]; then
+        if ! account_has_password "$user"; then
+            fail "Account '${user}' has no usable password (passwd -S is not 'P').
+
+Re-enabling password login would move the port and drop the key wrapper while
+giving no way back in. Use --keep-ssh to leave sshd alone, or set a password
+first with: sudo passwd ${user}"
+        fi
+    fi
+
+    if [ "$assume_yes" != "1" ]; then
+        local host_cf confirm
+        host_cf="$(host_get host_cf_hostname)"
+        printf "Type the host's tunnel hostname (%s) to confirm: " "$host_cf"
+        IFS= read -r confirm
+        [ "$confirm" = "$host_cf" ] || { echo "Aborted."; return 0; }
+    fi
+
+    # --- Access first. Nothing irreversible before this succeeds. ---
+    if [ "$keep_ssh" != "1" ]; then
+        if [ -n "$admin_key" ]; then
+            if [ "$(unwrap_admin_key "$admin_key")" = "unwrapped" ]; then
+                log "Admin key unwrapped — it no longer depends on ~/bin."
+            fi
+        fi
+        log "Reverting sshd to port 22 with password login..."
+        set_sshd_option "PubkeyAuthentication"   "yes"
+        set_sshd_option "PasswordAuthentication" "yes"
+        if ! sudo sshd -t 2>/dev/null; then
+            fail "sshd config test failed — nothing else was changed."
+        fi
+        apply_ssh_port 22
+        local waited=0
+        while [ $waited -lt 10 ] && ! ssh_port_listening 22; do
+            sleep 1; waited=$((waited + 1))
+        done
+        ssh_port_listening 22 || fail "Port 22 is not listening — aborting before removal."
+
+        if [ "$force" != "1" ]; then
+            local since tries=30
+            since="$(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            log "Confirm you can still get in BEFORE anything is removed."
+            log "From another terminal:  ssh -p 22 ${user}@<this-host>"
+            log "Waiting up to 60s for a login... (Ctrl-C to abort safely)"
+            local ok=0
+            while [ $tries -gt 0 ]; do
+                # Either method counts here: the goal is access, not key auth.
+                if journalctl --since "$since" --no-pager -n 500 2>/dev/null \
+                    | grep -qE "Accepted (publickey|password) for ${user}"; then
+                    ok=1; break
+                fi
+                sleep 2; tries=$((tries - 1))
+            done
+            if [ "$ok" != "1" ]; then
+                fail "No login seen. NOTHING has been removed — the host is intact.
+sshd is now on port 22 with passwords enabled; re-run when you can log in,
+or use 'gpudev ssh lockdown' to put it back."
+            fi
+            log "Login confirmed. Proceeding."
+        fi
+    fi
+
+    # --- From here it is destructive. ---
+    cmd_reset --yes ${purge_data:+--purge-data} --force || true
+
+    log "Removing images and build cache..."
+    docker_cmd rmi -f gpudev-base:latest gpudev-base-cuda-dev:latest >/dev/null 2>&1 || true
+    docker_cmd builder prune -af >/dev/null 2>&1 || true
+
+    local answer
+    for comp in docker nvidia_container_toolkit cloudflared; do
+        [ "$(provenance_says_ours "$comp")" = "yes" ] || continue
+        local foreign
+        foreign="$(foreign_docker_workloads 2>/dev/null || true)"
+        if [ "$comp" = "docker" ] && [ -n "$foreign" ]; then
+            warn "Keeping Docker — something else is using it:"
+            printf '%b' "$foreign" >&2
+            continue
+        fi
+        printf "Remove %s (gpudev installed it)? [y/N]: " "$comp"
+        IFS= read -r answer
+        case "$answer" in
+            y|Y)
+                case "$comp" in
+                    docker) sudo apt-get purge -qy docker-ce docker-ce-cli containerd.io >/dev/null 2>&1 || true ;;
+                    nvidia_container_toolkit) sudo apt-get purge -qy nvidia-container-toolkit >/dev/null 2>&1 || true ;;
+                    cloudflared) sudo rm -f "$(command -v cloudflared)" 2>/dev/null || true ;;
+                esac
+                log "  ${comp} removed."
+                ;;
+            *) log "  ${comp} kept." ;;
+        esac
+    done
+
+    echo ""
+    log "gpudev uninstalled."
+    if [ "$keep_ssh" != "1" ]; then
+        log ""
+        log "sshd is on port 22 with password login enabled."
+        log "KEEP THIS SESSION OPEN until a new login works."
+    fi
 }
 
 # ── gpudev self-update ────────────────────────────────────────────────────────
@@ -2515,6 +2767,7 @@ Power:
 Other:
   gpudev self-update
   gpudev reset [--dry-run] [--purge-data] [--yes] [--force]
+  gpudev uninstall [--dry-run] [--purge-data] [--keep-ssh] [--yes] [--force]
 EOF
 }
 
@@ -2579,6 +2832,10 @@ main() {
         reset)
             shift
             cmd_reset "$@"
+            ;;
+        uninstall)
+            shift
+            cmd_uninstall "$@"
             ;;
         self-update)
             cmd_self_update

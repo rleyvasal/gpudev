@@ -240,12 +240,40 @@ PY
 
 # ── Step 2: Docker ────────────────────────────────────────────────────────────
 
+# Whether gpudev itself installed a shared component, so uninstall does not
+# remove something the machine had before — Docker in particular may be carrying
+# other people's workloads.
+#
+# FIRST RUN WINS. Provenance cannot be inferred retroactively: a second
+# linux-setup.sh run sees Docker already present and would record false, erasing
+# the fact that the first run installed it. So only write a key that is absent.
+record_provenance() {
+    local component="$1" installed="$2"
+    [ -f "$HOST_CONFIG" ] || return 0
+    COMPONENT_VAL="$component" INSTALLED_VAL="$installed" \
+    python3 - "$HOST_CONFIG" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    raise SystemExit(0)
+provenance = data.setdefault("installed_by_gpudev", {})
+component = os.environ["COMPONENT_VAL"]
+if component not in provenance:
+    provenance[component] = os.environ["INSTALLED_VAL"] == "true"
+    path.write_text(json.dumps(data, indent=2))
+PY
+}
+
 install_docker() {
     if command_exists docker; then
         log "Docker already installed: $(docker --version)"
+        record_provenance docker false
         return 0
     fi
 
+    record_provenance docker true
     log "Installing Docker Engine..."
     sudo apt-get update -q
     sudo apt-get install -qy ca-certificates curl gnupg lsb-release
@@ -357,8 +385,10 @@ nvidia_toolkit_installed() {
 install_nvidia_container_toolkit() {
     if nvidia_toolkit_installed; then
         log "NVIDIA Container Toolkit already installed."
+        record_provenance nvidia_container_toolkit false
         return 0
     fi
+    record_provenance nvidia_container_toolkit true
 
     log "Installing NVIDIA Container Toolkit..."
 
@@ -1064,8 +1094,10 @@ To skip (not recommended): SKIP_GPU_CHECK=1 bash linux-setup.sh"
 install_cloudflared_host() {
     if command_exists cloudflared; then
         log "cloudflared already installed: $(cloudflared --version)"
+        record_provenance cloudflared false
         return 0
     fi
+    record_provenance cloudflared true
 
     log "Installing cloudflared on host..."
     local tmp_deb
