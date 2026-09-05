@@ -1,6 +1,8 @@
 # Spec — `gpudev reset` and `gpudev uninstall`
 
-Status: draft, not implemented.
+Status: IMPLEMENTED — `reset` in `8cbd3cc`, `uninstall` and provenance in
+`1e5659c`, `--cold` in `1f4a5b7`. Guards are tested; the destructive paths have
+not been run against a live host.
 Scope: `gpudev`, `linux-setup.sh`, `LINUX-QUICKSTART.md`.
 
 Two commands. `reset` puts the box back to "before `linux-setup.sh`" so a clean
@@ -49,8 +51,8 @@ machine usable and reachable.
 **Removes:** clients (containers + ingress + CNAMEs), the tunnel, gpudev state
 and system files from the table above, `~/.config/gpudev`, `~/bin` scripts.
 
-**Keeps:** Docker, the toolkit, cloudflared, **all sshd and SSH settings**, the
-build cache, and the ML lock.
+**Keeps:** Docker, the toolkit, cloudflared, **all sshd and SSH settings**, and
+the build cache (unless `--cold`).
 
 **Does not touch sshd at all.** The operator is staying on the box and
 reinstalling immediately; changing the port mid-reset only creates work.
@@ -81,9 +83,14 @@ Every layer after it is keyed on those file contents. A reset that deletes
 install re-resolves with `--upgrade`. Identical upstream pins give a full cache
 hit; a new torch release gives a miss from that COPY down.
 
-So `reset` stashes `pylock.gpudev-torch.toml` and the `ml_profile` object and
-restores them into the fresh `host.json`, making the cache hit deterministic
-rather than lucky. `--fresh-ml` opts out when the point is to test resolution.
+**Not implemented, and deliberately so.** The plan was to stash the lock and
+`ml_profile` and restore them, but the stash only helps if `linux-setup.sh`
+reads it back, which would couple reset to the installer for a benefit that
+usually is not needed: `uv pip compile` is deterministic, so an unchanged
+upstream re-resolves to byte-identical pins and the COPY layer hits cache
+anyway. The build cache carries the speed on its own. If a torch release ever
+does land mid-iteration the cost is one slow rebuild, which `--cold` makes
+deliberate rather than accidental.
 
 ---
 

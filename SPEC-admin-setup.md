@@ -1,6 +1,8 @@
 # Spec — admin setup phase and SSH lockdown
 
-Status: draft, not implemented.
+Status: IMPLEMENTED — phase and `ssh` commands in `e2035b2`, port mechanism
+corrected in `a955740`. Exercised on a live host: lockdown, unlock, and the
+proof gate all ran; a fresh install has not.
 Scope: `linux-setup.sh`, `gpudev`, `LINUX-QUICKSTART.md`.
 
 ---
