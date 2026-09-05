@@ -118,6 +118,76 @@ class ClientInviteTests(unittest.TestCase):
             self.assertNotEqual(malformed.returncode, 0)
             self.assertIn("does not look like an SSH public key", malformed.stderr)
 
+    def test_client_add_builds_missing_cuda_dev_once_then_continues(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            repo = root / "repo"
+            fake_bin = root / "bin"
+            state = root / "state"
+            (home / ".config" / "gpudev").mkdir(parents=True)
+            repo.mkdir()
+            fake_bin.mkdir()
+            state.mkdir()
+
+            (home / ".config" / "gpudev" / "host.json").write_text(
+                json.dumps({"cf_domain": "example.com", "linux_user": "gpudev"})
+            )
+            (home / ".config" / "gpudev" / "clients.json").write_text(
+                json.dumps({"clients": []})
+            )
+            shutil.copy2(REPO_ROOT / "gpudev", repo / "gpudev")
+
+            docker = fake_bin / "docker"
+            docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"${1:-}\" = info ]; then exit 0; fi\n"
+                "if [ \"${1:-} ${2:-}\" = 'image inspect' ]; then\n"
+                "  [ \"${3:-}\" = gpudev-base-cuda-dev:latest ] || exit 0\n"
+                "  test -f \"$TEST_STATE/cuda-built\"\n"
+                "fi\n"
+            )
+            docker.chmod(0o755)
+
+            setup = repo / "linux-setup.sh"
+            setup.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >> \"$TEST_STATE/build-calls\"\n"
+                "touch \"$TEST_STATE/cuda-built\"\n"
+            )
+            setup.chmod(0o755)
+
+            client_setup = repo / "client-setup.sh"
+            client_setup.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s|%s|%s\\n' \"$GPUDEV_VARIANT\" \"$1\" \"$2\" "
+                ">> \"$TEST_STATE/client-calls\"\n"
+            )
+            client_setup.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update({
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TEST_STATE": str(state),
+            })
+            command = [
+                str(repo / "gpudev"), "client", "add", "alice",
+                "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test",
+            ]
+
+            first = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn("Building it now", first.stdout)
+            self.assertIn("continuing client provisioning", first.stdout)
+            self.assertEqual((state / "build-calls").read_text().splitlines(), ["--build-cuda-dev"])
+            self.assertIn("cuda-dev|alice|ssh-ed25519 AAAA test", (state / "client-calls").read_text())
+
+            second = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertNotIn("Building it now", second.stdout)
+            self.assertEqual((state / "build-calls").read_text().splitlines(), ["--build-cuda-dev"])
+
     def test_domain_is_learned_from_an_existing_stanza(self):
         # The notebook cannot know the domain, which is the only reason
         # %gpu_setup ever needed --hostname. Any client already configured

@@ -120,6 +120,37 @@ variant_image() {
     esac
 }
 
+# A requested opt-in image should behave like a missing Docker Compose image:
+# build it once, then continue the operation that needed it. Making the
+# administrator run a separate build command and repeat `client add` turns one
+# explicit request into a needless failure/retry loop. The standard image is
+# still owned by linux-setup.sh and is always built during host installation.
+ensure_client_variant_image() {
+    local variant="$1" image setup
+    image="$(variant_image "$variant")"
+
+    if docker_cmd image inspect "$image" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ "$variant" != "cuda-dev" ]; then
+        fail "Base image '$image' not found. Run linux-setup.sh first."
+    fi
+
+    setup="${REPO_DIR}/linux-setup.sh"
+    [ -f "$setup" ] || fail "linux-setup.sh not found at $setup (run: gpudev self-update)"
+
+    echo ""
+    log "cuda-dev was requested, but its image is not built yet."
+    log "Building it now (several GB; the first build can take about 25 minutes)."
+    log "This client will receive SYS_ADMIN + PERFMON for NVIDIA profiling tools."
+    bash "$setup" --build-cuda-dev
+
+    docker_cmd image inspect "$image" >/dev/null 2>&1 \
+        || fail "cuda-dev build finished without producing '$image'."
+    log "cuda-dev image is ready; continuing client provisioning."
+}
+
 # SYS_ADMIN is granted only to cuda-dev: Nsight Compute needs it to read GPU
 # counters inside a container, but it is close to root on the host.
 variant_run_flags() {
@@ -457,6 +488,8 @@ cmd_client_add() {
         *) fail "Unknown variant '$variant'. Known variants: default, cuda-dev." ;;
     esac
 
+    require_host_setup
+
     if [ -n "$ssh_key" ] && [ -n "$key_file" ]; then
         fail "Use --key or --key-file, not both."
     fi
@@ -482,6 +515,7 @@ cmd_client_add() {
 with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-file." ;;
     esac
 
+    ensure_client_variant_image "$variant"
     GPUDEV_VARIANT="$variant" bash "$CLIENT_SETUP" "$name" "$ssh_key"
 
     # Close the loop: the notebook still needs the hostname to write its ssh

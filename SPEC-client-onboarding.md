@@ -161,6 +161,7 @@ first step.
 | `core.py` | `gpu_setup`: print the admin command; skip the stanza when no hostname |
 | `core.py` | `gpu`: accept and honour `--hostname`; refuse clearly when no stanza |
 | `client_setup.py` | `setup_client`: `hostname` optional; return whether the stanza was written |
+| `gpudev` | a missing requested `cuda-dev` image is built once inside `client add`, which then continues provisioning |
 | `LINUX-QUICKSTART.md` | Part 2 written against this flow |
 
 ## Failure modes
