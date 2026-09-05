@@ -1410,9 +1410,9 @@ require_interactive_sudo() {
     local what="$1"
     sudo -n true 2>/dev/null && return 0
     [ -t 0 ] && return 0
-    fail "'gpudev ssh ${what}' needs sudo, and this session has no terminal to
+    fail "'${what}' needs sudo, and this session has no terminal to
 authenticate on. Run it from an interactive shell on the host:
-  gpudev ssh ${what}"
+  ${what}"
 }
 
 cmd_ssh_status() {
@@ -1464,7 +1464,7 @@ cmd_ssh_status() {
 
 cmd_ssh_lockdown() {
     require_host_setup
-    require_interactive_sudo "lockdown"
+    require_interactive_sudo "gpudev ssh lockdown"
     local key port
     key="$(host_get admin_ssh_key)"
     port="$(host_get host_ssh_port)"
@@ -1554,7 +1554,7 @@ Install it first:  ssh-copy-id -i ~/.ssh/gpudev-admin.pub $(whoami)@<this-host>"
 # this, you are at the console, where the port is irrelevant anyway.
 cmd_ssh_unlock() {
     require_host_setup
-    require_interactive_sudo "unlock"
+    require_interactive_sudo "gpudev ssh unlock"
     local port
     port="$(host_get host_ssh_port)"
     [ -n "$port" ] || port=22
@@ -2239,6 +2239,7 @@ cmd_reset() {
     done
 
     require_host_setup
+    require_interactive_sudo "gpudev reset"
 
     # Reset deletes the tunnel, which is the path a remote session arrives on.
     # Running it from such a session cuts the operator off mid-reset, with the
@@ -2324,7 +2325,19 @@ Or --force if you accept being disconnected."
         sudo rm -f "$f" 2>/dev/null || true
     done < <(gpudev_system_files)
     command_exists systemctl && sudo systemctl daemon-reload >/dev/null 2>&1 || true
-    log "System files removed."
+
+    local leftover=""
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        [ -e "$f" ] && leftover="${leftover}  ${f}\n"
+    done < <(gpudev_system_files)
+    if [ -n "$leftover" ]; then
+        warn "These system files could not be removed:"
+        printf '%b' "$leftover" >&2
+        warn "The next install will NOT be testing a clean host. Remove them with sudo."
+    else
+        log "System files removed."
+    fi
 
     # cert.pem is the ACCOUNT credential from `cloudflared tunnel login`, not
     # tunnel state. Keeping it saves a browser round-trip on the next install.
@@ -2462,6 +2475,7 @@ cmd_uninstall() {
     done
 
     require_host_setup
+    require_interactive_sudo "gpudev uninstall"
     local user admin_key
     user="$(host_get linux_user)"
     admin_key="$(host_get admin_ssh_key)"
