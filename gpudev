@@ -1858,6 +1858,24 @@ ensure_wsl_interop() {
     return 0
 }
 
+# A sleep request arriving seconds after a resume is almost always a queued
+# `ssh gpudev sleep` that hung on the tunnel while the host was unreachable and
+# completed the instant it came back. Observed on this host: woke 22:48:15 from
+# a magic packet, a tunnel session landed 22:49:30 and suspended it 22:49:31 —
+# 76 seconds of uptime, which from outside is indistinguishable from
+# "wake-on-LAN failed", and sends the operator hunting the wrong bug.
+# Overridable so the guard can be tuned, and tested without waiting.
+POWER_RESUME_GUARD_SECONDS="${POWER_RESUME_GUARD_SECONDS:-60}"
+
+seconds_since_resume() {
+    local stamp epoch
+    stamp="$(systemctl show systemd-suspend.service -p InactiveEnterTimestamp --value 2>/dev/null)"
+    # Empty or "n/a" when the host has not suspended this boot — nothing to guard.
+    case "$stamp" in ""|"n/a") return 1 ;; esac
+    epoch="$(date -d "$stamp" +%s 2>/dev/null)" || return 1
+    echo $(( $(date +%s) - epoch ))
+}
+
 execute_power_action() {
     local action="$1"
     require_host_setup
@@ -1892,6 +1910,21 @@ execute_power_action() {
             # rule for exactly these two commands).
             local sysctl_action
             sysctl_action="$([ "$action" = "reboot" ] && echo reboot || echo suspend)"
+
+            if [ "$action" = "sleep" ] && [ "${GPUDEV_POWER_FORCE:-0}" != "1" ]; then
+                local since=""
+                since="$(seconds_since_resume 2>/dev/null || true)"
+                if [ -n "$since" ] && [ "$since" -lt "$POWER_RESUME_GUARD_SECONDS" ]; then
+                    fail "Refusing to sleep: this host resumed ${since}s ago.
+
+A sleep arriving this soon is usually a queued 'ssh gpudev sleep' that waited
+out the last sleep and fired the moment the host came back — which looks like
+wake-on-LAN failing, because the machine wakes and vanishes again.
+
+If you meant it:  gpudev power sleep now --force"
+                fi
+            fi
+
             log "Running: systemctl $sysctl_action"
             [ -n "${GPUDEV_POWER_DRYRUN:-}" ] && { echo "[dry-run] sudo systemctl $sysctl_action"; return 0; }
             sudo systemctl "$sysctl_action"
@@ -2032,6 +2065,17 @@ cancel_power_timers() {
 }
 
 cmd_power() {
+    # --force may appear anywhere; strip it before positional parsing.
+    local _args=() _a
+    for _a in "$@"; do
+        if [ "$_a" = "--force" ]; then
+            GPUDEV_POWER_FORCE=1
+        else
+            _args+=("$_a")
+        fi
+    done
+    set -- ${_args[@]+"${_args[@]}"}
+
     local action="${1:-}" when="${2:-}" extra="${3:-}"
     [ -z "$extra" ] || fail "Too many arguments. Use: gpudev power <sleep|reboot> [now|duration]"
     case "$action" in
@@ -2240,7 +2284,7 @@ SSH / host access:
 
 Power:
   gpudev power setup
-  gpudev power sleep [now|30s|60m|2h|1d]
+  gpudev power sleep [now|30s|60m|2h|1d] [--force]
   gpudev power reboot [now|30s|60m|2h|1d]
   gpudev power status
   gpudev power cancel [all|sleep|reboot|job-id]
