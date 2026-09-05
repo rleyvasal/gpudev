@@ -135,11 +135,14 @@ Nothing irreversible before step 5.
 2. **Preconditions** — usable password; foreign-workload scan (below)
 3. **Unwrap the key** — rewrite `authorized_keys` from `command="…" <key>` to
    bare `<key>`, matching on type + blob so a wrapped entry is recognised
-4. **Revert sshd** — `Port 22`, passwords on, `sshd -t`, restart, confirm 22 is
-   listening; roll back and abort if not
+4. **Provisionally revert sshd** — back up `sshd_config` and `authorized_keys`,
+   then set `Port 22`, passwords on, run `sshd -t`, restart, and confirm 22 is
+   listening. Any failure or interruption restores both backups and reloads the
+   original listener.
 5. **Prove access** — a *fresh* login on port 22, observed after the prompt.
    Unlike `ssh lockdown`, **either** publickey or password counts: the goal here
-   is access, not key auth. Stale evidence is still never accepted
+   is access, not key auth. Stale evidence is still never accepted. A timeout
+   restores the original sshd configuration and forced-command key wrapper.
 6. **Remove** gpudev state, units, sudoers, config, `~/bin`, `~/gpudev`
 7. **Cloud state** — delete client CNAMEs and the tunnel, using the `apiToken`
    in `~/.cloudflared/cert.pem`
@@ -147,8 +150,9 @@ Nothing irreversible before step 5.
 9. **Shared components** — per provenance and prompt (below)
 10. **Final message** — keep-this-session-open warning, and what was left behind
 
-If step 5 fails, stop: re-wrap nothing, remove nothing, and say the box is still
-fully functional.
+If step 5 fails, restore the original sshd configuration and exact
+`authorized_keys`, reload the original listener, remove nothing, and report
+whether that listener was verified.
 
 ---
 

@@ -1409,10 +1409,13 @@ CFPORT
 require_interactive_sudo() {
     local what="$1"
     sudo -n true 2>/dev/null && return 0
-    [ -t 0 ] && return 0
-    fail "'${what}' needs sudo, and this session has no terminal to
+    if [ ! -t 0 ]; then
+        fail "'${what}' needs sudo, and this session has no terminal to
 authenticate on. Run it from an interactive shell on the host:
   ${what}"
+    fi
+    log "sudo authentication is required for: ${what}"
+    sudo -v || fail "Could not authenticate sudo for '${what}'."
 }
 
 cmd_ssh_status() {
@@ -2421,6 +2424,9 @@ PY
 # the forced-command wrapper, and leaves no way back in. P = usable password.
 account_has_password() {
     local user="${1:-$(whoami)}"
+    # require_interactive_sudo has already authenticated. Keep this probe
+    # non-interactive so an expired credential is a legible refusal, not a
+    # surprise prompt in the middle of the precondition checks.
     sudo -n passwd -S "$user" 2>/dev/null | awk '{print $2}' | grep -qx P
 }
 
@@ -2428,7 +2434,7 @@ account_has_password() {
 # anything ELSE is now relying on it. Someone may have started using this Docker
 # after gpudev installed it, which makes the flag correct and still wrong.
 foreign_docker_workloads() {
-    local names known found=""
+    local names found=""
     names="$(all_client_names 2>/dev/null || true)"
     local c
     while IFS= read -r c; do
@@ -2469,6 +2475,104 @@ print('yes' if p.get('${component}') is True else ('no' if '${component}' in p e
     printf '%s' "$answer"
 }
 
+# The SSH revert is provisional until a fresh port-22 login proves it. Any
+# failure or Ctrl-C before that point restores BOTH sshd_config and the exact
+# authorized_keys file, then reloads sshd so the tunnel continues to match the
+# original port. Globals are used because the EXIT trap runs outside the local
+# scope where it was armed.
+UNINSTALL_ACCESS_ROLLBACK_ARMED=0
+UNINSTALL_SSHD_BACKUP=""
+UNINSTALL_AUTH_KEYS_BACKUP=""
+UNINSTALL_AUTH_KEYS_EXISTED=0
+UNINSTALL_PREV_SSH_PORT=""
+
+rollback_uninstall_access() {
+    [ "$UNINSTALL_ACCESS_ROLLBACK_ARMED" = "1" ] || return 0
+    UNINSTALL_ACCESS_ROLLBACK_ARMED=0
+    warn "Access was not proven — restoring the original SSH configuration."
+    local restore_failed=0
+
+    if [ -n "$UNINSTALL_SSHD_BACKUP" ] && [ -f "$UNINSTALL_SSHD_BACKUP" ]; then
+        sudo cp "$UNINSTALL_SSHD_BACKUP" "$SSHD_CONFIG" \
+            || { warn "Could not restore $SSHD_CONFIG from $UNINSTALL_SSHD_BACKUP"; restore_failed=1; }
+    fi
+
+    local authorized="${HOME}/.ssh/authorized_keys"
+    if [ "$UNINSTALL_AUTH_KEYS_EXISTED" = "1" ] \
+       && [ -n "$UNINSTALL_AUTH_KEYS_BACKUP" ] \
+       && [ -f "$UNINSTALL_AUTH_KEYS_BACKUP" ]; then
+        cp "$UNINSTALL_AUTH_KEYS_BACKUP" "$authorized" \
+            && chmod 600 "$authorized" \
+            || { warn "Could not restore $authorized from $UNINSTALL_AUTH_KEYS_BACKUP"; restore_failed=1; }
+    elif [ "$UNINSTALL_AUTH_KEYS_EXISTED" = "0" ]; then
+        rm -f "$authorized" \
+            || { warn "Could not remove newly created $authorized"; restore_failed=1; }
+    fi
+
+    if sudo sshd -t 2>/dev/null; then
+        if ssh_socket_activated; then
+            sudo systemctl daemon-reload >/dev/null 2>&1 \
+                || { warn "Could not reload systemd while restoring SSH."; restore_failed=1; }
+            sudo systemctl restart ssh.socket >/dev/null 2>&1 \
+                || { warn "Could not restart ssh.socket while restoring SSH."; restore_failed=1; }
+        fi
+        sudo systemctl restart ssh >/dev/null 2>&1 \
+            || { warn "Could not restart ssh.service while restoring SSH."; restore_failed=1; }
+    else
+        warn "The restored sshd configuration did not validate; inspect $SSHD_CONFIG now."
+        restore_failed=1
+    fi
+
+    if [ -n "$UNINSTALL_PREV_SSH_PORT" ] \
+       && ssh_port_listening "$UNINSTALL_PREV_SSH_PORT"; then
+        log "Original SSH access restored on port ${UNINSTALL_PREV_SSH_PORT}."
+    else
+        warn "Could not verify the original SSH listener. Keep this session open and check sshd."
+        restore_failed=1
+    fi
+
+    if [ "$restore_failed" = "0" ]; then
+        rm -f "$UNINSTALL_SSHD_BACKUP" "$UNINSTALL_AUTH_KEYS_BACKUP"
+        UNINSTALL_SSHD_BACKUP=""
+        UNINSTALL_AUTH_KEYS_BACKUP=""
+    else
+        warn "Recovery backups were kept for manual repair:"
+        warn "  sshd: $UNINSTALL_SSHD_BACKUP"
+        warn "  keys: $UNINSTALL_AUTH_KEYS_BACKUP"
+    fi
+}
+
+uninstall_access_exit_trap() {
+    local status=$?
+    rollback_uninstall_access
+    return "$status"
+}
+
+remove_shared_component() {
+    local component="$1" path=""
+    case "$component" in
+        docker)
+            sudo apt-get purge -qy docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin || return 1
+            hash -r 2>/dev/null || true
+            ! command_exists docker
+            ;;
+        nvidia_container_toolkit)
+            sudo apt-get purge -qy nvidia-container-toolkit || return 1
+            ! dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null \
+                | grep -q 'ok installed'
+            ;;
+        cloudflared)
+            path="$(command -v cloudflared 2>/dev/null || true)"
+            [ -z "$path" ] && return 0
+            sudo rm -f "$path" || return 1
+            hash -r 2>/dev/null || true
+            ! command_exists cloudflared
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_uninstall() {
     local dry_run=0 purge_data=0 keep_ssh=0 assume_yes=0 force=0
     while [ $# -gt 0 ]; do
@@ -2487,6 +2591,14 @@ cmd_uninstall() {
     user="$(host_get linux_user)"
     admin_key="$(host_get admin_ssh_key)"
 
+    # Snapshot evidence that reset deliberately deletes. Uninstall still needs
+    # these answers afterwards to decide which shared components it may offer
+    # to remove and whether Docker has foreign workloads.
+    local docker_provenance toolkit_provenance cloudflared_provenance foreign_docker=""
+    docker_provenance="$(provenance_says_ours docker)"
+    toolkit_provenance="$(provenance_says_ours nvidia_container_toolkit)"
+    cloudflared_provenance="$(provenance_says_ours cloudflared)"
+
     echo ""
     echo "gpudev uninstall — this removes gpudev from this host."
     reset_manifest "$purge_data" uninstall
@@ -2504,7 +2616,11 @@ cmd_uninstall() {
     local comp state
     echo "Shared components:"
     for comp in docker nvidia_container_toolkit cloudflared; do
-        state="$(provenance_says_ours "$comp")"
+        case "$comp" in
+            docker)                   state="$docker_provenance" ;;
+            nvidia_container_toolkit) state="$toolkit_provenance" ;;
+            cloudflared)              state="$cloudflared_provenance" ;;
+        esac
         case "$state" in
             yes)     echo "  ${comp}: installed by gpudev — you will be asked" ;;
             no)      echo "  ${comp}: was already present — keeping" ;;
@@ -2520,13 +2636,27 @@ cmd_uninstall() {
 
     require_interactive_sudo "gpudev uninstall"
 
-    if session_rides_tunnel && [ "$force" != "1" ]; then
-        fail "This session arrives over the tunnel, which uninstall deletes.
-Re-run from the console or a LAN session, or --force to accept losing access."
+    # This can fall back to sudo Docker access, so keep it beyond --dry-run's
+    # no-sudo gate. It still runs before reset removes clients.json.
+    if [ "$docker_provenance" = "yes" ]; then
+        foreign_docker="$(foreign_docker_workloads 2>/dev/null || true)"
     fi
 
-    if [ "$keep_ssh" != "1" ] && [ "$force" != "1" ]; then
-        if ! account_has_password "$user"; then
+    if session_rides_tunnel; then
+        if [ "$force" = "1" ]; then
+            warn "--force: this session uses the tunnel; uninstall will disconnect it."
+        else
+            fail "This session arrives over the tunnel, which uninstall deletes.
+Re-run from the console or a LAN session, or --force to accept losing access."
+        fi
+    fi
+
+    if [ "$keep_ssh" != "1" ]; then
+        if [ "$force" = "1" ]; then
+            warn "--force: skipping the usable-password precondition and fresh-login proof."
+            warn "  sshd will move to port 22 and the admin key will be unwrapped without"
+            warn "  proving that another login works. Keep this session open."
+        elif ! account_has_password "$user"; then
             fail "Account '${user}' has no usable password (passwd -S is not 'P').
 
 Re-enabling password login would move the port and drop the key wrapper while
@@ -2545,6 +2675,23 @@ first with: sudo passwd ${user}"
 
     # --- Access first. Nothing irreversible before this succeeds. ---
     if [ "$keep_ssh" != "1" ]; then
+        local authorized="${HOME}/.ssh/authorized_keys"
+        UNINSTALL_SSHD_BACKUP="$(mktemp)"
+        UNINSTALL_AUTH_KEYS_BACKUP="$(mktemp)"
+        UNINSTALL_AUTH_KEYS_EXISTED=0
+        UNINSTALL_PREV_SSH_PORT="$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null \
+                                  | awk '{print $2}' | head -1)"
+        [ -n "$UNINSTALL_PREV_SSH_PORT" ] || UNINSTALL_PREV_SSH_PORT=22
+        sudo cp "$SSHD_CONFIG" "$UNINSTALL_SSHD_BACKUP"
+        if [ -f "$authorized" ]; then
+            cp "$authorized" "$UNINSTALL_AUTH_KEYS_BACKUP"
+            UNINSTALL_AUTH_KEYS_EXISTED=1
+        fi
+        UNINSTALL_ACCESS_ROLLBACK_ARMED=1
+        trap uninstall_access_exit_trap EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
         if [ -n "$admin_key" ]; then
             if [ "$(unwrap_admin_key "$admin_key")" = "unwrapped" ]; then
                 log "Admin key unwrapped — it no longer depends on ~/bin."
@@ -2554,14 +2701,18 @@ first with: sudo passwd ${user}"
         set_sshd_option "PubkeyAuthentication"   "yes"
         set_sshd_option "PasswordAuthentication" "yes"
         if ! sudo sshd -t 2>/dev/null; then
-            fail "sshd config test failed — nothing else was changed."
+            rollback_uninstall_access
+            fail "sshd config test failed — original SSH configuration restored."
         fi
         apply_ssh_port 22
         local waited=0
         while [ $waited -lt 10 ] && ! ssh_port_listening 22; do
             sleep 1; waited=$((waited + 1))
         done
-        ssh_port_listening 22 || fail "Port 22 is not listening — aborting before removal."
+        if ! ssh_port_listening 22; then
+            rollback_uninstall_access
+            fail "Port 22 did not start listening — original SSH configuration restored."
+        fi
 
         if [ "$force" != "1" ]; then
             local since tries=30
@@ -2580,41 +2731,57 @@ first with: sudo passwd ${user}"
                 sleep 2; tries=$((tries - 1))
             done
             if [ "$ok" != "1" ]; then
-                fail "No login seen. NOTHING has been removed — the host is intact.
-sshd is now on port 22 with passwords enabled; re-run when you can log in,
-or use 'gpudev ssh lockdown' to put it back."
+                rollback_uninstall_access
+                fail "No fresh login seen. Nothing was removed, and the original SSH
+configuration and key wrapper were restored."
             fi
             log "Login confirmed. Proceeding."
         fi
+
+        # Access is proven (or explicitly forced). From this point the port-22
+        # state is intentional and the destructive phase may begin.
+        UNINSTALL_ACCESS_ROLLBACK_ARMED=0
+        trap - EXIT INT TERM
+        rm -f "$UNINSTALL_SSHD_BACKUP" "$UNINSTALL_AUTH_KEYS_BACKUP"
+        UNINSTALL_SSHD_BACKUP=""
+        UNINSTALL_AUTH_KEYS_BACKUP=""
     fi
 
     # --- From here it is destructive. ---
-    cmd_reset --yes ${purge_data:+--purge-data} --force || true
+    local reset_args=(--yes --force)
+    if [ "$purge_data" = "1" ]; then
+        reset_args+=(--purge-data)
+    fi
+    cmd_reset "${reset_args[@]}"
 
     log "Removing images and build cache..."
-    docker_cmd rmi -f gpudev-base:latest gpudev-base-cuda-dev:latest >/dev/null 2>&1 || true
-    docker_cmd builder prune -af >/dev/null 2>&1 || true
+    docker_cmd rmi -f gpudev-base:latest gpudev-base-cuda-dev:latest >/dev/null 2>&1 \
+        || warn "One or more gpudev images could not be removed."
+    docker_cmd builder prune -af >/dev/null 2>&1 \
+        || warn "The BuildKit cache could not be completely pruned."
 
     local answer
     for comp in docker nvidia_container_toolkit cloudflared; do
-        [ "$(provenance_says_ours "$comp")" = "yes" ] || continue
-        local foreign
-        foreign="$(foreign_docker_workloads 2>/dev/null || true)"
-        if [ "$comp" = "docker" ] && [ -n "$foreign" ]; then
+        case "$comp" in
+            docker)                   state="$docker_provenance" ;;
+            nvidia_container_toolkit) state="$toolkit_provenance" ;;
+            cloudflared)              state="$cloudflared_provenance" ;;
+        esac
+        [ "$state" = "yes" ] || continue
+        if [ "$comp" = "docker" ] && [ -n "$foreign_docker" ]; then
             warn "Keeping Docker — something else is using it:"
-            printf '%b' "$foreign" >&2
+            printf '%b' "$foreign_docker" >&2
             continue
         fi
         printf "Remove %s (gpudev installed it)? [y/N]: " "$comp"
         IFS= read -r answer
         case "$answer" in
             y|Y)
-                case "$comp" in
-                    docker) sudo apt-get purge -qy docker-ce docker-ce-cli containerd.io >/dev/null 2>&1 || true ;;
-                    nvidia_container_toolkit) sudo apt-get purge -qy nvidia-container-toolkit >/dev/null 2>&1 || true ;;
-                    cloudflared) sudo rm -f "$(command -v cloudflared)" 2>/dev/null || true ;;
-                esac
-                log "  ${comp} removed."
+                if remove_shared_component "$comp" >/dev/null 2>&1; then
+                    log "  ${comp} removed and verified absent."
+                else
+                    warn "  ${comp} could not be completely removed; inspect it manually."
+                fi
                 ;;
             *) log "  ${comp} kept." ;;
         esac
