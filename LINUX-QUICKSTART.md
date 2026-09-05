@@ -6,8 +6,8 @@ because you have a physical console and no Windows host underneath.
 
 **Part 1 — admin setup**: from BIOS settings on bare hardware, through the
 Ubuntu install and remote SSH access, to a finished `linux-setup.sh`.
-**Part 2 — onboarding a notebook client**: `%gpu_setup` → `client add` →
-`%gpu`.
+**Part 2 — onboarding a notebook client**: `%gpudev_setup` → `client add` →
+`%gpudev`.
 
 ---
 
@@ -443,7 +443,7 @@ socket generator, rather than leaving a hand-edited config behind.
 
 Part 1 left you with a working host. This part adds one **client**: a container
 with its own GPU access, its own SSH identity, and its own tunnel hostname,
-which a SolveIt notebook connects to with `%gpu <name>`.
+which a SolveIt notebook connects to with `%gpudev <name>`.
 
 Two people are usually involved — the **administrator** on the host, and the
 **user** in the notebook. The steps say which is which. If you are both, you
@@ -460,26 +460,31 @@ the flow below hits it.
 
 ---
 
-## Step 1 (user) — run one cell in SolveIt
+## Step 1 (user) — one-time setup, one cell in SolveIt
 
 ```
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py solveit --domain example.com
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup solveit --domain example.com
 ```
 
-The first line installs the client runtime into **`~/.gpudev-client`** — the
-same path line 2 runs it from, so the destination is visible in the cell rather
-than hidden in a default. It fetches only the ten files a client actually runs
-(~192 KB), not the host-side scripts and not repository history.
+Each line does exactly one job:
+
+| Line | Job | How often |
+|---|---|---|
+| `!curl … sh` | fetch the runtime into `~/.gpudev-client` | once, plus for fixes |
+| `%run …/CRAFT.py` | load the magics — nothing else | every session |
+| `%gpudev_setup …` | make this client's key and SSH entry | **once, ever** |
+
+The first line fetches only the ten files a client actually runs (~192 KB), not
+the host-side scripts and not repository history, into **`~/.gpudev-client`** —
+the same path line 2 loads from, so the destination is visible in the cell
+rather than hidden in a default.
 
 Home-relative on purpose. In SolveIt the home directory *is* the persistent
 storage (`cd ~` lands in `/app/data`), so this survives kernel restarts, and the
 same cell is correct on a local Jupyter or Colab where no SolveIt path exists.
 It is why `~/.ssh/gpudev-<name>` persists too.
-
-The second line loads CRAFT **and** runs setup: `%run script.py args` fills
-`sys.argv`, and `CRAFT.py` is already the `%run` entry point. Two lines is the
-floor here, because a cold client has to fetch something before it can run it.
 
 ### Installing on another volume
 
@@ -489,7 +494,8 @@ prints both paths:
 
 ```
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py solveit --domain example.com
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup solveit --domain example.com
 ```
 
 Choose somewhere persistent — a temp directory means re-fetching after every
@@ -505,16 +511,15 @@ it, so it is safe to paste again.
 
 ### Which line takes which options
 
-Line 1 fetches; line 2 sets up the client. **Everything about the client —
-`--domain`, `--variant`, `--hostname` — goes on line 2, after `CRAFT.py`.** Line
-1 takes only the `GPUDEV_*` environment variables, which are rarely needed.
+**Everything about the client goes on the `%gpudev_setup` line** — `--domain`,
+`--variant`, `--hostname`. `%run` takes no arguments; the fetch line takes only
+the `GPUDEV_*` environment variables, which are rarely needed.
 
 For `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation, ask for the
-`cuda-dev` variant on line 2, leaving line 1 exactly as printed:
+`cuda-dev` variant at setup time. Only the last line changes:
 
 ```
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py solveit --domain example.com --variant cuda-dev
+%gpudev_setup solveit --domain example.com --variant cuda-dev
 ```
 
 The generated admin command carries the choice forward and warns that this
@@ -553,11 +558,11 @@ You do not strictly need it. Without `--domain` the key is still generated and
 the admin command still printed; if another gpudev client is already configured
 on this notebook, CRAFT learns the domain from its SSH entry anyway. Otherwise
 the administrator returns the hostname after provisioning and the user supplies
-it once on the first `%gpu`.
+it once on the first `%gpudev`.
 
 ## Step 2 (user ↔ admin) — one round trip
 
-`%gpu_setup` prints the administrator's whole command:
+`%gpudev_setup` prints the administrator's whole command:
 
 ```
 Send this line to your gpudev administrator:
@@ -599,7 +604,7 @@ It finishes by printing the line to send back:
 ```
 Send this line back to the client:
 
-  %gpu solveit --hostname solveit.example.com
+  %gpudev solveit --hostname solveit.example.com
 ```
 
 ## Step 3 (user) — connect
@@ -607,22 +612,35 @@ Send this line back to the client:
 If step 1 used `--domain`, the SSH entry already exists:
 
 ```
-%gpu solveit
+%gpudev solveit
 ```
 
 If it did not, run the line the administrator sent back once, which writes the
 entry and connects:
 
 ```
-%gpu solveit --hostname solveit.example.com
+%gpudev solveit --hostname solveit.example.com
 ```
 
-Either way, plain `%gpu solveit` is the everyday command from then on, in this
+Either way, plain `%gpudev solveit` is the everyday command from then on, in this
 and every other notebook that shares the same persistent SolveIt storage.
+
+### Every session after this
+
+Setup never runs again. A new notebook, or a restarted kernel, needs two lines:
+
+```
+%run ~/.gpudev-client/CRAFT.py
+%gpudev solveit
+```
+
+`%run` reloads the magics into the fresh kernel; `%gpudev` reconnects. Put the
+`!curl … sh` line back on top only when you want to pick up fixes — it costs a
+40-byte request when already current.
 
 ### Version drift
 
-On connecting, `%gpu` compares this client's `VERSION` against the container's
+On connecting, `%gpudev` compares this client's `VERSION` against the container's
 `kernel-manager.sh version` and notes a mismatch once per session:
 
 ```
@@ -649,7 +667,7 @@ prerequisite.
 ## Troubleshooting
 
 **`No SSH config for 'solveit' yet`** — the hostname was never supplied. Run
-the `%gpu <name> --hostname <host>` line the administrator printed.
+the `%gpudev <name> --hostname <host>` line the administrator printed.
 
 **`Could not resolve hostname gpudev-solveit`** — you used the alias without
 the entry existing. Same fix as above.
@@ -667,7 +685,7 @@ gpudev cloudflare
 sudo systemctl restart gpudev-tunnel
 ```
 
-**Nothing happens on `%gpu`** — check the client is running:
+**Nothing happens on `%gpudev`** — check the client is running:
 
 ```bash
 gpudev client list

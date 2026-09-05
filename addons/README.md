@@ -4,12 +4,12 @@ Optional tools loaded with the **same pattern as core**:
 
 ```text
 %local
-# Always the same loaders (CRAFT optional — auto-detected for %gpu seed):
+# Always the same loaders (CRAFT optional — auto-detected for %gpudev seed):
 %run /path/to/gpudev/addons/tidy3.py       # or %run …/tidy3/tidy3.py
 %run /path/to/gpudev/addons/plot3.py       # or %run …/plot3/plot3.py
 # Only if you need GPU:
 %run /path/to/gpudev/CRAFT.py
-%gpu
+%gpudev
 ```
 
 gpudev `addons/tidy3.py` / `addons/plot3.py` / `addons/sslive.py` are thin
@@ -20,8 +20,8 @@ wrappers that locate the clone and run the package loaders.
 | **pcviz** | `addons/pcviz.py` | this repo | `%pointcloud` … |
 | **mojo** | `addons/mojo.py` | this repo | `%gpum` `%mojo_*` … |
 | **sslive** | `addons/sslive.py` + `addons/sslive` → link | [sslive](https://github.com/rleyvasal/sslive) | `%sslive` …; ▶ Run auto GPU/local |
-| **tidy3** | `addons/tidy3.py` + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run`; remote seed under `%gpu` |
-| **plot3** | `addons/plot3.py` + `addons/plot3` → link | [plot3](https://github.com/rleyvasal/plot3) | `ggplot` / `%plot3`; iframe + red-eye in SolveIt; remote seed under `%gpu` |
+| **tidy3** | `addons/tidy3.py` + `addons/tidy3` → link | [tidy3](https://github.com/rleyvasal/tidy3) | `tidy` / `>>` / `%%tidy3_run`; remote seed under `%gpudev` |
+| **plot3** | `addons/plot3.py` + `addons/plot3` → link | [plot3](https://github.com/rleyvasal/plot3) | `ggplot` / `%plot3`; iframe + red-eye in SolveIt; remote seed under `%gpudev` |
 
 ### sslive (one command)
 
@@ -32,7 +32,7 @@ wrappers that locate the clone and run the package loaders.
 %sslive
 ```
 
-CRAFT is optional. Load CRAFT + `%gpu` when you want remote ▶ Run; no second
+CRAFT is optional. Load CRAFT + `%gpudev` when you want remote ▶ Run; no second
 sslive recipe.
 
 ## SolveIt: tidy3 + plot3 together
@@ -51,7 +51,7 @@ CRAFT: tidy3 0.x loaded (local) from ...
 CRAFT: plot3 0.x loaded (local) from ...
 ```
 
-Then (still under `%local`, or after `%gpu` once seeded):
+Then (still under `%local`, or after `%gpudev` once seeded):
 
 ```python
 from tidy3 import tidy, filter, select, col   # often already in user_ns
@@ -69,7 +69,7 @@ tidy(cars)
 In **SolveIt**, figures render as an **iframe** (WebGL). The cell is marked
 `skipped=1` (red eye) so large HTML does not enter the LLM context.
 
-Under **`%gpu`**:
+Under **`%gpudev`**:
 
 - tidy3 / plot3 source is **seeded to the remote** automatically
 - `%plot3` stays **host-local** (viewer + hide-from-AI on the dialog machine)
@@ -107,7 +107,7 @@ pip install -e /path/to/plot3
 An addon must register its **entire public surface itself** via `get_ipython()`:
 
 - magics through the magics manager, plus `register_local_magic('%name')` so
-  they run on the host under `%gpu`;
+  they run on the host under `%gpudev`;
 - any names meant for direct cell use written explicitly into `user_ns`.
 
 Never rely on `%run` leaking module globals into the dialog namespace.
@@ -117,9 +117,9 @@ Never rely on `%run` leaking module globals into the dialog namespace.
 CRAFT core only:
 
 - manages the SSH / kernel connection
-- switches `%local` / `%gpu`
+- switches `%local` / `%gpudev`
 - routes the original cell text to the selected backend
-- knows its own host magics: `%gpu`, `%local`, `%kernel_status`, `%restart_kernel`
+- knows its own host magics: `%gpudev`, `%local`, `%kernel_status`, `%restart_kernel`
 - does **no** package-specific rewriting (`!`, tidyselect, ggplot, …)
 
 Package addons own their syntax:
@@ -147,7 +147,7 @@ Rules:
 
 1. **`PythonBackend.passthru()` stays boring** — local vs remote only (core
    magics, `get_ipython()`, router internals). No syntax rewrite there.
-   Under `%gpu`, notebook shell cells (`!ls`, `!whoami`, `!pip …`) route to
+   Under `%gpudev`, notebook shell cells (`!ls`, `!whoami`, `!pip …`) route to
    the remote kernel like any other cell — do **not** force-`!` passthru to
    the host (that masks whether the GPU session is live).
 2. Transforms are registered only when the addon is loaded, enabled only while
@@ -159,6 +159,6 @@ Rules:
 
 ## Order
 
-1. Always load **CRAFT core** first if you need `%gpu` / `remote_run_`.
+1. Always load **CRAFT core** first if you need `%gpudev` / `remote_run_`.
 2. Then load any addons under **`%local`**.
-3. Then **`%gpu`** for remote Python cells.
+3. Then **`%gpudev`** for remote Python cells.

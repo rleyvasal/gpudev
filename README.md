@@ -26,13 +26,13 @@ gpudev/
 %run /path/to/gpudev/addons/mojo.py
 %run /path/to/gpudev/addons/sslive.py
 %run /path/to/gpudev/addons/tidy3.py
-%gpu alice
+%gpudev alice
 %sslive
 ```
 
 | Load | Provides |
 |------|----------|
-| `CRAFT.py` | `%gpu <client>` `%gpu_setup` `%local` `%kernel_status` `remote_run_` |
+| `CRAFT.py` | `%gpudev <client>` `%gpudev_setup` `%local` `%kernel_status` `remote_run_` |
 | `addons/pcviz.py` | `%pointcloud` `%pointcloud_var` `%pointcloud_plotly` |
 | `addons/mojo.py` | `%gpum` `%mojo_*` `%bench` |
 | `addons/sslive.py` | `%sslive` `%sslive_export` (link `addons/sslive` → sslive clone) |
@@ -66,7 +66,7 @@ The system has three roles. They are physically and cryptographically separated.
 |---|---|---|---|
 | **Admin** | your laptop | admin SSH private key | provision/remove clients, reboot/sleep host, update host software, view all logs |
 | **Host** | Windows + WSL2 (this guide) or bare Linux | Docker, the gpudev CLI, all client containers, Cloudflare connector | runs everything; no outbound calls except cloudflared |
-| **Client** | a notebook machine (e.g. SolveIt cloud VM) | one locally generated SSH private key per client identity | runs CRAFT.py, routes each notebook kernel to the container named by `%gpu <client>`; cannot reach the host or other clients |
+| **Client** | a notebook machine (e.g. SolveIt cloud VM) | one locally generated SSH private key per client identity | runs CRAFT.py, routes each notebook kernel to the container named by `%gpudev <client>`; cannot reach the host or other clients |
 
 A client cannot become an admin: it gets its own SSH key (scoped to its
 container's port-mapped sshd), no access to the host's admin SSH service, no
@@ -159,7 +159,7 @@ ssh gpudev reboot 15m         # reboot it in 15 minutes
 
 The setup keeps normal SSH commands working, so after opening the dashboard you
 can still run `gpudev client add alice --key "ssh-ed25519 ..."` to provision a
-client container from the key the user's `%gpu_setup` printed. Each notebook you
+client container from the key the user's `%gpudev_setup` printed. Each notebook you
 onboard gets its own SSH key, container, and GPU access.
 
 ---
@@ -489,9 +489,9 @@ either pastes a cell or forwards a line the tool printed.
 |---|---|---|
 | **1** | user | pastes one cell in SolveIt — fetches the runtime, generates the key, prints the admin's command |
 | **2** | → admin → | forwards that command; the admin runs it |
-| **3** | user | `%gpu <name>` |
+| **3** | user | `%gpudev <name>` |
 
-Everyday use after that is `%gpu <name>`, in this and every other notebook.
+Everyday use after that is `%gpudev <name>`, in this and every other notebook.
 
 No `craft.json`, manual SSH-config editing, terminal login, private-key transfer,
 or first-connect confirmation is required. New host fingerprints are accepted
@@ -514,49 +514,54 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 
 ### Step 1 — Start on the client in SolveIt
 
-Run this one cell. Line 1 installs the client runtime into `~/.gpudev-client`;
-line 2 loads CRAFT **and** runs setup from that same path, because `%run
-script.py args` fills `sys.argv` and `CRAFT.py` is already the entry point:
+This cell runs **once, ever**. Three lines, one job each — fetch, load, set up:
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py alice --domain example.com
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup alice --domain example.com
 ```
 
-**The destination is `~/.gpudev-client`, right there on line 2** — no hidden
-path, nothing to configure for the normal case. In SolveIt the home directory
-*is* the persistent storage (`cd ~` lands in `/app/data`), so this survives
-kernel restarts, and it is equally correct on a local Jupyter or Colab. It is
-the same reason `~/.ssh/gpudev-alice` persists.
+| Line | Job | How often |
+|---|---|---|
+| `!curl … sh` | fetch the runtime into `~/.gpudev-client` | once, plus whenever you want fixes |
+| `%run …/CRAFT.py` | load the magics — **nothing else** | every session |
+| `%gpudev_setup …` | make this client's key and SSH entry | **once, ever** |
+
+The destination is `~/.gpudev-client`, named on line 2 — no hidden path,
+nothing to configure. In SolveIt the home directory *is* the persistent storage
+(`cd ~` lands in `/app/data`), so it survives kernel restarts and is equally
+correct on a local Jupyter or Colab. Same reason `~/.ssh/gpudev-alice` persists.
 
 #### Which line takes which options
 
-Line 1 fetches; line 2 sets up your client. **Every option about *your client* —
-`--domain`, `--variant`, `--hostname` — goes on line 2, after `CRAFT.py`.**
+**Everything about your client goes on the `%gpudev_setup` line** — `--domain`,
+`--variant`, `--hostname`. `%run` takes no arguments at all: it only loads
+CRAFT, which is why the same `%run` appears in the every-session cell below.
 
 For `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation, ask for the
-`cuda-dev` variant. The whole cell, with line 1 unchanged:
+`cuda-dev` variant at setup time. Only the last line changes:
 
 ```text
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py alice --domain example.com --variant cuda-dev
+%gpudev_setup alice --domain example.com --variant cuda-dev
 ```
 
 That choice is carried into the administrator command automatically. It also
 warns that `cuda-dev` grants the container `SYS_ADMIN` and `PERFMON`, which is
 why the standard image remains the default.
 
-Line 1 only ever takes the three `GPUDEV_*` environment variables, and you can
-usually ignore all of them:
+The fetch line takes only the three `GPUDEV_*` environment variables, and you
+can usually ignore all of them:
 
-| | Goes on | Examples |
+| | Options go | Examples |
 |---|---|---|
-| **Line 1** — where the runtime comes from and lands | before `sh`, as `export VAR=…` | `GPUDEV_DIR`, `GPUDEV_REF`, `GPUDEV_SLUG` |
-| **Line 2** — everything about your client | after `CRAFT.py` | `--domain`, `--variant`, `--hostname` |
+| `!curl … sh` | before `sh`, as `export VAR=…` | `GPUDEV_DIR`, `GPUDEV_REF`, `GPUDEV_SLUG` |
+| `%run …/CRAFT.py` | *takes none* | — |
+| `%gpudev_setup` | after the client name | `--domain`, `--variant`, `--hostname` |
 
 > **Don't know the domain yet?** Drop `--domain`. The key is still generated and
 > the admin command still printed; the stanza is written later by the
-> `%gpu alice --hostname alice.example.com` line that `client add` prints back.
+> `%gpudev alice --hostname alice.example.com` line that `client add` prints back.
 
 Ask your administrator for the domain — it is public DNS, not a secret, and it
 is the only thing the notebook cannot work out for itself.
@@ -574,7 +579,8 @@ them:
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py alice --domain example.com
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup alice --domain example.com
 ```
 
 **Line 2 still does not change.** When `GPUDEV_DIR` points elsewhere, the
@@ -638,7 +644,7 @@ replaced with the real install, and the old copy is named so you can remove it.
 
 ### Step 2 — The round trip through the administrator
 
-`%gpu_setup` prints a complete command containing only the public key. Forward
+`%gpudev_setup` prints a complete command containing only the public key. Forward
 that whole line — do not retype or extract the key:
 
 ```bash
@@ -651,7 +657,7 @@ the container's SSH service answers through Cloudflare. When it succeeds it
 prints one line, which the administrator returns to the user:
 
 ```text
-%gpu alice --hostname alice.example.com
+%gpudev alice --hostname alice.example.com
 ```
 
 If the forwarded command carried `--variant cuda-dev` and that image is not
@@ -660,26 +666,40 @@ continues. No separate build command is needed.
 
 ### Step 3 — Connect in SolveIt
 
-If step 1 had `--domain`, the SSH stanza already exists and this is all there is:
+CRAFT is already loaded from step 1, so this is all there is:
 
 ```python
-%gpu alice
+%gpudev alice
 ```
 
 That connects as user `gpudev`, records the host fingerprint, attaches the
 kernel, and starts routing. `%local` switches execution back to the notebook.
 
-If you skipped `--domain`, run the line the administrator sent back instead —
-once — and plain `%gpu alice` works from then on, in this and every other
-notebook:
+If you skipped `--domain` at setup, run the line the administrator sent back
+instead — once — and plain `%gpudev alice` works from then on:
 
 ```python
-%gpu alice --hostname alice.example.com
+%gpudev alice --hostname alice.example.com
 ```
 
 Either way, unexpectedly changed fingerprints remain blocked.
 
-> On connecting, `%gpu` compares this client's version against the container's
+#### Every session after this
+
+Setup never runs again. A new notebook, or a restarted kernel, needs only two
+lines — and this is the cell to keep:
+
+```python
+%run ~/.gpudev-client/CRAFT.py
+%gpudev alice
+```
+
+`%run` reloads the magics into the fresh kernel; `%gpudev` reconnects. No
+`%gpudev_setup`, no bootstrap, no administrator. Add the `!curl … sh` line back
+on top only when you want to pick up fixes — it costs a 40-byte request when
+you are already current.
+
+> On connecting, `%gpudev` compares this client's version against the container's
 > and notes a mismatch once per session. The two halves are updated by different
 > people — you re-run the bootstrap cell, the administrator runs
 > `gpudev client rebuild <name>` — so they can drift. It is a note, not a block.
@@ -1013,7 +1033,7 @@ gpudev client add bev --variant cuda-dev --key "ssh-ed25519 ..."
 For client-first onboarding, the user normally chooses the variant in SolveIt:
 
 ```text
-%gpu_setup bev --variant cuda-dev
+%gpudev_setup bev --variant cuda-dev
 ```
 
 The printed administrator command already includes `--variant cuda-dev`. An
@@ -1188,7 +1208,7 @@ gpudev host status                    # host-only view (no client detail)
 
 # clients
 gpudev client list                    # all clients with status + uptime
-gpudev client add <name> --key "..."  # provision a client from the key %gpu_setup printed
+gpudev client add <name> --key "..."  # provision a client from the key %gpudev_setup printed
 gpudev client invite <name>           # optional admin-first bootstrap cell (no host changes)
 gpudev client info <name>             # SSH stanza for an existing client
 gpudev client start|stop <name>       # free GPU memory without deleting anything

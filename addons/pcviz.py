@@ -1,7 +1,7 @@
 # pcviz.py — reusable point-cloud viewer for SolveIt (FastHTML + three.js).
 #
 # The viewer server runs in the LOCAL SolveIt kernel.
-# It can still be called while %gpu mode is active because %pointcloud,
+# It can still be called while %gpudev mode is active because %pointcloud,
 # %pointcloud_var, and %pointcloud_plotly are registered as local passthrough
 # magics in CRAFT.
 #
@@ -50,7 +50,7 @@ _HDRS = (
 
 
 def _craft_keep_local(magic):
-    """Keep `magic` local under %gpu. Durable across CRAFT re-runs when CRAFT supports it."""
+    """Keep `magic` local under %gpudev. Durable across CRAFT re-runs when CRAFT supports it."""
     try:
         ns = get_ipython().user_ns
     except Exception:
@@ -80,7 +80,7 @@ def _ssh_cfg():
         if ns.get("SSH_HOST"):
             return ns["SSH_HOST"], ns.get("SSH_OPTS", "")
 
-    raise RuntimeError("SSH_HOST not found — load CRAFT and run %gpu first.")
+    raise RuntimeError("SSH_HOST not found — load CRAFT and run %gpudev first.")
 
 
 def _slug(path):
@@ -1105,7 +1105,7 @@ try:
 
     @register_line_magic
     def pointcloud_var(line):
-        """Snapshot an (N,K>=3) point-cloud variable from the %gpu kernel and view it locally.
+        """Snapshot an (N,K>=3) point-cloud variable from the %gpudev kernel and view it locally.
 
         Usage:
           %pointcloud_var pts
@@ -1118,7 +1118,7 @@ try:
 
         if pc is None or rr is None:
             raise RuntimeError(
-                "Load pcviz + CRAFT and run %gpu first "
+                "Load pcviz + CRAFT and run %gpudev first "
                 "(point_cloud / remote_run_ missing)."
             )
 

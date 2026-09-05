@@ -1,25 +1,23 @@
 # CRAFT dialog loader — keep this cell short (LLM context budget).
 # Core: gpudev_craft/   Addons: addons/ (pcviz, mojo, sslive)
 #
+# This file does ONE thing: load CRAFT. It takes no arguments.
+#
 #   %local
 #   %run /path/to/gpudev/CRAFT.py
 #   %run /path/to/gpudev/addons/pcviz.py    # optional
 #   %run /path/to/gpudev/addons/mojo.py     # optional
 #   %run /path/to/gpudev/addons/sslive.py   # optional (separate repo via link)
-#   %gpu solveite
+#   %gpudev solveite
 #   %sslive
 #
-# First-time setup can ride the same line, because `%run script.py args` fills
-# sys.argv and this file is already the %run entry point:
-#
-#   %run /path/to/gpudev/CRAFT.py alice --domain example.com
-#
-# That loads the magics AND runs %gpu_setup, so a new client needs one cell
-# rather than two. Keeping the keygen here rather than in client-bootstrap.sh
-# avoids a second implementation of tested Python in shell.
+# First-time setup is a separate, one-time step — `%gpudev_setup <name>
+# --domain <d>` — deliberately NOT folded into this file. Folding it in would
+# make `%run CRAFT.py` mean both "load CRAFT" (every session) and "set up a new
+# client" (once), leaving no way to tell which line a flag belongs on. One
+# command, one job.
 
 import importlib
-import shlex
 import sys
 from pathlib import Path
 
@@ -48,26 +46,3 @@ if _core_was_loaded:
 from gpudev_craft.magics import install_core  # noqa: E402
 
 install_core()
-
-
-def _setup_args():
-    """Setup arguments passed via ``%run CRAFT.py <name> [flags]``, if any.
-
-    Only trust sys.argv when argv[0] is this file: ``%run`` sets argv to
-    ``[script, *args]`` for the duration, but imported or exec'd another way
-    the process argv belongs to the kernel launcher (``-f …kernel.json``), and
-    treating that as a client name would be a confusing failure.
-    """
-    argv = sys.argv
-    if len(argv) < 2:
-        return None
-    if Path(argv[0]).name != Path(__file__).name:
-        return None
-    return " ".join(shlex.quote(a) for a in argv[1:])
-
-
-_args = _setup_args()
-if _args:
-    from gpudev_craft import core  # noqa: E402
-
-    core.gpu_setup(_args)

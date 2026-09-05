@@ -190,7 +190,7 @@ class ClientInviteTests(unittest.TestCase):
 
     def test_domain_is_learned_from_an_existing_stanza(self):
         # The notebook cannot know the domain, which is the only reason
-        # %gpu_setup ever needed --hostname. Any client already configured
+        # %gpudev_setup ever needed --hostname. Any client already configured
         # records it, so only the first client on a machine has to be told.
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
@@ -245,40 +245,30 @@ class ClientInviteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_gpu_setup_args("alice --domain ''")
 
-    def test_craft_entrypoint_only_trusts_its_own_argv(self):
-        # `%run CRAFT.py alice --domain x` fills sys.argv, which is what lets
-        # one line load the magics AND run setup. Imported another way, argv
-        # belongs to the kernel launcher (-f …kernel.json), and treating that
-        # as a client name would fail confusingly.
+    def test_craft_entrypoint_takes_no_arguments(self):
+        # Folding setup into `%run CRAFT.py <name> --domain x` would make %run
+        # mean two things — "load CRAFT" every session and "set up a client"
+        # once — leaving no way to tell which line a flag like --variant
+        # belongs on. Setup is %gpudev_setup; %run only loads.
         source = (REPO_ROOT / "CRAFT.py").read_text()
-        self.assertIn("_setup_args", source)
-        self.assertIn("Path(argv[0]).name != Path(__file__).name", source)
+        self.assertNotIn("sys.argv", source)
+        self.assertNotIn("gpudev_setup(", source)
 
-        import sys as _sys_mod
+    def test_core_magics_are_named_for_the_project_not_the_hardware(self):
+        # "gpu" names a piece of hardware and reads as a generic accelerator
+        # magic; these connect to a gpudev environment specifically.
+        from gpudev_craft import core
 
-        namespace: dict = {
-            "__file__": str(REPO_ROOT / "CRAFT.py"),
-            "Path": Path,
-            "shlex": __import__("shlex"),
-            "sys": _sys_mod,
-        }
-        body = source[source.index("def _setup_args"):source.index("_args = _setup_args()")]
-        exec(compile(body, "CRAFT.py", "exec"), namespace)
-        setup_args = namespace["_setup_args"]
+        registered = dict(core._CORE_MAGIC_FUNCS)
+        self.assertIn("gpudev", registered)
+        self.assertIn("gpudev_setup", registered)
+        self.assertNotIn("gpu", registered)
+        self.assertNotIn("gpu_setup", registered)
 
-        import sys as _sys
-
-        saved = _sys.argv
-        try:
-            _sys.argv = ["CRAFT.py"]
-            self.assertIsNone(setup_args())
-            _sys.argv = ["CRAFT.py", "alice", "--domain", "example.com"]
-            self.assertEqual(setup_args(), "alice --domain example.com")
-            # The kernel launcher's argv must never be read as setup arguments.
-            _sys.argv = ["ipykernel_launcher.py", "-f", "/tmp/kernel.json"]
-            self.assertIsNone(setup_args())
-        finally:
-            _sys.argv = saved
+        # The fallback registrar names a magic after fn.__name__, so a
+        # mismatch there would silently register the wrong magic name.
+        for name, fn in core._CORE_MAGIC_FUNCS:
+            self.assertEqual(fn.__name__, name)
 
     def test_rebuild_still_accepts_all_as_a_target(self):
         # Adding --variant introduced an option parser, whose `-*` catch-all
@@ -339,29 +329,31 @@ class ClientInviteTests(unittest.TestCase):
             # `!` escapes can, verified in SolveIt. Reintroducing %%bash would
             # silently split it again.
             self.assertNotIn("%%bash", result.stdout)
-            # Two lines, not three: %run carries the setup arguments, because
-            # `%run script.py args` fills sys.argv and CRAFT.py is already the
-            # entry point. Splitting setup back onto its own %gpu_setup line
-            # would be a regression, not a style choice.
-            self.assertIn(
-                "%run ~/.gpudev-client/CRAFT.py solveite --domain example.com",
-                result.stdout,
-            )
+            # Three lines, one job each. %run must carry NO arguments: folding
+            # setup into it made `%run CRAFT.py` mean both "load CRAFT" every
+            # session and "set up a client" once, which is what made readers
+            # unable to place a flag like --variant.
+            self.assertIn("%run ~/.gpudev-client/CRAFT.py\n", result.stdout)
+            self.assertIn("%gpudev_setup solveite --domain example.com", result.stdout)
+            self.assertNotIn("CRAFT.py solveite", result.stdout)
             # The stable entry point, not the install path: GPUDEV_DIR is
             # configurable but %run cannot expand a shell variable, so a
             # literal install path here would silently break a relocated
             # install.
             self.assertNotIn("/app/data", result.stdout)
-            # "add --variant to the %run line" read as ambiguous to someone
-            # holding a two-line cell, so the invite shows the whole second
-            # line with the flag in place. A bare fragment is the regression.
+            # Naming "the %gpudev_setup line" is ambiguous to someone holding a
+            # multi-line cell, so the variant hint shows the whole line.
             self.assertIn(
-                "%run ~/.gpudev-client/CRAFT.py solveite --domain example.com "
-                "--variant cuda-dev",
+                "%gpudev_setup solveite --domain example.com --variant cuda-dev",
                 result.stdout,
             )
+            # The every-session cell must be shown too — knowing setup is
+            # one-time is useless without knowing what replaces it.
+            self.assertIn("%gpudev solveite", result.stdout)
+            # Renamed from %gpu/%gpu_setup: "gpu" names hardware, not this
+            # project. New output must not teach the old names.
+            self.assertNotIn("%gpu ", result.stdout)
             self.assertNotIn("%gpu_setup", result.stdout)
-            self.assertIn("%gpu solveite", result.stdout)
             # The cell must not have drifted back to a repository clone.
             self.assertNotIn("git clone", result.stdout)
             self.assertEqual(clients_path.read_bytes(), before)

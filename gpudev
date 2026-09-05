@@ -484,7 +484,7 @@ cmd_client_add() {
             --variant=*)  variant="${1#*=}"; shift ;;
             # A public key is NOT a secret — it is the half meant to be
             # published — so accepting it on the command line is fine, and it is
-            # what lets `%gpu_setup` hand the operator one pasteable line
+            # what lets `%gpudev_setup` hand the operator one pasteable line
             # instead of a bare key to relay into a prompt.
             --key)        ssh_key="${2:-}"; shift 2 ;;
             --key=*)      ssh_key="${1#*=}"; shift ;;
@@ -541,7 +541,7 @@ with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-
         echo ""
         echo "Send this line back to the client:"
         echo ""
-        echo "  %gpu ${name} --hostname ${name}.${cf_domain}"
+        echo "  %gpudev ${name} --hostname ${name}.${cf_domain}"
         echo ""
     fi
 }
@@ -1063,30 +1063,37 @@ print_solveit_bootstrap() {
 
     echo "── SolveIt bootstrap ──"
     echo ""
-    echo "Step 1 of 3 — paste ONE cell into SolveIt:"
+    echo "Step 1 of 3 — ONE-TIME setup. Paste this cell into SolveIt:"
     echo ""
     # One cell, not two. `!` shell escapes coexist with %run and a line magic in
     # the same cell; only %%bash forced the split, because a cell magic must be
     # alone. Verified in SolveIt.
     #
-    # Two lines rather than three: `%run script.py args` fills sys.argv, and
-    # CRAFT.py is already the %run entry point, so loading the magics and
-    # running setup ride the same line. Two is the floor — a cold client has to
-    # fetch something before it can run it.
+    # Three lines, each doing one job: fetch, load, set up. Setup briefly rode
+    # the %run line as arguments to save a line, which made `%run CRAFT.py`
+    # mean both "load CRAFT" every session and "set up a client" once — and
+    # readers could not tell which line a flag belonged on. Reverted.
     cat <<EOF
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py ${name} --domain ${domain}
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup ${name} --domain ${domain}
 EOF
     echo ""
-    # Naming "the %run line" was ambiguous to readers holding a two-line cell,
-    # so show the whole second line with the flag already in place.
-    echo "  Need nvcc/ncu/nsys/TensorRT? Leave line 1 as-is and make line 2:"
+    echo "  Need nvcc/ncu/nsys/TensorRT? Add --variant cuda-dev to the"
+    echo "  %gpudev_setup line — it is a setup-time choice:"
     echo ""
-    echo "    %run ~/.gpudev-client/CRAFT.py ${name} --domain ${domain} --variant cuda-dev"
+    echo "    %gpudev_setup ${name} --domain ${domain} --variant cuda-dev"
     echo ""
     echo "Step 2 of 3 — the private key never leaves SolveIt. Setup prints a"
     echo "single 'gpudev client add ...' line; send that to your administrator."
-    echo "Step 3 of 3 — connect each notebook independently with: %gpu ${name}"
+    echo ""
+    echo "Step 3 of 3 — once the administrator confirms, connect. This is also"
+    echo "the EVERY-SESSION cell, in this and every other notebook:"
+    echo ""
+    echo "    %run ~/.gpudev-client/CRAFT.py"
+    echo "    %gpudev ${name}"
+    echo ""
+    echo "Setup is not repeated. %run only loads CRAFT; %gpudev_setup is one-time."
     echo "No JSON file, manual SSH edit, terminal login, or host-key prompt is needed."
     echo ""
 }

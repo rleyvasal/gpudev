@@ -5,7 +5,7 @@ Single file under ``addons/mojo.py``. Load with:
   %local
   %run /path/to/gpudev/CRAFT.py
   %run /path/to/gpudev/addons/mojo.py
-  %gpu
+  %gpudev
   %gpum
 """
 from __future__ import annotations

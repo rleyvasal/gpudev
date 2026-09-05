@@ -29,7 +29,7 @@ def _inject_installers_into_user_ns() -> None:
 
 
 def install_core(*, quiet: bool = False) -> bool:
-    """Load GPU connection magics (%gpu, %local, …) and remote_run_."""
+    """Load GPU connection magics (%gpudev, %local, …) and remote_run_."""
     from . import core
 
     ok = core.install_core(quiet=quiet)

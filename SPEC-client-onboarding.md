@@ -65,28 +65,31 @@ into a prompt-only path on security grounds.
 
 ## Tier 1 — one-cell bootstrap
 
-`print_solveit_bootstrap` emits one cell: a shell escape that fetches the client
-runtime, then a `%run` that both loads CRAFT and runs setup.
+`print_solveit_bootstrap` emits one cell of three lines, one job each: a shell
+escape that fetches the client runtime, a `%run` that loads CRAFT, and
+`%gpudev_setup`.
 
 ```python
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run ~/.gpudev-client/CRAFT.py <name> --domain <domain>
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup <name> --domain <domain>
 ```
 
 This combination was verified in SolveIt. The former `%%bash` cell magic could
 not coexist with the other lines, which was why the earlier flow required two
 cells.
 
-Two lines rather than three: `%run script.py args` fills `sys.argv` and
-`CRAFT.py` is already the `%run` entry point, so setup rides the same line. Two
-is the floor — a cold client must fetch something before it can run it. See
-`SPEC-client-bootstrap.md` for the fetch, verification and version stamp.
+Setup briefly rode the `%run` line as arguments to save a line. That made
+`%run CRAFT.py` mean both "load CRAFT" (every session) and "set up a client"
+(once), and readers could not tell which line a flag belonged on. Reverted:
+`%run` takes no arguments. See `SPEC-client-bootstrap.md` for the fetch,
+verification and version stamp.
 
 ---
 
 ## Tier 2 — the notebook prints the admin's command
 
-Before this work, `%gpu_setup` printed the raw public key plus prose telling the
+Before this work, `%gpudev_setup` printed the raw public key plus prose telling the
 user to give it to an administrator. It now prints the exact command to run:
 
 ```
@@ -111,7 +114,7 @@ per-client and the user could not know it unaided.
 
 Two facts make deferral safe:
 
-- `%gpu` connects through the **SSH alias**, `gpudev-<name>`
+- `%gpudev` connects through the **SSH alias**, `gpudev-<name>`
   (`core.py`, `select_client`). It never reads the hostname.
 - the hostname is needed only by `ensure_ssh_config`, when writing the
   `~/.ssh/config` stanza.
@@ -120,31 +123,31 @@ Two facts make deferral safe:
 
 | Invocation | Effect |
 |---|---|
-| `%gpu_setup <name> --hostname <h>` | unchanged — key, stanza, admin command |
-| `%gpu_setup <name>` | key + admin command; **no stanza written** |
-| `%gpu <name> --hostname <h>` | writes the stanza, then connects |
-| `%gpu <name>` with no stanza | refuse with the exact line to run |
+| `%gpudev_setup <name> --hostname <h>` | unchanged — key, stanza, admin command |
+| `%gpudev_setup <name>` | key + admin command; **no stanza written** |
+| `%gpudev <name> --hostname <h>` | writes the stanza, then connects |
+| `%gpudev <name>` with no stanza | refuse with the exact line to run |
 
-`%gpu_setup <name>` must say plainly what is still missing:
+`%gpudev_setup <name>` must say plainly what is still missing:
 
 ```
 SSH config not written yet — the hostname is not known.
 When the administrator confirms, run:
 
-  %gpu <name> --hostname <name>.<their-domain>
+  %gpudev <name> --hostname <name>.<their-domain>
 ```
 
-The refusal path for `%gpu <name>` without a stanza must name the same command
+The refusal path for `%gpudev <name>` without a stanza must name the same command
 rather than failing with a generic SSH error.
 
 ### Resulting flow
 
 One round trip in each direction, one line each:
 
-1. user: paste the bootstrap cell, `%gpu_setup solveit`
+1. user: paste the bootstrap cell, `%gpudev_setup solveit`
 2. user → admin: `gpudev client add solveit --key "ssh-ed25519 ..."`
 3. admin runs it; `client add` prints the line to send back:
-   `%gpu solveit --hostname solveit.qsoftss.com`
+   `%gpudev solveit --hostname solveit.qsoftss.com`
 4. user pastes that; connected
 
 If the domain is published once for the host — it is a constant, not
@@ -159,7 +162,7 @@ first step.
 | File | Change |
 |---|---|
 | `gpudev` | `cmd_client_add`: `--key` / `--key-file`, validate before provisioning |
-| `gpudev` | `cmd_client_add`: print the `%gpu <name> --hostname <h>` line on success |
+| `gpudev` | `cmd_client_add`: print the `%gpudev <name> --hostname <h>` line on success |
 | `gpudev` | `print_solveit_bootstrap`: one cell; dropped "Step 3 — paste the public key", which told the admin to do a step they had just completed |
 | `core.py` | `_parse_gpu_setup_args`: `--hostname` optional |
 | `core.py` | `gpu_setup`: print the admin command; skip the stanza when no hostname |
@@ -174,14 +177,14 @@ first step.
 |---|---|
 | `--key` malformed | fail before provisioning, with the expected shape |
 | `--key` and `--key-file` both given | error, do not guess |
-| `%gpu <name>`, no stanza, no `--hostname` | print the exact `%gpu … --hostname …` line |
-| `%gpu_setup` re-run | remains idempotent (`ensure_client_key` reuses) and reprints the admin command |
+| `%gpudev <name>`, no stanza, no `--hostname` | print the exact `%gpudev … --hostname …` line |
+| `%gpudev_setup` re-run | remains idempotent (`ensure_client_key` reuses) and reprints the admin command |
 | hostname supplied later differs from an existing stanza | rewrite the stanza, say that it changed |
 
 ## Out of scope — Tier 3
 
 An enrollment endpoint would remove the key transfer entirely: `client invite`
-mints a one-time, name-bound, expiring token; `%gpu_setup` POSTs its public key;
+mints a one-time, name-bound, expiring token; `%gpudev_setup` POSTs its public key;
 `client add` finds it waiting.
 
 Deferred deliberately. It adds an internet-reachable endpoint that accepts

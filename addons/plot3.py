@@ -7,7 +7,7 @@
 #   %run /path/to/plot3/plot3.py
 #
 # CRAFT is optional. The package loader auto-detects CRAFT and seeds the
-# remote under %gpu when connected; without CRAFT it is pure local.
+# remote under %gpudev when connected; without CRAFT it is pure local.
 
 from __future__ import annotations
 

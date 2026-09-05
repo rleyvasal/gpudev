@@ -72,7 +72,7 @@ def get_ipython():  # type: ignore[misc]
 
 # ── Notebook-local client selection ──────────────────────────────────────────
 # Each SolveIt notebook has its own Python kernel, so these values are naturally
-# scoped to that notebook. ``%gpu <name>`` sets them for the life of the kernel;
+# scoped to that notebook. ``%gpudev <name>`` sets them for the life of the kernel;
 # no shared craft.json/default is needed or consulted.
 CLIENT_NAME = ""
 
@@ -169,7 +169,7 @@ def _looks_like_tunnel_not_ready(stderr: str) -> bool:
 def select_client(raw_name: str, *, quiet: bool = False) -> str:
     """Select one remote identity for this notebook kernel.
 
-    ``quiet`` suppresses the confirmation line. %gpu_setup already names the
+    ``quiet`` suppresses the confirmation line. %gpudev_setup already names the
     client in its own report, and printing after that report put a stray stream
     line inside the trailing code block the notebook had just rendered.
     """
@@ -326,7 +326,7 @@ def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
     """
     if not SSH_HOST:
         raise RuntimeError(
-            "No gpudev client selected — use %gpu <client-name>"
+            "No gpudev client selected — use %gpudev <client-name>"
         )
     normalize_client_name(CLIENT_NAME)
 
@@ -373,7 +373,7 @@ def _ssh(cmd, capture_output=False, check=True, _hostkey_retried=False):
 def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
     """SSH with stdin payload (Mojo source upload). Host-key auto-clear once."""
     if not SSH_HOST:
-        raise RuntimeError("No gpudev client selected — use %gpu <client-name>")
+        raise RuntimeError("No gpudev client selected — use %gpudev <client-name>")
     normalize_client_name(CLIENT_NAME)
     # Same export prefix as _ssh (compound remote commands + client env)
     wrapped = f"export GPUDEV_CLIENT={CLIENT_NAME}; {remote_cmd}"
@@ -1601,7 +1601,7 @@ class RemoteExecutionManager:
 
         if not CLIENT_NAME:
             print("No gpudev client selected for this notebook.")
-            print("Use: %gpu <client-name>")
+            print("Use: %gpudev <client-name>")
             return False
 
         if not install_cloudflared():
@@ -2054,8 +2054,8 @@ class ModeRouter:
 # register_local_magic() into IPython user_ns so they survive CRAFT re-runs.
 # Core host magics only — Mojo lives in addons/mojo.py
 _DEFAULT_LOCAL_MAGICS = (
-    "%gpu",
-    "%gpu_setup",
+    "%gpudev",
+    "%gpudev_setup",
     "%local",
     "%restart_kernel",
     "%kernel_status",
@@ -2065,7 +2065,7 @@ _LOCAL_MAGICS_NS_KEY = "_gpudev_local_magics"
 
 
 def _local_magic_set():
-    """Mutable set of line-magic prefixes that must stay local under %gpu."""
+    """Mutable set of line-magic prefixes that must stay local under %gpudev."""
     try:
         ip = get_ipython()
         ns = ip.user_ns
@@ -2082,7 +2082,7 @@ def _local_magic_set():
 
 
 def register_local_magic(magic: str) -> None:
-    """Register a line-magic prefix that stays local under %gpu. Idempotent."""
+    """Register a line-magic prefix that stays local under %gpudev. Idempotent."""
     m = magic if magic.startswith("%") else f"%{magic}"
     _local_magic_set().add(m)
 
@@ -2105,7 +2105,7 @@ class PythonBackend:
     def passthru(self, c):
         """Host-local only — no syntax rewriting.
 
-        Decides whether a cell stays on the notebook kernel under ``%gpu``.
+        Decides whether a cell stays on the notebook kernel under ``%gpudev``.
         Package transforms (tidy3, plot3, …) must not live here; they register
         via :func:`register_transform` and run only for non-passthru cells.
         """
@@ -2201,12 +2201,12 @@ _KNOWN_VARIANTS = ("default", "cuda-dev")
 
 
 def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
-    """Parse ``%gpu_setup <name> [--domain <d> | --hostname <host>]``.
+    """Parse ``%gpudev_setup <name> [--domain <d> | --hostname <host>]``.
 
     Both are OPTIONAL. Requiring one was the only reason the administrator had
     to go first: the hostname is per-client, so the notebook could not know it
     unaided. Without either, the key is still generated and can be sent onward;
-    the ssh config stanza is written later, on the first ``%gpu <name>
+    the ssh config stanza is written later, on the first ``%gpudev <name>
     --hostname <host>``.
 
     ``--domain`` is the friendlier half of that pair and the normal path. The
@@ -2215,7 +2215,7 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
     afterwards is self-service. ``--hostname`` stays for the line ``client
     add`` prints back, which is a full hostname.
     """
-    usage = ("Usage: %gpu_setup <client-name> [--variant cuda-dev] "
+    usage = ("Usage: %gpudev_setup <client-name> [--variant cuda-dev] "
              "[--domain <domain> | --hostname <client.domain>]")
     tokens = shlex.split(line or "")
     if not tokens:
@@ -2258,7 +2258,7 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
     return name, hostname, variant
 
 
-def gpu_setup(line):
+def gpudev_setup(line):
     """One-time, idempotent SolveIt-side SSH/key setup for a client."""
     try:
         name, hostname, variant = _parse_gpu_setup_args(line)
@@ -2310,14 +2310,14 @@ def gpu_setup(line):
     if result.ssh_config_written:
         closing = (
             f"After the administrator confirms, connect with:\n\n"
-            f"```\n%gpu {result.name}\n```"
+            f"```\n%gpudev {result.name}\n```"
         )
     else:
         closing = (
             "SSH config not written yet — this client's hostname is not known.\n\n"
             "When the administrator confirms, connect with the line their "
             "`client add` prints:\n\n"
-            f"```\n%gpu {result.name} --hostname {result.name}.<their-domain>\n```"
+            f"```\n%gpudev {result.name} --hostname {result.name}.<their-domain>\n```"
         )
 
     if _HAS_RICH_DISPLAY:
@@ -2347,23 +2347,23 @@ def gpu_setup(line):
             print("")
         if result.ssh_config_written:
             print("After the administrator confirms, connect with:")
-            print(f"  %gpu {result.name}")
+            print(f"  %gpudev {result.name}")
         else:
             print("SSH config not written yet — this client's hostname is not known.")
             print("When the administrator confirms, connect with:")
-            print(f"  %gpu {result.name} --hostname {result.name}.<their-domain>")
+            print(f"  %gpudev {result.name} --hostname {result.name}.<their-domain>")
             print("(the administrator's `client add` prints the exact line)")
 
     select_client(result.name, quiet=True)
 
-def gpu(line):
+def gpudev(line):
     try:
         tokens = shlex.split(line or "")
     except ValueError as e:
-        print(f"Invalid %gpu arguments: {e}")
+        print(f"Invalid %gpudev arguments: {e}")
         return
 
-    # --hostname is accepted here so a notebook that ran `%gpu_setup <name>`
+    # --hostname is accepted here so a notebook that ran `%gpudev_setup <name>`
     # before the administrator provisioned anything can supply the hostname on
     # its first connect. Writing the stanza is all it is needed for.
     name = ""
@@ -2375,17 +2375,17 @@ def gpu(line):
         elif token.startswith("--hostname="):
             hostname = token.split("=", 1)[1]
         elif token.startswith("-"):
-            print(f"Unknown argument {token!r}. Usage: %gpu <client-name> "
+            print(f"Unknown argument {token!r}. Usage: %gpudev <client-name> "
                   "[--hostname <client.domain>]")
             return
         elif not name:
             name = token
         else:
-            print("Usage: %gpu <client-name> [--hostname <client.domain>]")
+            print("Usage: %gpudev <client-name> [--hostname <client.domain>]")
             return
 
     if not name and not CLIENT_NAME:
-        print("No client selected. Use: %gpu <client-name>")
+        print("No client selected. Use: %gpudev <client-name>")
         return
     name = name or CLIENT_NAME
 
@@ -2400,7 +2400,7 @@ def gpu(line):
         # gpudev-<name>", which names nothing about gpudev. Say what to run.
         print(f"No SSH config for '{name}' yet — its hostname is not known here.")
         print("Run this once, with the hostname your administrator confirmed:")
-        print(f"  %gpu {name} --hostname {name}.<their-domain>")
+        print(f"  %gpudev {name} --hostname {name}.<their-domain>")
         return
 
     try:
@@ -2421,7 +2421,7 @@ def local(line):
 
 def restart_kernel(line):
     if not CLIENT_NAME:
-        print("No client selected. Use: %gpu <client-name>")
+        print("No client selected. Use: %gpudev <client-name>")
         return
     _exec_mgr.restart_kernel()
 
@@ -2466,8 +2466,8 @@ def kernel_status(line):
 
 
 _CORE_MAGIC_FUNCS = (
-    ("gpu", gpu),
-    ("gpu_setup", gpu_setup),
+    ("gpudev", gpudev),
+    ("gpudev_setup", gpudev_setup),
     ("local", local),
     ("restart_kernel", restart_kernel),
     ("kernel_status", kernel_status),
@@ -2530,6 +2530,8 @@ def _register_core_magics() -> bool:
         ok = True
     except Exception:
         try:
+            # register_line_magic names the magic after fn.__name__, which is
+            # why the functions are named for their magics rather than mapped.
             for name, fn in _CORE_MAGIC_FUNCS:
                 register_line_magic(fn)
             ok = True
@@ -2583,7 +2585,8 @@ def install_core(*, quiet: bool = False) -> bool:
 
     if not quiet:
         print("CRAFT core ready")
-        print("  %gpu <client>  %gpu_setup <client> --hostname <host>")
+        print("  %gpudev <client>          connect (every session)")
+        print("  %gpudev_setup <client> --domain <domain>   first time only")
         print("  %local  %kernel_status  %restart_kernel")
         print("  remote_run_(code)  register_local_magic('%name')")
         print("  register_transform(name, fn)  # package syntax only; core has none")

@@ -100,7 +100,7 @@ def derive_domain(*, home: Path | None = None) -> str:
     """Learn the Cloudflare domain from any gpudev stanza already in ssh config.
 
     The notebook cannot know the domain on its own, which is the only reason
-    ``%gpu_setup`` ever had to ask for ``--hostname``. But any client already
+    ``%gpudev_setup`` ever had to ask for ``--hostname``. But any client already
     configured on this machine records it: ``HostName <name>.<domain>``. Reading
     it back means the second and every later client needs no hostname at all.
 
@@ -129,7 +129,7 @@ def derive_domain(*, home: Path | None = None) -> str:
 def has_ssh_stanza(name: str, *, home: Path | None = None) -> bool:
     """Is there an SSH entry this client can actually connect through?
 
-    ``%gpu`` dials the alias ``gpudev-<name>``, so a missing stanza surfaces as
+    ``%gpudev`` dials the alias ``gpudev-<name>``, so a missing stanza surfaces as
     a generic "could not resolve hostname" from ssh, which says nothing about
     gpudev. Checking first lets the caller name the exact command to run.
     """
@@ -266,7 +266,7 @@ def setup_client(
 
     ``hostname`` is optional so a notebook can generate its key before the
     administrator has provisioned anything. Nothing at connect time needs it:
-    ``%gpu`` dials the alias ``gpudev-<name>``, and the hostname is consumed
+    ``%gpudev`` dials the alias ``gpudev-<name>``, and the hostname is consumed
     only here, to write the ``~/.ssh/config`` stanza. Omitting it yields a key
     and a public key to send onward, with ``ssh_config_written`` False.
     """

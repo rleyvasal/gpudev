@@ -1,6 +1,6 @@
 # Spec — client bootstrap
 
-Status: IMPLEMENTED — `client-bootstrap.sh`, the `%run` entry point, `--domain`,
+Status: IMPLEMENTED — `client-bootstrap.sh`, `%gpudev_setup`, `--domain`,
 the version stamp and the drift warning are in place, with 24 tests across
 `tests/test_client_bootstrap.py` and `tests/test_version_drift.py`. Exercised
 against the live GitHub endpoint (install, no-op re-run, `--verify`, `--force`,
@@ -10,7 +10,7 @@ Scope: new `client-bootstrap.sh`, `CRAFT.py`, `gpudev_craft/`, `gpudev`
 (`client invite` output), `README.md`, `LINUX-QUICKSTART.md`, `CRAFT_DIALOG.md`.
 
 Deliver the client's runtime with a small, named script instead of a repository
-clone, and collapse first-run setup into one `%run` line.
+clone, with a three-line cell whose lines each do one job: fetch, load, set up.
 
 ---
 
@@ -88,7 +88,7 @@ The stanza needs two things: the key enrolled (irreducible, above) and the
 
 The domain is the *only* reason `--hostname` appears at the end of the flow
 today. If the bootstrap is told the domain, the stanza is written during step 1
-and the final step is a bare `%gpu <name>`.
+and the final step is a bare `%gpudev <name>`.
 
 **Decision: the domain becomes a normal argument to setup, not an admin-first
 special case.** An administrator tells a user the domain once; every client
@@ -450,7 +450,7 @@ closing this is nearly free:
 1. `client-bootstrap.sh` writes `<dir>/VERSION` (commit SHA).
 2. `kernel-manager.sh` gains a `version` subcommand reporting the SHA it was
    built from; `client-setup.sh` stamps it at container-build time.
-3. `%gpu` compares them **once per kernel session** and warns on mismatch,
+3. `%gpudev` compares them **once per kernel session** and warns on mismatch,
    naming the fix (`gpudev client rebuild <name>` for the host half, re-running
    the bootstrap cell for the client half).
 
@@ -467,7 +467,8 @@ run it.
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gb.sh && sh /tmp/gb.sh
-%run ~/.gpudev-client/CRAFT.py alice --domain example.com
+%run ~/.gpudev-client/CRAFT.py
+%gpudev_setup alice --domain example.com
 ```
 
 ### Why `CRAFT.py` takes the arguments
@@ -495,7 +496,7 @@ read after the fact.
 |---|---|---|
 | **1** | user | the two-line cell — key, stanza, and the admin's command printed |
 | **2** | ↔ admin | forwards that command; the admin runs it |
-| **3** | user | `%gpu alice` |
+| **3** | user | `%gpudev alice` |
 
 ---
 
