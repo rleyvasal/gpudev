@@ -2755,8 +2755,14 @@ except Exception: pass' 2>/dev/null || true)"
         fi
     done
 
-    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] && [ -f "$HOST_CONFIG" ]; then
-        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG"
+    # Needs the ADMIN KEY, not merely host.json: the dispatcher wraps that key in
+    # a forced command and calls fail() when it is absent. A host part-way
+    # through a fresh install has a host.json but no key yet, and an
+    # unconditional call there takes self-update down with it — which is how a
+    # clean install left the operator unable to even update the scripts.
+    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] && [ -n "$(host_get admin_ssh_key)" ]; then
+        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG" || \
+            warn "Could not refresh the admin SSH shortcuts (continuing)."
     fi
 
     # Ensure the interactive-login dashboard hook is in ~/.bashrc so existing
