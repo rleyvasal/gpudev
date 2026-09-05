@@ -2586,6 +2586,18 @@ or use 'gpudev ssh lockdown' to put it back."
 
     echo ""
     log "gpudev uninstalled."
+
+    # Group membership is a change to the OPERATOR'S ACCOUNT, not to gpudev, and
+    # removing it would strip Docker access while leaving Docker installed —
+    # which is the normal outcome, since Docker is kept whenever anything else
+    # uses it. Left in place, but said out loud so it is not a silent leftover.
+    if id -nG 2>/dev/null | tr " " "\n" | grep -qx docker; then
+        log ""
+        log "You are still in the 'docker' group (left deliberately — removing it"
+        log "would take away Docker access while Docker itself stays installed)."
+        log "  Remove it yourself with:  sudo gpasswd -d $(whoami) docker"
+    fi
+
     if [ "$keep_ssh" != "1" ]; then
         log ""
         log "sshd is on port 22 with password login enabled."
