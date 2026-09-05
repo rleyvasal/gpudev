@@ -467,6 +467,9 @@ the flow below hits it.
 %run ~/.gpudev-client/CRAFT.py solveit --domain example.com
 ```
 
+> Installing somewhere else? Put `GPUDEV_DIR=<path>` before `sh` on line 1 —
+> see **Choosing the install directory** below. Line 2 never changes.
+
 The first line installs the client runtime into `/app/data/gpudevd/gpudev` —
 SolveIt's persistent storage, so it survives kernel restarts. It fetches only
 the ten files a client actually runs (~192 KB), not the host-side scripts and

@@ -514,14 +514,20 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 
 ### Step 1 — Start on the client in SolveIt
 
-Run this one cell. Line 1 installs or updates the client runtime in SolveIt's
-persistent storage; line 2 loads CRAFT **and** runs setup, because `%run
-script.py args` fills `sys.argv` and `CRAFT.py` is already the entry point:
+Run this one cell. Line 1 installs or updates the client runtime — into
+`/app/data/gpudevd/gpudev` by default, or wherever you set `GPUDEV_DIR`
+([below](#choosing-where-the-files-go)). Line 2 loads CRAFT **and** runs setup,
+because `%run script.py args` fills `sys.argv` and `CRAFT.py` is already the
+entry point:
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py alice --domain example.com
 ```
+
+> Installing somewhere else? Put `GPUDEV_DIR=<path>` before `sh` on line 1:
+> `... -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh`.
+> Line 2 never changes.
 
 Ask your administrator for the domain — it is public DNS, not a secret, and it
 is the only thing the notebook cannot work out for itself.
