@@ -2161,7 +2161,7 @@ PATHS
 # mode=uninstall suppresses the KEEP lines that uninstall contradicts, so the
 # two halves of its manifest cannot claim opposite things about sshd.
 reset_manifest() {
-    local purge_data="$1" mode="${2:-reset}"
+    local purge_data="$1" mode="${2:-reset}" cold="${3:-0}"
     local names cf_domain
     names="$(all_client_names 2>/dev/null || true)"
     cf_domain="$(host_get cf_domain)"
@@ -2186,12 +2186,22 @@ reset_manifest() {
     echo "  sudoers     gpudev-tunnel, gpudev-power, gpudev-clocks"
     echo "  config      ~/.config/gpudev, ~/gpudev, ~/bin/gpudev*"
     echo "  drop-ins    logind, apt security, nvidia profiling"
+    if [ "$cold" = "1" ]; then
+        # A warm cache skips the layers where image builds actually fail — the
+        # uv install of the CUDA wheels among them. Pruning it makes the next
+        # install exercise the path a first-time user takes.
+        echo "  cache       the BuildKit cache (--cold: next build is ~13min, not ~7s)"
+    fi
     echo ""
     echo "This will KEEP:"
     echo ""
     if [ "$mode" = "reset" ]; then
         echo "  Docker, NVIDIA toolkit, cloudflared   (may serve other workloads)"
-        echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
+        if [ "$cold" = "1" ]; then
+            echo "  (NOT the BuildKit cache — --cold prunes it, see above)"
+        else
+            echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
+        fi
         echo "  images gpudev-base*                   (replaced by the next build)"
         echo "  every sshd/SSH setting                (port, password policy, your key)"
     fi
@@ -2203,14 +2213,15 @@ reset_manifest() {
 }
 
 cmd_reset() {
-    local dry_run=0 purge_data=0 assume_yes=0 force=0
+    local dry_run=0 purge_data=0 assume_yes=0 force=0 cold=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --dry-run)    dry_run=1; shift ;;
             --purge-data) purge_data=1; shift ;;
+            --cold)       cold=1; shift ;;
             --yes)        assume_yes=1; shift ;;
             --force)      force=1; shift ;;
-            *) fail "Unknown option '$1'. Usage: gpudev reset [--dry-run] [--purge-data] [--yes] [--force]" ;;
+            *) fail "Unknown option '$1'. Usage: gpudev reset [--dry-run] [--purge-data] [--cold] [--yes] [--force]" ;;
         esac
     done
 
@@ -2231,7 +2242,7 @@ has run again. Re-run from the console or a LAN session:
 Or --force if you accept being disconnected."
     fi
 
-    reset_manifest "$purge_data"
+    reset_manifest "$purge_data" reset "$cold"
 
     if [ "$dry_run" = "1" ]; then
         log "--dry-run: nothing was changed."
@@ -2318,7 +2329,17 @@ Or --force if you accept being disconnected."
           "${HOME}/bin/client-setup.sh" "${HOME}/bin/kernel-manager.sh" 2>/dev/null || true
 
     echo ""
-    log "Reset complete. Docker, the toolkit, the build cache and SSH are untouched."
+    if [ "$cold" = "1" ]; then
+        log "Pruning the BuildKit cache (--cold)..."
+        docker_cmd builder prune -af >/dev/null 2>&1 || true
+    fi
+
+    if [ "$cold" = "1" ]; then
+        log "Reset complete (cold). Docker, the toolkit and SSH are untouched;"
+        log "the build cache is gone, so the next install builds from scratch."
+    else
+        log "Reset complete. Docker, the toolkit, the build cache and SSH are untouched."
+    fi
     log ""
     log "Reinstall with:"
     log "  bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)"
@@ -2758,7 +2779,7 @@ Power:
 
 Other:
   gpudev self-update
-  gpudev reset [--dry-run] [--purge-data] [--yes] [--force]
+  gpudev reset [--dry-run] [--purge-data] [--cold] [--yes] [--force]
   gpudev uninstall [--dry-run] [--purge-data] [--keep-ssh] [--yes] [--force]
 EOF
 }
