@@ -236,10 +236,34 @@ fi
 mv "${GPUDEV_DIR}.new" "$GPUDEV_DIR"
 rm -rf "${GPUDEV_DIR}.old"
 
+# ── Stable entry point ───────────────────────────────────────────────────────
+# GPUDEV_DIR is configurable, but the notebook's second line is a `%run` with a
+# literal path — and IPython expands `$VAR` from the PYTHON namespace, not the
+# shell environment, so `%run $GPUDEV_DIR/CRAFT.py` simply does not work
+# (measured: "File `'$GPUDEV_DIR/CRAFT.py'` not found"). A shell escape cannot
+# set a Python variable either, so line 1 has no way to tell line 2 where the
+# install went.
+#
+# A symlink at a path that is always valid closes that gap: the install lives
+# wherever GPUDEV_DIR says, and the cell always says ~/.gpudev-client. `%run`
+# expands `~`, and __file__.resolve() follows the link, so imports and addons
+# resolve against the real directory.
+ENTRY=""
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+    link="${HOME}/.gpudev-client"
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        # Never replace something that is not ours to replace.
+        say "Note: ${link} exists and is not a symlink; leaving it alone."
+    elif ln -sfn "$GPUDEV_DIR" "$link" 2>/dev/null; then
+        ENTRY="~/.gpudev-client"
+    fi
+fi
+
 say ""
 say "Installed gpudev client runtime"
 say "  commit:  ${short} (${GPUDEV_REF})"
 say "  files:   ${count} python files + VERSION"
 say "  path:    ${GPUDEV_DIR}"
+[ -n "$ENTRY" ] && say "  entry:   ${ENTRY} → ${GPUDEV_DIR}"
 say ""
-say "Next:  %run ${GPUDEV_DIR}/CRAFT.py <client-name> --domain <your-domain>"
+say "Next:  %run ${ENTRY:-$GPUDEV_DIR}/CRAFT.py <client-name> --domain <your-domain>"

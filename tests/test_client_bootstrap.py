@@ -249,6 +249,59 @@ class BootstrapTests(unittest.TestCase):
         ]
         self.assertEqual(leftovers, [])
 
+    def test_stable_entry_point_points_at_the_install(self):
+        # GPUDEV_DIR is configurable, but the cell's second line is a `%run`
+        # with a literal path, and IPython expands $VAR from the PYTHON
+        # namespace rather than the environment — so `%run $GPUDEV_DIR/...`
+        # cannot work, and a `!` line cannot set a Python variable either.
+        # The symlink is what lets the cell stay correct wherever you install.
+        home = self.root / "home"
+        home.mkdir()
+        env = self.env(HOME=str(home))
+
+        result = run_bootstrap(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        link = home / ".gpudev-client"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), self.install.resolve())
+        self.assertTrue((link / "CRAFT.py").is_file())
+        # The cell it tells you to paste must use the stable path, not the
+        # install path — otherwise the advice reintroduces the problem.
+        self.assertIn("%run ~/.gpudev-client/CRAFT.py", result.stdout)
+
+    def test_entry_point_follows_a_relocated_install(self):
+        home = self.root / "home"
+        home.mkdir()
+        elsewhere = self.root / "elsewhere" / "gpudev"
+
+        run_bootstrap(self.env(HOME=str(home)))
+        run_bootstrap(self.server.env(HOME=str(home), GPUDEV_DIR=str(elsewhere)))
+
+        self.assertEqual((home / ".gpudev-client").resolve(), elsewhere.resolve())
+
+    def test_a_real_directory_at_the_entry_path_is_never_replaced(self):
+        home = self.root / "home"
+        (home / ".gpudev-client").mkdir(parents=True)
+        (home / ".gpudev-client" / "mine.txt").write_text("do not delete")
+
+        result = run_bootstrap(self.env(HOME=str(home)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Left intact, and the advice falls back to the literal path.
+        self.assertEqual(
+            (home / ".gpudev-client" / "mine.txt").read_text(), "do not delete"
+        )
+        self.assertFalse((home / ".gpudev-client").is_symlink())
+        self.assertIn(f"%run {self.install}/CRAFT.py", result.stdout)
+
+    def test_install_still_succeeds_without_a_usable_home(self):
+        env = self.env()
+        env.pop("HOME", None)
+        result = run_bootstrap(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.install / "CRAFT.py").is_file())
+        self.assertIn(f"%run {self.install}/CRAFT.py", result.stdout)
+
     def test_patterns_are_not_glob_expanded_by_the_shell(self):
         # `$PATTERNS` must reach tar literally. Unquoted and unguarded, the
         # shell expands `*/CRAFT.py` against the CURRENT directory first and

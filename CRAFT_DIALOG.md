@@ -7,7 +7,7 @@
 
    ```text
    !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-   %run /app/data/gpudevd/gpudev/CRAFT.py solveite --domain <domain>
+   %run ~/.gpudev-client/CRAFT.py solveite --domain <domain>
    ```
 2. Forward the single `gpudev client add solveite --key "..."` line it prints;
    the administrator runs it.
@@ -41,7 +41,7 @@ gpudev/
 
 ```text
 %local
-%run /app/data/gpudevd/gpudev/CRAFT.py
+%run ~/.gpudev-client/CRAFT.py
 %gpu solveite
 ```
 
@@ -49,10 +49,10 @@ gpudev/
 
 ```text
 %local
-%run /app/data/gpudevd/gpudev/addons/pcviz.py
-%run /app/data/gpudevd/gpudev/addons/mojo.py
-%run /app/data/gpudevd/gpudev/addons/sslive.py
-%run /app/data/gpudevd/gpudev/addons/tidy3.py
+%run ~/.gpudev-client/addons/pcviz.py
+%run ~/.gpudev-client/addons/mojo.py
+%run ~/.gpudev-client/addons/sslive.py
+%run ~/.gpudev-client/addons/tidy3.py
 %gpu solveite
 %sslive
 ```
@@ -72,7 +72,7 @@ gpudev/
 Side-by-side under e.g. `/app/data/gpudevd/`:
 
 ```bash
-cd /app/data/gpudevd/gpudev/addons
+cd ~/.gpudev-client/addons
 ln -sfn /app/data/gpudevd/sslive sslive
 ln -sfn /app/data/gpudevd/tidy3 tidy3
 ```

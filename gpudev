@@ -1075,7 +1075,7 @@ print_solveit_bootstrap() {
     # fetch something before it can run it.
     cat <<EOF
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run /app/data/gpudevd/gpudev/CRAFT.py ${name} --domain ${domain}
+%run ~/.gpudev-client/CRAFT.py ${name} --domain ${domain}
 EOF
     echo ""
     echo "  (add --variant cuda-dev to the %run line for nvcc/ncu/nsys/TensorRT)"

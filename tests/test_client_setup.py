@@ -344,9 +344,14 @@ class ClientInviteTests(unittest.TestCase):
             # entry point. Splitting setup back onto its own %gpu_setup line
             # would be a regression, not a style choice.
             self.assertIn(
-                "%run /app/data/gpudevd/gpudev/CRAFT.py solveite --domain example.com",
+                "%run ~/.gpudev-client/CRAFT.py solveite --domain example.com",
                 result.stdout,
             )
+            # The stable entry point, not the install path: GPUDEV_DIR is
+            # configurable but %run cannot expand a shell variable, so a
+            # literal install path here would silently break a relocated
+            # install.
+            self.assertNotIn("/app/data", result.stdout)
             self.assertNotIn("%gpu_setup", result.stdout)
             self.assertIn("%gpu solveite", result.stdout)
             # The cell must not have drifted back to a repository clone.

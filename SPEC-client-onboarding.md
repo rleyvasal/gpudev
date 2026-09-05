@@ -70,7 +70,7 @@ runtime, then a `%run` that both loads CRAFT and runs setup.
 
 ```python
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run /app/data/gpudevd/gpudev/CRAFT.py <name> --domain <domain>
+%run ~/.gpudev-client/CRAFT.py <name> --domain <domain>
 ```
 
 This combination was verified in SolveIt. The former `%%bash` cell magic could

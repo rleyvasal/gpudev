@@ -464,7 +464,7 @@ the flow below hits it.
 
 ```
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run /app/data/gpudevd/gpudev/CRAFT.py solveit --domain example.com
+%run ~/.gpudev-client/CRAFT.py solveit --domain example.com
 ```
 
 The first line installs the client runtime into `/app/data`, which is
@@ -498,6 +498,14 @@ sh /tmp/gpudev-bootstrap.sh --force    # re-fetch, repairing what --verify found
 `GPUDEV_REF` pins to a tag or commit and `GPUDEV_DIR` changes the location. If
 an update ever breaks a notebook, the commit that worked is recorded in
 `<install>/VERSION` — pin to it and carry on.
+
+`~/.gpudev-client` is a symlink the bootstrap points at whatever `GPUDEV_DIR`
+is, so the second line of the cell never has to change. It exists because
+`%run` expands `$VAR` from the Python namespace rather than the shell
+environment, so `%run $GPUDEV_DIR/CRAFT.py` cannot work, and a `!` line cannot
+set a Python variable for the next line to use. The upside beyond
+configurability: the cell carries no SolveIt-specific path, so it also works on
+a local Jupyter where `/app/data` does not exist.
 
 ### Hostnames
 

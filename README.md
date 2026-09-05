@@ -520,7 +520,7 @@ script.py args` fills `sys.argv` and `CRAFT.py` is already the entry point:
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
-%run /app/data/gpudevd/gpudev/CRAFT.py alice --domain example.com
+%run ~/.gpudev-client/CRAFT.py alice --domain example.com
 ```
 
 Ask your administrator for the domain — it is public DNS, not a secret, and it
@@ -535,7 +535,7 @@ If this client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA
 compilation, add the variant to the same line:
 
 ```text
-%run /app/data/gpudevd/gpudev/CRAFT.py alice --domain example.com --variant cuda-dev
+%run ~/.gpudev-client/CRAFT.py alice --domain example.com --variant cuda-dev
 ```
 
 That choice is carried into the administrator command automatically. It also
@@ -565,6 +565,27 @@ sh /tmp/gpudev-bootstrap.sh --force    # re-fetch and repair
 `GPUDEV_REF` pins to a tag or commit, and `GPUDEV_DIR` changes the install
 location. Pinning is the recovery lever if an update ever breaks you: the
 commit you were on is recorded in `VERSION`.
+
+#### Why the cell says `~/.gpudev-client`
+
+The install location is configurable, but the second line is a `%run` with a
+literal path, and IPython expands `$VAR` from the **Python** namespace, not the
+shell environment — `%run $GPUDEV_DIR/CRAFT.py` fails with *File not found*. A
+`!` shell escape cannot set a Python variable either, so line 1 has no way to
+tell line 2 where the install went.
+
+The bootstrap therefore points `~/.gpudev-client` at whatever `GPUDEV_DIR` is.
+`%run` expands `~`, and `__file__.resolve()` follows the link, so imports and
+addons resolve against the real directory. The cell stays correct wherever you
+install — and carries no SolveIt-specific path, so it works unchanged on a
+local Jupyter or anywhere `/app/data` does not exist.
+
+```bash
+GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh   # cell line 2 unchanged
+```
+
+If `~/.gpudev-client` already exists as a real directory, the bootstrap leaves
+it alone and prints the literal path to use instead.
 
 ### Step 2 — The round trip through the administrator
 

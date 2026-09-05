@@ -292,6 +292,46 @@ and the docs reference the script.
 The script prints the resolved directory, so a non-default install is never
 silent.
 
+#### The override is not enough on its own
+
+Making `GPUDEV_DIR` configurable in the script leaves the cell's **second** line
+hardcoded, and the two can silently disagree — set the variable, forget line 2,
+and `%run` loads a stale install or fails.
+
+The obvious repair does not work. Measured against a real IPython:
+
+| `%run` argument | Result |
+|---|---|
+| `$GPUDEV_DIR/CRAFT.py` (shell env var) | **fails** — ``File `'$GPUDEV_DIR/CRAFT.py'` not found`` |
+| `{GPUDEV_DIR}/CRAFT.py` (brace, env var) | **fails** |
+| `$gd/CRAFT.py` (Python variable) | works |
+| `{gd}/CRAFT.py` (brace, Python variable) | works |
+
+`%run` expands from the **Python namespace**, not the environment. And line 1 is
+a `!` shell escape, which cannot set a Python variable for line 2 to read. So
+there is no expression line 2 can contain that follows `GPUDEV_DIR`.
+
+#### Stable entry point
+
+The bootstrap points `~/.gpudev-client` at whatever `GPUDEV_DIR` resolves to,
+and every published cell says `~/.gpudev-client/CRAFT.py`. Verified: `%run`
+expands `~`, and because `__file__.resolve()` follows the link, `_GPUDEV_ROOT`,
+`_ADDONS` and `VERSION_FILE` all land on the real directory — addons load
+through the symlink unchanged.
+
+Two consequences beyond the configurability fix:
+
+- The cell carries **no SolveIt-specific path**, so it works unchanged on a
+  local Jupyter or anywhere `/app/data` does not exist. That is the case
+  `GPUDEV_DIR` was for, and it now needs no second edit.
+- Old cells keep working. The install still defaults to
+  `/app/data/gpudevd/gpudev`, so a previously pasted literal path resolves to
+  the same tree.
+
+If `~/.gpudev-client` exists and is **not** a symlink, it is left untouched and
+the literal path is printed instead — the script must never replace a directory
+it did not create. A missing or unwritable `$HOME` degrades the same way.
+
 ### Version stamp
 
 The script writes `<dir>/VERSION` containing the resolved commit SHA and the
@@ -405,7 +445,7 @@ run it.
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gb.sh && sh /tmp/gb.sh
-%run /app/data/gpudevd/gpudev/CRAFT.py alice --domain example.com
+%run ~/.gpudev-client/CRAFT.py alice --domain example.com
 ```
 
 ### Why `CRAFT.py` takes the arguments
