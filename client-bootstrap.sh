@@ -151,8 +151,27 @@ fi
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
 parent="$(dirname "$GPUDEV_DIR")"
-mkdir -p "$parent" || die "cannot create ${parent}"
-[ -w "$parent" ] || die "${parent} is not writable."
+# A bad GPUDEV_DIR is the likeliest cause, and the fix is usually to stop
+# setting it: the default is home-relative and works everywhere. Say so here
+# rather than leaving a bare "permission denied" — silently falling back to the
+# default would be worse, since it installs somewhere the operator did not pick.
+dir_hint() {
+    if [ "$GPUDEV_DIR" != "$GPUDEV_ENTRY" ]; then
+        say "  GPUDEV_DIR is set to ${GPUDEV_DIR}."
+        say "  Unset it to install into ${GPUDEV_ENTRY}, which needs no special access."
+    fi
+}
+
+if ! mkdir -p "$parent" 2>/dev/null; then
+    say "client-bootstrap: cannot create ${parent}" >&2
+    dir_hint >&2
+    exit 1
+fi
+if [ ! -w "$parent" ]; then
+    say "client-bootstrap: ${parent} is not writable." >&2
+    dir_hint >&2
+    exit 1
+fi
 
 tmp="$(mktemp -d "${parent}/.gpudev-boot.XXXXXX")" || die "cannot create a temp dir in ${parent}"
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -262,11 +281,24 @@ rm -rf "${GPUDEV_DIR}.old"
 # overridden GPUDEV_DIR needs a symlink to bridge the two.
 ENTRY="~/.gpudev-client"
 if [ "$GPUDEV_DIR" != "$GPUDEV_ENTRY" ]; then
+    # A real directory here is either a previous default install (ours, and
+    # safe to replace with a link to the new location) or something else
+    # entirely (never touch it). Its VERSION + CRAFT.py tell them apart.
+    #
+    # Getting this wrong is not cosmetic: leaving a stale default install in
+    # place means %run ~/.gpudev-client/CRAFT.py keeps loading the OLD copy
+    # while the operator believes they relocated it.
     if [ -e "$GPUDEV_ENTRY" ] && [ ! -L "$GPUDEV_ENTRY" ]; then
-        # Never replace something this script did not create.
-        say "Note: ${GPUDEV_ENTRY} exists and is not a symlink; leaving it alone."
-        ENTRY="$GPUDEV_DIR"
-    elif ! ln -sfn "$GPUDEV_DIR" "$GPUDEV_ENTRY" 2>/dev/null; then
+        if [ -f "${GPUDEV_ENTRY}/VERSION" ] && [ -f "${GPUDEV_ENTRY}/CRAFT.py" ]; then
+            rm -rf "$GPUDEV_ENTRY"
+            say "Replaced the previous install at ${GPUDEV_ENTRY} with a link."
+        else
+            say "Note: ${GPUDEV_ENTRY} exists and is not a gpudev install; leaving it alone."
+            ENTRY="$GPUDEV_DIR"
+        fi
+    fi
+    if [ "$ENTRY" = "~/.gpudev-client" ] \
+       && ! ln -sfn "$GPUDEV_DIR" "$GPUDEV_ENTRY" 2>/dev/null; then
         ENTRY="$GPUDEV_DIR"
     fi
 fi

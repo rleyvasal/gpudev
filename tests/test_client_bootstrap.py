@@ -323,7 +323,28 @@ class BootstrapTests(unittest.TestCase):
 
         self.assertEqual((home / ".gpudev-client").resolve(), elsewhere.resolve())
 
-    def test_a_real_directory_at_the_entry_path_is_never_replaced(self):
+    def test_relocating_after_a_default_install_repoints_the_entry(self):
+        # Default install first, then GPUDEV_DIR elsewhere. The entry path is
+        # then a real directory — a previous install of ours. Leaving it would
+        # keep %run ~/.gpudev-client/CRAFT.py loading the OLD copy while the
+        # operator believes the relocation took effect.
+        home = self.root / "home"
+        home.mkdir()
+        elsewhere = self.root / "runtime"
+
+        run_bootstrap(self.server.env(HOME=str(home)))
+        self.assertTrue((home / ".gpudev-client" / "VERSION").is_file())
+
+        result = run_bootstrap(
+            self.server.env(HOME=str(home), GPUDEV_DIR=str(elsewhere))
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((home / ".gpudev-client").is_symlink())
+        self.assertEqual((home / ".gpudev-client").resolve(), elsewhere.resolve())
+        self.assertIn("%run ~/.gpudev-client/CRAFT.py", result.stdout)
+
+    def test_a_foreign_directory_at_the_entry_path_is_never_replaced(self):
+        # Only a directory carrying our VERSION + CRAFT.py counts as ours.
         home = self.root / "home"
         (home / ".gpudev-client").mkdir(parents=True)
         (home / ".gpudev-client" / "mine.txt").write_text("do not delete")
@@ -336,6 +357,35 @@ class BootstrapTests(unittest.TestCase):
         )
         self.assertFalse((home / ".gpudev-client").is_symlink())
         self.assertIn(f"%run {self.install}/CRAFT.py", result.stdout)
+
+    def test_unwritable_gpudev_dir_names_the_variable_as_the_cause(self):
+        # A documented GPUDEV_DIR example once used /data/gpudev, which does
+        # not exist in SolveIt — a copy-pasteable line that could only fail,
+        # with a bare "Permission denied" that did not say GPUDEV_DIR was to
+        # blame or that unsetting it is the fix.
+        result = run_bootstrap(self.server.env(GPUDEV_DIR="/data/gpudev"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GPUDEV_DIR", result.stderr)
+        self.assertIn("Unset it", result.stderr)
+        # Never silently fall back to the default: that installs somewhere the
+        # operator did not pick and hides the mistake.
+        self.assertFalse(self.install.exists())
+
+    def test_documented_override_examples_are_runnable(self):
+        # The docs' override examples must use a path that can actually exist
+        # where the docs are aimed. Anything absolute and system-owned is the
+        # bug this guards.
+        import re
+
+        for doc in ("README.md", "LINUX-QUICKSTART.md"):
+            text = (REPO_ROOT / doc).read_text()
+            for value in re.findall(r"export GPUDEV_DIR=(\S+)", text):
+                with self.subTest(doc=doc, value=value):
+                    self.assertTrue(
+                        value.startswith("~") or value.startswith("$"),
+                        f"{doc} shows GPUDEV_DIR={value}, which is not"
+                        " home-relative and may not be writable",
+                    )
 
     def test_missing_home_fails_fast_rather_than_guessing(self):
         # The default install path is home-relative, so an unset HOME has no

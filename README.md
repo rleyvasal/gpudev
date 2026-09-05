@@ -573,12 +573,22 @@ never replaces an existing private key, and the private key stays in SolveIt.
 
 #### Installing somewhere other than the home directory
 
-Rarely needed — `~/.gpudev-client` is correct on SolveIt, local Jupyter and
-Colab alike. If you do want the files on a different volume, `GPUDEV_DIR` moves
-them:
+**You almost certainly do not want this.** `~/.gpudev-client` is correct on
+SolveIt, local Jupyter and Colab alike, and it is the only location guaranteed
+to be writable. Setting `GPUDEV_DIR` to a path you do not own fails:
 
 ```text
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
+mkdir: cannot create directory '/data': Permission denied
+```
+
+The default needs no `GPUDEV_DIR` at all — leave it unset and paste the cell
+above as-is.
+
+If you genuinely have another writable volume, `GPUDEV_DIR` moves the files
+there. Use a path you know exists:
+
+```text
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=~/gpudev-runtime && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py
 %gpudev_setup alice --domain example.com
 ```
@@ -587,8 +597,8 @@ them:
 bootstrap makes `~/.gpudev-client` a symlink to it, and says so:
 
 ```text
-  path:    /data/gpudev
-  entry:   ~/.gpudev-client → /data/gpudev
+  path:    /home/you/gpudev-runtime
+  entry:   ~/.gpudev-client → /home/you/gpudev-runtime
 ```
 
 Pick somewhere persistent — a temp directory means re-fetching after every

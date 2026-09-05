@@ -488,12 +488,20 @@ It is why `~/.ssh/gpudev-<name>` persists too.
 
 ### Installing on another volume
 
-Rarely needed. `GPUDEV_DIR` moves the files, and line 2 still does not change —
-the bootstrap makes `~/.gpudev-client` a symlink to wherever you chose and
-prints both paths:
+**Almost never wanted.** The home directory is the one location guaranteed to
+be writable, so the default cell above needs no `GPUDEV_DIR`. Pointing it at a
+path you do not own fails before anything is fetched:
 
 ```
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
+mkdir: cannot create directory '/data': Permission denied
+```
+
+If you do have another writable volume, `GPUDEV_DIR` moves the files there and
+line 2 still does not change — the bootstrap makes `~/.gpudev-client` a symlink
+to wherever you chose and prints both paths:
+
+```
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=~/gpudev-runtime && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py
 %gpudev_setup solveit --domain example.com
 ```
