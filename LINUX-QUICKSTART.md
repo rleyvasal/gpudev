@@ -503,10 +503,22 @@ kernel restart.
 Setup is idempotent: re-running reuses the existing key rather than replacing
 it, so it is safe to paste again.
 
-If the client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation,
-add `--variant cuda-dev` to the second line. The generated admin command carries
-the choice forward and warns that this variant grants the container `SYS_ADMIN`
-and `PERFMON`.
+### Which line takes which options
+
+Line 1 fetches; line 2 sets up the client. **Everything about the client —
+`--domain`, `--variant`, `--hostname` — goes on line 2, after `CRAFT.py`.** Line
+1 takes only the `GPUDEV_*` environment variables, which are rarely needed.
+
+For `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation, ask for the
+`cuda-dev` variant on line 2, leaving line 1 exactly as printed:
+
+```
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run ~/.gpudev-client/CRAFT.py solveit --domain example.com --variant cuda-dev
+```
+
+The generated admin command carries the choice forward and warns that this
+variant grants the container `SYS_ADMIN` and `PERFMON`.
 
 ### Updating later
 

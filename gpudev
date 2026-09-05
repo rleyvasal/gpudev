@@ -1078,7 +1078,11 @@ print_solveit_bootstrap() {
 %run ~/.gpudev-client/CRAFT.py ${name} --domain ${domain}
 EOF
     echo ""
-    echo "  (add --variant cuda-dev to the %run line for nvcc/ncu/nsys/TensorRT)"
+    # Naming "the %run line" was ambiguous to readers holding a two-line cell,
+    # so show the whole second line with the flag already in place.
+    echo "  Need nvcc/ncu/nsys/TensorRT? Leave line 1 as-is and make line 2:"
+    echo ""
+    echo "    %run ~/.gpudev-client/CRAFT.py ${name} --domain ${domain} --variant cuda-dev"
     echo ""
     echo "Step 2 of 3 — the private key never leaves SolveIt. Setup prints a"
     echo "single 'gpudev client add ...' line; send that to your administrator."

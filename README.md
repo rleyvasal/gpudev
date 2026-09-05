@@ -529,6 +529,35 @@ path, nothing to configure for the normal case. In SolveIt the home directory
 kernel restarts, and it is equally correct on a local Jupyter or Colab. It is
 the same reason `~/.ssh/gpudev-alice` persists.
 
+#### Which line takes which options
+
+Line 1 fetches; line 2 sets up your client. **Every option about *your client* —
+`--domain`, `--variant`, `--hostname` — goes on line 2, after `CRAFT.py`.**
+
+For `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation, ask for the
+`cuda-dev` variant. The whole cell, with line 1 unchanged:
+
+```text
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run ~/.gpudev-client/CRAFT.py alice --domain example.com --variant cuda-dev
+```
+
+That choice is carried into the administrator command automatically. It also
+warns that `cuda-dev` grants the container `SYS_ADMIN` and `PERFMON`, which is
+why the standard image remains the default.
+
+Line 1 only ever takes the three `GPUDEV_*` environment variables, and you can
+usually ignore all of them:
+
+| | Goes on | Examples |
+|---|---|---|
+| **Line 1** — where the runtime comes from and lands | before `sh`, as `export VAR=…` | `GPUDEV_DIR`, `GPUDEV_REF`, `GPUDEV_SLUG` |
+| **Line 2** — everything about your client | after `CRAFT.py` | `--domain`, `--variant`, `--hostname` |
+
+> **Don't know the domain yet?** Drop `--domain`. The key is still generated and
+> the admin command still printed; the stanza is written later by the
+> `%gpu alice --hostname alice.example.com` line that `client add` prints back.
+
 Ask your administrator for the domain — it is public DNS, not a secret, and it
 is the only thing the notebook cannot work out for itself.
 
@@ -563,21 +592,6 @@ kernel restart.
 > child never inherits, so the install silently lands in the default directory —
 > no error, just files somewhere you did not choose. Use `export … && sh …` as
 > above, or the prefix form `GPUDEV_DIR=… sh …` with no `&&` between them.
-
-If this client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA
-compilation, add the variant to the same line:
-
-```text
-%run ~/.gpudev-client/CRAFT.py alice --domain example.com --variant cuda-dev
-```
-
-That choice is carried into the administrator command automatically. It also
-warns that `cuda-dev` grants the container `SYS_ADMIN` and `PERFMON`, which is
-why the standard image remains the default.
-
-> **Don't know the domain yet?** Drop `--domain`. The key is still generated and
-> the admin command still printed; the stanza is written later by the
-> `%gpu alice --hostname alice.example.com` line that `client add` prints back.
 
 #### Re-running the cell is how you get fixes
 

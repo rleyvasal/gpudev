@@ -352,6 +352,14 @@ class ClientInviteTests(unittest.TestCase):
             # literal install path here would silently break a relocated
             # install.
             self.assertNotIn("/app/data", result.stdout)
+            # "add --variant to the %run line" read as ambiguous to someone
+            # holding a two-line cell, so the invite shows the whole second
+            # line with the flag in place. A bare fragment is the regression.
+            self.assertIn(
+                "%run ~/.gpudev-client/CRAFT.py solveite --domain example.com "
+                "--variant cuda-dev",
+                result.stdout,
+            )
             self.assertNotIn("%gpu_setup", result.stdout)
             self.assertIn("%gpu solveite", result.stdout)
             # The cell must not have drifted back to a repository clone.
