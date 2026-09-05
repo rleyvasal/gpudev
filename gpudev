@@ -179,6 +179,13 @@ cmd_host_status() {
     port_base="$(host_get port_base)"
     host_ssh_port="$(host_get host_ssh_port)"
     host_cf_hostname="$(host_get host_cf_hostname)"
+    if [ -z "$host_ssh_port" ]; then
+        if [ "$host_env" = "linux" ]; then
+            host_ssh_port=22
+        else
+            host_ssh_port=52100
+        fi
+    fi
 
     echo "gpudev Host Status"
     echo ""
@@ -210,6 +217,23 @@ cmd_host_status() {
     echo "  Clients registered: $count"
     echo ""
 
+    if [ "$host_env" = "linux" ]; then
+        local lan_ip
+        lan_ip="$(ip -4 addr show scope global 2>/dev/null \
+                  | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
+        echo "── Connect to host directly on the LAN ──"
+        echo ""
+        echo "  On your admin machine, add to ~/.ssh/config:"
+        echo "    Host ${linux_user}-lan"
+        echo "      HostName ${lan_ip:-<lan-ip>}"
+        echo "      User ${linux_user}"
+        echo "      Port ${host_ssh_port}"
+        echo "      IdentityFile ~/.ssh/<your-admin-key>"
+        echo "      IdentitiesOnly yes"
+        echo "  then:  ssh ${linux_user}-lan"
+        echo ""
+    fi
+
     if [ -n "$host_cf_hostname" ]; then
         echo "── Connect to host (via the Cloudflare tunnel) ──"
         echo ""
@@ -225,7 +249,9 @@ cmd_host_status() {
         echo "      ServerAliveInterval 30"
         echo "      ServerAliveCountMax 3"
         echo "  then:  ssh ${linux_user}"
-        echo "  (port ${host_ssh_port:-52100} is internal to WSL — never 'ssh -p' it directly)"
+        if [ "$host_env" = "wsl2" ]; then
+            echo "  (port ${host_ssh_port} is internal to WSL — never 'ssh -p' it directly)"
+        fi
         echo ""
     fi
 
