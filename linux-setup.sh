@@ -1684,8 +1684,15 @@ install_gpudev_cli() {
         log "  OS packages:              OK (up to date)"
     fi
 
-    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ]; then
-        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG"
+    # The dispatcher wraps the ADMIN KEY in a forced command, so it needs that
+    # key to exist. Since the key moved to the admin-setup phase at the end, a
+    # fresh install reaches here with none — and the dispatcher's `fail` aborted
+    # the whole installer at step 9, before power management or admin setup ever
+    # ran. admin_setup installs the wrapper itself once a key is enrolled, so
+    # this call is only for RE-runs on a host that already has one.
+    if [ -x "${HOME}/bin/gpudev-ssh-dispatch" ] && [ -n "${ADMIN_SSH_KEY:-}" ]; then
+        "${HOME}/bin/gpudev-ssh-dispatch" --install "$HOST_CONFIG" || \
+            warn "Could not install the admin SSH shortcuts; admin setup will retry."
     fi
 }
 

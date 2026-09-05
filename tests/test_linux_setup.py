@@ -116,6 +116,21 @@ class LinuxSetupTests(unittest.TestCase):
             + ", ".join(missing),
         )
 
+    def test_dispatcher_install_waits_for_a_key_to_exist(self):
+        # gpudev-ssh-dispatch --install fails hard when host.json has no
+        # admin_ssh_key. The key is now enrolled in admin_setup at the END, so
+        # any earlier caller must be guarded or a fresh install aborts before
+        # power management and admin setup ever run — which is exactly what
+        # happened on the first real clean install.
+        body = function_body("fetch_companions")
+        if "gpudev-ssh-dispatch" in body:
+            call = body[body.index("gpudev-ssh-dispatch"):]
+            self.assertIn("ADMIN_SSH_KEY", body,
+                          "the step-9 dispatcher install must check for a key first")
+            # And it must not be able to abort the run.
+            self.assertTrue("|| \\" in call or "|| warn" in call or "|| true" in call,
+                            "the dispatcher install must not be fatal")
+
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a
         # host where docker-group membership already grants access.
