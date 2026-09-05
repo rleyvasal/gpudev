@@ -76,6 +76,13 @@ class LinuxSetupTests(unittest.TestCase):
         self.assertNotIn('grep -qxF "$ADMIN_SSH_KEY"', body)
         self.assertIn("admin_key_present", body)
 
+    def test_admin_state_c_prints_the_current_ssh_port(self):
+        body = function_body("admin_setup")
+        self.assertIn('current_port="$(printf', body)
+        self.assertIn("SSH_CONNECTION", body)
+        self.assertIn("sudo sshd -T", body)
+        self.assertIn("-p ${current_port}", body)
+
     def test_sshd_hardening_moved_out_of_the_install_run(self):
         # Disabling passwords mid-install, against a key typed at a console,
         # was the lockout risk. setup_host_ssh must no longer do it; lockdown

@@ -1,6 +1,6 @@
 # Spec — client onboarding without the paste round-trip
 
-Status: draft, not implemented.
+Status: implemented.
 Scope: `gpudev` (`client add`, `client invite`), `gpudev_craft/core.py`,
 `gpudev_craft/client_setup.py`, `LINUX-QUICKSTART.md` Part 2.
 
@@ -12,7 +12,8 @@ the key transfer entirely) is explicitly **out of scope** — see the end.
 
 ## Problem
 
-Onboarding one notebook client costs two human round-trips and three pastes:
+Before this work, onboarding one notebook client cost two human round-trips and
+three pastes:
 
 | Transfer | Pastes |
 |---|---|
@@ -64,28 +65,25 @@ into a prompt-only path on security grounds.
 
 ## Tier 1 — one-cell bootstrap
 
-`print_solveit_bootstrap` emits two cells today: a `%%bash` block that clones
-CRAFT, then a second cell with `%run` and `%gpu_setup`. Merge them into one
-paste using shell escapes:
+`print_solveit_bootstrap` now emits one cell using a shell escape followed by
+`%run` and `%gpu_setup`:
 
 ```python
-!mkdir -p /app/data/gpudevd && if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only; else git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
+!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
 %run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup <name>
+%gpu_setup <name> --hostname <name>.<domain>
 ```
 
-> **Open — verify before shipping.** This assumes SolveIt runs `!` shell
-> escapes in the same cell as `%run` and a line magic. `%%bash` is a *cell*
-> magic and cannot coexist with other lines, which is the only reason there are
-> two cells today. If `!` is unavailable, keep two cells; the rest of this spec
-> is unaffected.
+This combination was verified in SolveIt. The former `%%bash` cell magic could
+not coexist with the other lines, which was why the earlier flow required two
+cells.
 
 ---
 
 ## Tier 2 — the notebook prints the admin's command
 
-`%gpu_setup` currently prints the raw public key plus prose telling the user to
-give it to an administrator. Replace that with the exact command to run:
+Before this work, `%gpu_setup` printed the raw public key plus prose telling the
+user to give it to an administrator. It now prints the exact command to run:
 
 ```
 Send this line to your gpudev administrator:
@@ -103,9 +101,9 @@ thing the user is told to send.
 
 ## `--hostname` becomes optional
 
-Today `_parse_gpu_setup_args` **requires** `--hostname`, and that requirement
-is the only reason the admin must go first: the hostname is per-client and the
-user cannot know it unaided.
+Before this work, `_parse_gpu_setup_args` **required** `--hostname`, and that
+requirement was the only reason the admin had to go first: the hostname is
+per-client and the user could not know it unaided.
 
 Two facts make deferral safe:
 
@@ -158,7 +156,7 @@ first step.
 |---|---|
 | `gpudev` | `cmd_client_add`: `--key` / `--key-file`, validate before provisioning |
 | `gpudev` | `cmd_client_add`: print the `%gpu <name> --hostname <h>` line on success |
-| `gpudev` | `print_solveit_bootstrap`: one cell; drop "Step 3 — paste the public key", which currently tells the admin to do a step they just completed |
+| `gpudev` | `print_solveit_bootstrap`: one cell; dropped "Step 3 — paste the public key", which told the admin to do a step they had just completed |
 | `core.py` | `_parse_gpu_setup_args`: `--hostname` optional |
 | `core.py` | `gpu_setup`: print the admin command; skip the stanza when no hostname |
 | `core.py` | `gpu`: accept and honour `--hostname`; refuse clearly when no stanza |
@@ -172,7 +170,7 @@ first step.
 | `--key` malformed | fail before provisioning, with the expected shape |
 | `--key` and `--key-file` both given | error, do not guess |
 | `%gpu <name>`, no stanza, no `--hostname` | print the exact `%gpu … --hostname …` line |
-| `%gpu_setup` re-run | idempotent today (`ensure_client_key` reuses); keep that, and reprint the admin command |
+| `%gpu_setup` re-run | remains idempotent (`ensure_client_key` reuses) and reprints the admin command |
 | hostname supplied later differs from an existing stanza | rewrite the stanza, say that it changed |
 
 ## Out of scope — Tier 3

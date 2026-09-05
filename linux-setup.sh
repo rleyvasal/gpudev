@@ -1324,13 +1324,19 @@ admin_setup() {
     [ -n "$key" ] || key="$(pick_admin_key "$authorized" || true)"
 
     if [ -z "$key" ] && [ "${NON_INTERACTIVE:-}" != "true" ] && [ -t 0 ]; then
-        local ip
+        local ip current_port
         ip="$(ip -4 addr show scope global 2>/dev/null \
               | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
+        current_port="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $4}')"
+        if ! [[ "$current_port" =~ ^[0-9]+$ ]]; then
+            current_port="$(sudo sshd -T 2>/dev/null \
+                           | awk '$1 == "port" {print $2; exit}')"
+        fi
+        [ -n "$current_port" ] || current_port=22
         echo ""
         echo "No admin key found. On your LAPTOP, run:"
         echo ""
-        echo "    ssh-copy-id -i ~/.ssh/gpudev-admin.pub ${LINUX_USER}@${ip:-<this-host>}"
+        echo "    ssh-copy-id -i ~/.ssh/gpudev-admin.pub -p ${current_port} ${LINUX_USER}@${ip:-<this-host>}"
         echo ""
         echo "(no key yet?  ssh-keygen -t ed25519 -f ~/.ssh/gpudev-admin)"
         echo ""

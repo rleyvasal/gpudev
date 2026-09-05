@@ -3,10 +3,10 @@
 ## First-time client setup (four steps)
 
 1. On the host: `gpudev client invite solveite`.
-2. In SolveIt: paste the two cells printed by the invitation. Cell 1 clones or
-   updates gpudev; Cell 2 loads CRAFT and runs `%gpu_setup`.
-3. On the host: run `gpudev client add solveite` and paste the public key printed
-   by `%gpu_setup`.
+2. In SolveIt: paste the one cell printed by the invitation. It installs or
+   updates gpudev, loads CRAFT, and runs `%gpu_setup`.
+3. Send the single `gpudev client add solveite --key "..."` line printed by
+   `%gpu_setup` to the administrator, who runs it on the host.
 4. In each notebook: `%gpu solveite`.
 
 `%gpu_setup` generates the private key locally, updates `~/.ssh/config`, and

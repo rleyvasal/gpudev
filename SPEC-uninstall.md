@@ -1,8 +1,9 @@
 # Spec — `gpudev reset` and `gpudev uninstall`
 
 Status: IMPLEMENTED — `reset` in `8cbd3cc`, `uninstall` and provenance in
-`1e5659c`, `--cold` in `1f4a5b7`. Guards are tested; the destructive paths have
-not been run against a live host.
+`1e5659c`, `--cold` in `1f4a5b7`, and transactional access handling in
+`cd8d68d`/`5571491`. The default destructive uninstall path has run
+successfully on a live bare-Linux host.
 Scope: `gpudev`, `linux-setup.sh`, `LINUX-QUICKSTART.md`.
 
 Two commands. `reset` puts the box back to "before `linux-setup.sh`" so a clean
@@ -34,7 +35,7 @@ ordering discipline as `ssh lockdown`: no destructive step ahead of its proof.
 
 | Tier | Items |
 |---|---|
-| **Access** | sshd `Port 52100`, `PasswordAuthentication no`, the wrapped admin key |
+| **Access** | sshd on its recorded port (`22` for new bare Linux, `52100` for WSL2), `PasswordAuthentication no`, the wrapped admin key |
 | **gpudev state** | `~/.config/gpudev`, `~/gpudev`, `~/bin/{gpudev,gpudev-ssh-dispatch,client-setup.sh,kernel-manager.sh}`, `/etc/systemd/system/gpudev-tunnel.service`, `gpudev-wol.service`, `/etc/sudoers.d/gpudev-{tunnel,power,clocks}`, `/etc/systemd/logind.conf.d/gpudev.conf`, `/etc/apt/apt.conf.d/{52gpudev-security,20auto-upgrades}`, `/etc/modprobe.d/gpudev-nvidia-profiling.conf`, the `~/.bashrc` dashboard hook |
 | **Cloud state** | the Cloudflare tunnel, host + client CNAMEs |
 | **Containers/images** | client containers, `gpudev-base`, `gpudev-base-cuda-dev` |
@@ -110,7 +111,7 @@ it earlier because its fresh-login proof depends on the unwrapped key.
 |---|---|
 | `--dry-run` | print the manifest, change nothing |
 | `--purge-data` | also delete `<name>-data` volumes (**user home directories**) |
-| `--keep-ssh` | skip the SSH revert; leave port 52100 and key-only auth |
+| `--keep-ssh` | skip the sshd policy revert; retain the current port and key-only auth |
 | `--force` | bypass the password precondition and the proof gate, announcing both |
 
 Client data volumes are **kept by default**. They are the one thing here that

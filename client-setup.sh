@@ -196,8 +196,8 @@ p.write_text(content)
 # cloudflared dials sshd on localhost, so a session riding the tunnel reports
 # 127.0.0.1 as its peer, while a LAN or console session reports a real address.
 # Measured on the host:
-#   tunnel -> SSH_CONNECTION="127.0.0.1 55396 127.0.0.1 52100"
-#   LAN    -> SSH_CONNECTION="192.168.10.59 51214 192.168.10.80 52100"
+#   tunnel -> SSH_CONNECTION="127.0.0.1 55396 127.0.0.1 <host-port>"
+#   LAN    -> SSH_CONNECTION="192.168.10.59 51214 192.168.10.80 <host-port>"
 # Only the first case needs the deferred/detached dance; everywhere else the
 # reload can run inline and be VERIFIED before the command returns.
 session_rides_tunnel() {

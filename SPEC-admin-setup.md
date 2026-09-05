@@ -1,15 +1,16 @@
 # Spec — admin setup phase and SSH lockdown
 
 Status: IMPLEMENTED — phase and `ssh` commands in `e2035b2`, port mechanism
-corrected in `a955740`. Exercised on a live host: lockdown, unlock, and the
-proof gate all ran; a fresh install has not.
+corrected in `a955740`, and the bare-Linux port-22 default in `5571491`.
+Lockdown, unlock, and the proof gate have run on a live host; the new
+bare-Linux default still needs a fresh-install test.
 Scope: `linux-setup.sh`, `gpudev`, `LINUX-QUICKSTART.md`.
 
 ---
 
 ## Problem
 
-`linux-setup.sh` today does three risky things mid-run, inside
+Historically, `linux-setup.sh` did three risky things mid-run, inside
 `setup_host_ssh()`:
 
 ```
@@ -31,7 +32,7 @@ operator what `~/.ssh/config` should look like.
 
 1. No hand-transcribed keys. A key arrives by copy, never by typing.
 2. Nothing irreversible happens to sshd until a correct key is in place.
-3. The operator is told the final port and the exact laptop config block.
+3. The operator is told the final port and exact LAN/tunnel config blocks.
 4. Unattended installs remain possible.
 5. Recovery does not require the console.
 
@@ -85,7 +86,7 @@ address substituted:
 ```
 No admin key found. On your LAPTOP, run:
 
-    ssh-copy-id -i ~/.ssh/gpudev-admin.pub <user>@<ip>
+    ssh-copy-id -i ~/.ssh/gpudev-admin.pub -p <current-port> <user>@<ip>
 
 (no key yet?  ssh-keygen -t ed25519 -f ~/.ssh/gpudev-admin)
 
@@ -115,7 +116,7 @@ Only after a key is confirmed:
 - print the final `~/.ssh/config` block with the real port, and tell the
   operator to keep the current session open until the new one works
 
-#### The port is a value, not a step (decided)
+#### The port is an environment-aware value, not a hardening step (decided)
 
 `HOST_SSH_PORT` feeds two places today:
 
@@ -124,16 +125,14 @@ linux-setup.sh:1206   set_sshd_option "Port" "$HOST_SSH_PORT"
 linux-setup.sh:1297   ... ingress → ssh://localhost:${HOST_SSH_PORT}
 ```
 
-The Cloudflare tunnel ingress points at it, so the port move is not optional
-hardening: sshd on 22 while the tunnel dials 52100 breaks the tunnel, and
-breaks it silently.
+The Cloudflare tunnel ingress points at it, so sshd and the tunnel must always
+use the same value. A mismatch breaks tunnel access silently.
 
-There is therefore **no "skip the port change" option**. Instead the port is a
-value the operator controls, and `22` is legal. Lockdown writes whatever
-`HOST_SSH_PORT` is set to into *both* sshd and the tunnel ingress, so the two
-cannot desynchronize. An operator who wants to stay on 22 sets
-`HOST_SSH_PORT=22` and gets password-disable with no port move; the ingress
-follows automatically.
+Fresh bare-Linux hosts default to port `22`; WSL2 defaults to `52100`, where the
+listener is internal to the VM. An explicit `HOST_SSH_PORT` value wins, and a
+rerun preserves the value recorded in `host.json` or explicitly configured in
+`sshd_config`. Lockdown writes the resolved value into both sshd and the tunnel
+ingress so they cannot desynchronize.
 
 When the port actually changes, lockdown must update the ingress and reload the
 connector via `reload_tunnel_connector`.
@@ -197,7 +196,8 @@ it is bypassing rather than proceeding silently.
 
 ### `gpudev ssh unlock`
 
-Recovery. Re-enables `PasswordAuthentication yes` and restores port 22.
+Recovery. Re-enables `PasswordAuthentication yes` and leaves the current port
+unchanged so the tunnel ingress remains synchronized.
 Intended to be run from the console after a lockout, or from a working session
 before re-doing key setup. Prints a warning that the host is now
 password-reachable.
@@ -294,9 +294,9 @@ the port. Resolving it here removes that placeholder.
 1. **Proof gate** — this session if it is publickey-authenticated, otherwise
    wait for a *fresh* login observed after the prompt. Stale evidence is never
    accepted. `--force` retained, and must announce what it bypasses.
-2. **Port** — a value, not a step. `HOST_SSH_PORT=22` is legal. Lockdown writes
-   it to both `sshd_config` and the tunnel ingress so they cannot
-   desynchronize. There is no "skip the port change" flag.
+2. **Port** — an environment-aware value, not a hardening step. Fresh bare
+   Linux uses `22`; WSL2 uses `52100`; existing and explicit values are
+   preserved. Lockdown writes the result to both sshd and the tunnel ingress.
 3. **Key presence** — one blob-based predicate everywhere, which makes
    dispatcher ordering free. Install it during Confirm for ergonomics.
 

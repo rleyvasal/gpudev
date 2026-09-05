@@ -69,7 +69,7 @@ The system has three roles. They are physically and cryptographically separated.
 | **Client** | a notebook machine (e.g. SolveIt cloud VM) | one locally generated SSH private key per client identity | runs CRAFT.py, routes each notebook kernel to the container named by `%gpu <client>`; cannot reach the host or other clients |
 
 A client cannot become an admin: it gets its own SSH key (scoped to its
-container's port-mapped sshd), no access to the host's admin port (52100), no
+container's port-mapped sshd), no access to the host's admin SSH service, no
 ability to modify the tunnel, and CRAFT.py contains no management magics.
 
 ---
@@ -134,8 +134,10 @@ Gather these **before** starting setup. Only needed for Phase B (`linux-setup.sh
      ```bash
      ssh-keygen -t ed25519 -C "gpudev-admin@$(hostname -s)" -f ~/.ssh/gpudev-admin
      ```
-   - You'll paste the **public** half (`~/.ssh/gpudev-admin.pub`) when
-     `linux-setup.sh` prompts for it during Phase B.
+   - Keep the **public** half (`~/.ssh/gpudev-admin.pub`) available. At the end
+     of Phase B, `linux-setup.sh` either adopts a key already authorized on the
+     host or prints the exact `ssh-copy-id` command. It also offers a paste
+     fallback when direct copying is unavailable.
    - Keep the private half safe; only the admin laptop needs it.
 
 7. **`cloudflared` on the admin machine**
@@ -317,12 +319,12 @@ That `gpudev@<host>:~$` prompt is your handoff point.
 This phase runs `linux-setup.sh` — the same script used on a bare Linux host.
 It works regardless of which Linux username you picked at the prompt above.
 
-#### B.1 — Make a checklist of values you'll paste
+#### B.1 — Make a checklist of values you'll need
 
 | Value | Example | Source |
 |---|---|---|
 | Cloudflare domain | `example.com` | your Cloudflare account |
-| Admin public SSH key | `ssh-ed25519 AAAA…` | `cat ~/.ssh/gpudev-admin.pub` on the admin laptop |
+| Admin public SSH key | `ssh-ed25519 AAAA…` | Keep `~/.ssh/gpudev-admin.pub` available for the final admin-setup phase |
 
 #### B.2 — Bootstrap `linux-setup.sh`
 
@@ -365,8 +367,9 @@ In order:
    lands with systemd as PID 1 and proceeds with the full install.
 4. **Prompts for the Cloudflare domain.** Paste it (e.g. `example.com`)
    and Enter.
-5. **Prompts for the admin SSH public key.** Paste the full single-line
-   `ssh-ed25519 AAAA... comment` value and Enter.
+5. **Enrolls the admin SSH public key at the end.** It uses an existing
+   `authorized_keys` entry when available; otherwise it prints the exact
+   `ssh-copy-id` command and waits without disabling password access.
 6. **Installs Docker + NVIDIA Container Toolkit + `cloudflared`.**
 7. **Verifies GPU passthrough** by running `nvidia-smi` inside a test container.
 8. **Detects every GPU and the NVIDIA driver**, automatically selects a
@@ -376,8 +379,9 @@ compatible official PyTorch backend, and locks the exact PyTorch package set.
    on first run** — most of the install time. Subsequent client containers
    reuse this image. Setup runs a real CUDA operation on **each installed GPU**
    before accepting the image.
-10. **Configures host sshd** on port 52100 (pubkey-only, your admin key
-   authorized). Persistent via systemd.
+10. **Configures host sshd** for public-key-only access. Fresh bare Linux stays
+    on port 22; WSL2 uses its internal port 52100. The tunnel ingress follows
+    the same resolved value. Persistent via systemd.
 11. **Creates the host Cloudflare tunnel.** When `cloudflared` prints an auth
     URL, complete the browser flow (see "Before you start" §5 for the exact
     click-by-click steps). Persistent via `systemd` (`gpudev-tunnel.service`).
@@ -415,7 +419,7 @@ cloudflared (host):       OK
 host tunnel:              active (persistent via systemd)
 base image:               OK (gpudev-base:latest)
 torch.cuda kernels:       OK (2 GPU(s))
-host sshd:                OK (port 52100, persistent via systemd)
+host sshd:                OK (port 22 or 52100, persistent via systemd)
 host.json:                OK
 gpudev CLI:               OK
 power control:            OK (gpudev power → Windows interop)
@@ -444,8 +448,8 @@ Host gpudev
 
 (Substitute `example.com` for your domain, `gpudev` for the WSL user you chose.)
 
-Do **not** set `Port 52100` here — that port is internal to the host/WSL. Traffic
-reaches it only through the Cloudflare tunnel via `ProxyCommand`. The same
+Do **not** copy WSL's internal `Port 52100` into this tunnel alias. Traffic
+reaches the configured origin through the Cloudflare `ProxyCommand`. The same
 `ProxyCommand` form is printed by `linux-setup.sh` and `gpudev client info`
 (PATH first, then `~/.local/bin` where CRAFT may install cloudflared).
 
@@ -478,11 +482,10 @@ volume, and the gpudev base image's Python environment.
 ### Four-step setup
 
 1. **Admin creates an invitation:** `gpudev client invite <name>`.
-2. **User pastes the two printed SolveIt cells:** the first installs/updates
-   CRAFT; the second runs `%gpu_setup` to install `cloudflared`, generate the
-   local key, and update `~/.ssh/config`.
-3. **Admin enrolls the printed public key:** run `gpudev client add <name>` and
-   paste it when prompted.
+2. **User pastes the one printed SolveIt cell:** it installs/updates CRAFT,
+   runs `%gpu_setup`, generates the local key, and updates `~/.ssh/config`.
+3. **Admin enrolls the printed public key:** run the exact
+   `gpudev client add <name> --key "..."` line printed by `%gpu_setup`.
 4. **User connects from their notebook:** `%gpu <name>`.
 
 No `craft.json`, manual SSH-config editing, terminal login, private-key transfer,
@@ -511,25 +514,13 @@ ssh gpudev                         # opens admin shell on the host
 gpudev client invite alice         # makes no changes; prints the SolveIt bootstrap
 ```
 
-### Step 2 — Run the two-cell SolveIt bootstrap
+### Step 2 — Run the one-cell SolveIt bootstrap
 
-Give the printed bootstrap to the SolveIt user. It contains two cells. The first
+Give the printed bootstrap to the SolveIt user. It contains one cell, which
 installs or updates this repository in SolveIt's persistent storage:
 
-```python
-%%bash
-set -e
-mkdir -p /app/data/gpudevd
-if [ -d /app/data/gpudevd/gpudev/.git ]; then
-  git -C /app/data/gpudevd/gpudev pull --ff-only
-else
-  git clone https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev
-fi
-```
-
-The second loads CRAFT and performs idempotent local setup:
-
-```python
+```text
+!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
 %run /app/data/gpudevd/gpudev/CRAFT.py
 %gpu_setup alice --hostname alice.example.com
 ```
@@ -543,10 +534,11 @@ remain blocked and trigger CRAFT's targeted stale-key recovery.
 
 ### Step 3 — Enroll the public key on the host
 
-On the host, provision the container and paste the public key when prompted:
+Send the single command printed by `%gpu_setup` to the administrator, who runs
+it on the host:
 
 ```bash
-gpudev client add alice
+gpudev client add alice --key "ssh-ed25519 AAAA... gpudev-alice"
 ```
 
 ### Step 4 — Connect the notebook
@@ -781,7 +773,7 @@ the bare-metal path automatically.
    running setup — the script checks GPU passthrough through Docker, which fails
    confusingly if the host driver is missing entirely.
    ```bash
-   sudo ubuntu-drivers install       # or the .run installer / distro package
+   sudo ubuntu-drivers install --gpgpu
    nvidia-smi                        # must list the GPU before continuing
    ```
    On Blackwell (RTX 50-series) you need a driver new enough for `sm_120`.
@@ -1067,9 +1059,10 @@ daily-driver subset.
 
 ### `websocket: bad handshake` when SSH-ing as admin
 
-The Cloudflare tunnel is up but the origin (host sshd:52100) isn't reachable.
+The Cloudflare tunnel is up but the origin SSH service is not reachable. Its
+configured port is 52100 on WSL2 and 22 on a new bare-Linux host.
 Diagnose with `curl -I https://gpudev.<domain>`:
-- **HTTP 502** → tunnel OK, sshd:52100 down. On the host (via `wsl -d gpudev`):
+- **HTTP 502** → tunnel OK, origin sshd down. On a WSL host (via `wsl -d gpudev`):
   `sudo systemctl status ssh` and `sudo systemctl start ssh`.
 - **HTTP 530 / 1033** → no connected tunnel for that hostname. Two distinct cases:
   - **Connector down / crash-looping** (every hostname on the host is 530). On
@@ -1138,9 +1131,9 @@ This is the **opposite** direction from `Permission denied`, and the two are eas
 to confuse:
 
 - *Your* admin **public** key lives in the host's `~/.ssh/authorized_keys` — it
-  proves **you** to the host. Re-running `linux-setup.sh` re-adds it (you paste it,
-  or it comes from `host.json`/`ADMIN_SSH_KEY`), so a reinstall never locks you out
-  on this axis.
+  proves **you** to the host. Re-running `linux-setup.sh` adopts it there or
+  enrols it through the final admin-setup instructions, so a reinstall does not
+  disable password access until that key is proven.
 - The **host's** public key lives in *your* `~/.ssh/known_hosts` — it proves the
   **host** to you. Reinstalling the WSL distro regenerates `/etc/ssh/ssh_host_*`,
   so your cached entry no longer matches → SSH refuses to connect to defend against
