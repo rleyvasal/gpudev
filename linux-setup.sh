@@ -1848,7 +1848,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$(command -v ethtool) -s ${iface} wol g
+ExecStart=/bin/sh -c 'echo enabled > /sys/class/net/${iface}/device/power/wakeup 2>/dev/null || true; exec $(command -v ethtool) -s ${iface} wol g'
 RemainAfterExit=yes
 
 [Install]
@@ -1872,7 +1872,12 @@ StopWhenUnneeded=yes
 
 [Service]
 Type=oneshot
-ExecStart=$(command -v ethtool) -s ${iface} wol g
+# TWO independent gates, and arming only the first is not enough. `ethtool wol g`
+# arms the NIC's magic-packet detector; power/wakeup decides whether the PCI
+# device may wake the system at all. A resume can leave the second disabled
+# while ethtool still reports "Wake-on: g", which is why re-arming ethtool alone
+# did not fix the second-suspend failure on this RTL8125D.
+ExecStart=/bin/sh -c 'echo enabled > /sys/class/net/${iface}/device/power/wakeup 2>/dev/null || true; exec $(command -v ethtool) -s ${iface} wol g'
 
 [Install]
 WantedBy=sleep.target
