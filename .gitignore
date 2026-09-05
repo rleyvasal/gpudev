@@ -1,5 +1,14 @@
-# Local config (contains API tokens, SSH keys, domain names)
-*.json
+# Local gpudev config (API tokens, SSH keys, domain names).
+# The real files live in ~/.config/gpudev/, outside this repo, so these
+# entries do not protect them — they guard against a copy landing here
+# during debugging, which is the only way one ever appears in the tree.
+host.json
+clients.json
+
+# Per-machine editor/agent settings, never shared
+.claude/settings.local.json
+.claude/launch.json
+
 *.log
 
 # Python
