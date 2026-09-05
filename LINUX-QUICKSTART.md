@@ -467,32 +467,38 @@ the flow below hits it.
 %run ~/.gpudev-client/CRAFT.py solveit --domain example.com
 ```
 
-> Installing somewhere else? Put `GPUDEV_DIR=<path>` before `sh` on line 1 —
-> see **Choosing the install directory** below. Line 2 never changes.
+The first line installs the client runtime into **`~/.gpudev-client`** — the
+same path line 2 runs it from, so the destination is visible in the cell rather
+than hidden in a default. It fetches only the ten files a client actually runs
+(~192 KB), not the host-side scripts and not repository history.
 
-The first line installs the client runtime into `/app/data/gpudevd/gpudev` —
-SolveIt's persistent storage, so it survives kernel restarts. It fetches only
-the ten files a client actually runs (~192 KB), not the host-side scripts and
-not repository history.
+Home-relative on purpose. In SolveIt the home directory *is* the persistent
+storage (`cd ~` lands in `/app/data`), so this survives kernel restarts, and the
+same cell is correct on a local Jupyter or Colab where no SolveIt path exists.
+It is why `~/.ssh/gpudev-<name>` persists too.
 
 The second line loads CRAFT **and** runs setup: `%run script.py args` fills
 `sys.argv`, and `CRAFT.py` is already the `%run` entry point. Two lines is the
 floor here, because a cold client has to fetch something before it can run it.
 
-### Choosing the install directory
+### Installing on another volume
 
-Set `GPUDEV_DIR` on the first line to install somewhere else — worth doing on a
-local Jupyter, where `/app/data` does not exist:
+Rarely needed. `GPUDEV_DIR` moves the files, and line 2 still does not change —
+the bootstrap makes `~/.gpudev-client` a symlink to wherever you chose and
+prints both paths:
 
 ```
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py solveit --domain example.com
 ```
 
-The second line is unchanged: the bootstrap points `~/.gpudev-client` at
-whatever you chose, and prints both paths so a non-default install is never
-silent. Choose somewhere persistent — a temp directory means re-fetching after
-every kernel restart.
+Choose somewhere persistent — a temp directory means re-fetching after every
+kernel restart.
+
+> **Keep the `export`.** `GPUDEV_DIR=… && sh …` sets a shell variable the `sh`
+> child never inherits, so the install silently lands in the default directory
+> instead. Use `export … && sh …`, or the prefix form `GPUDEV_DIR=… sh …` with
+> no `&&` between them.
 
 Setup is idempotent: re-running reuses the existing key rather than replacing
 it, so it is safe to paste again.
@@ -517,13 +523,14 @@ sh /tmp/gpudev-bootstrap.sh --force    # re-fetch, repairing what --verify found
 an update ever breaks a notebook, the commit that worked is recorded in
 `<install>/VERSION` — pin to it and carry on.
 
-`~/.gpudev-client` is a symlink the bootstrap points at whatever `GPUDEV_DIR`
-is, so the second line of the cell never has to change. It exists because
-`%run` expands `$VAR` from the Python namespace rather than the shell
-environment, so `%run $GPUDEV_DIR/CRAFT.py` cannot work, and a `!` line cannot
-set a Python variable for the next line to use. The upside beyond
-configurability: the cell carries no SolveIt-specific path, so it also works on
-a local Jupyter where `/app/data` does not exist.
+`~/.gpudev-client` is the install itself in the normal case, so line 2 needs no
+indirection. Only an overridden `GPUDEV_DIR` turns it into a symlink, which
+exists because `%run` expands `$VAR` from the Python namespace rather than the
+shell environment — `%run $GPUDEV_DIR/CRAFT.py` cannot work, and a `!` line
+cannot set a Python variable for the next line to use.
+
+Upgrading from an earlier layout is handled: a leftover symlink at that path is
+replaced with the real install, and the old copy is named so you can delete it.
 
 ### Hostnames
 

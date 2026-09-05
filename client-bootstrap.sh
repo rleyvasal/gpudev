@@ -21,7 +21,15 @@ set -eu
 
 GPUDEV_SLUG="${GPUDEV_SLUG:-rleyvasal/gpudev}"
 GPUDEV_REF="${GPUDEV_REF:-main}"
-GPUDEV_DIR="${GPUDEV_DIR:-/app/data/gpudevd/gpudev}"
+
+# Home-relative by design. SolveIt's persistent storage IS the home directory
+# (`cd ~` there lands in /app/data), so ~/.gpudev-client survives kernel
+# restarts exactly as the old hardcoded /app/data path did — and it is also
+# correct on a local Jupyter, Colab, or anywhere else, none of which have
+# /app/data. The same fact is why ~/.ssh/gpudev-<name> persists.
+[ -n "${HOME:-}" ] || { echo "client-bootstrap: HOME is not set." >&2; exit 1; }
+GPUDEV_ENTRY="${HOME}/.gpudev-client"
+GPUDEV_DIR="${GPUDEV_DIR:-$GPUDEV_ENTRY}"
 
 # The client manifest. Exact files are required; addons are a glob so a new
 # addon does not require a bootstrap change. Matching *.py also excludes the
@@ -230,32 +238,36 @@ count="$( ( cd "${tmp}/new" && find . -name '*.py' -type f | wc -l ) | tr -d ' '
 # or the whole new one.
 rm -rf "${GPUDEV_DIR}.old" "${GPUDEV_DIR}.new"
 mv "${tmp}/new" "${GPUDEV_DIR}.new"
-if [ -d "$GPUDEV_DIR" ]; then
+# An install from before the default moved left ~/.gpudev-client as a SYMLINK
+# to the old location. Renaming a real directory onto a symlink would put the
+# tree inside the link's target instead of replacing it, so drop the link
+# first — the old tree is left alone and named at the end.
+if [ -L "$GPUDEV_DIR" ]; then
+    PREVIOUS_TARGET="$(ls -ld "$GPUDEV_DIR" 2>/dev/null | sed 's/.* -> //')"
+    rm -f "$GPUDEV_DIR"
+elif [ -d "$GPUDEV_DIR" ]; then
     mv "$GPUDEV_DIR" "${GPUDEV_DIR}.old"
 fi
 mv "${GPUDEV_DIR}.new" "$GPUDEV_DIR"
 rm -rf "${GPUDEV_DIR}.old"
 
-# ── Stable entry point ───────────────────────────────────────────────────────
-# GPUDEV_DIR is configurable, but the notebook's second line is a `%run` with a
-# literal path — and IPython expands `$VAR` from the PYTHON namespace, not the
-# shell environment, so `%run $GPUDEV_DIR/CRAFT.py` simply does not work
-# (measured: "File `'$GPUDEV_DIR/CRAFT.py'` not found"). A shell escape cannot
-# set a Python variable either, so line 1 has no way to tell line 2 where the
-# install went.
+# ── Entry point ──────────────────────────────────────────────────────────────
+# The cell's second line is a `%run` with a literal path, and IPython expands
+# `$VAR` from the PYTHON namespace, not the shell environment — measured:
+# `%run $GPUDEV_DIR/CRAFT.py` fails with "File not found". A `!` shell escape
+# cannot set a Python variable either, so line 1 has no way to tell line 2
+# where the install went. The cell therefore always says ~/.gpudev-client.
 #
-# A symlink at a path that is always valid closes that gap: the install lives
-# wherever GPUDEV_DIR says, and the cell always says ~/.gpudev-client. `%run`
-# expands `~`, and __file__.resolve() follows the link, so imports and addons
-# resolve against the real directory.
-ENTRY=""
-if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
-    link="${HOME}/.gpudev-client"
-    if [ -e "$link" ] && [ ! -L "$link" ]; then
-        # Never replace something that is not ours to replace.
-        say "Note: ${link} exists and is not a symlink; leaving it alone."
-    elif ln -sfn "$GPUDEV_DIR" "$link" 2>/dev/null; then
-        ENTRY="~/.gpudev-client"
+# In the default case that IS the install, so nothing more is needed. Only an
+# overridden GPUDEV_DIR needs a symlink to bridge the two.
+ENTRY="~/.gpudev-client"
+if [ "$GPUDEV_DIR" != "$GPUDEV_ENTRY" ]; then
+    if [ -e "$GPUDEV_ENTRY" ] && [ ! -L "$GPUDEV_ENTRY" ]; then
+        # Never replace something this script did not create.
+        say "Note: ${GPUDEV_ENTRY} exists and is not a symlink; leaving it alone."
+        ENTRY="$GPUDEV_DIR"
+    elif ! ln -sfn "$GPUDEV_DIR" "$GPUDEV_ENTRY" 2>/dev/null; then
+        ENTRY="$GPUDEV_DIR"
     fi
 fi
 
@@ -264,6 +276,12 @@ say "Installed gpudev client runtime"
 say "  commit:  ${short} (${GPUDEV_REF})"
 say "  files:   ${count} python files + VERSION"
 say "  path:    ${GPUDEV_DIR}"
-[ -n "$ENTRY" ] && say "  entry:   ${ENTRY} → ${GPUDEV_DIR}"
+[ "$ENTRY" = "~/.gpudev-client" ] && [ "$GPUDEV_DIR" != "$GPUDEV_ENTRY" ] \
+    && say "  entry:   ~/.gpudev-client → ${GPUDEV_DIR}"
+if [ -n "${PREVIOUS_TARGET:-}" ] && [ -d "$PREVIOUS_TARGET" ]; then
+    say ""
+    say "Note: this used to point at ${PREVIOUS_TARGET}."
+    say "      That copy is now unused and can be removed."
+fi
 say ""
-say "Next:  %run ${ENTRY:-$GPUDEV_DIR}/CRAFT.py <client-name> --domain <your-domain>"
+say "Next:  %run ${ENTRY}/CRAFT.py <client-name> --domain <your-domain>"

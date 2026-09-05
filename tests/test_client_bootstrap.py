@@ -249,6 +249,49 @@ class BootstrapTests(unittest.TestCase):
         ]
         self.assertEqual(leftovers, [])
 
+    def test_default_install_is_home_relative_with_no_symlink(self):
+        # SolveIt's persistent storage IS the home directory (`cd ~` lands in
+        # /app/data there), so a home-relative default persists exactly as the
+        # old hardcoded path did — and is also correct on a local Jupyter or
+        # Colab, which have no such path. In this case ~/.gpudev-client is the
+        # install itself, so no symlink should exist at all.
+        home = self.root / "home"
+        home.mkdir()
+        env = self.server.env(HOME=str(home))  # deliberately no GPUDEV_DIR
+
+        result = run_bootstrap(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        install = home / ".gpudev-client"
+        self.assertTrue(install.is_dir())
+        self.assertFalse(install.is_symlink())
+        self.assertTrue((install / "CRAFT.py").is_file())
+        self.assertIn("%run ~/.gpudev-client/CRAFT.py", result.stdout)
+        # No environment-specific path anywhere in the output.
+        self.assertNotIn("/app/data", result.stdout)
+
+    def test_upgrade_replaces_a_leftover_symlink_and_keeps_the_old_tree(self):
+        # Installs from before the default moved left ~/.gpudev-client as a
+        # SYMLINK. Renaming a directory onto a symlink would put the tree
+        # inside the link's target instead of replacing it.
+        home = self.root / "home"
+        old = home / "gpudevd" / "gpudev"
+        old.mkdir(parents=True)
+        (old / "CRAFT.py").write_text("old install\n")
+        (home / ".gpudev-client").symlink_to(old)
+
+        result = run_bootstrap(self.server.env(HOME=str(home)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        entry = home / ".gpudev-client"
+        self.assertFalse(entry.is_symlink())
+        self.assertTrue(entry.is_dir())
+        self.assertNotIn("old install", (entry / "CRAFT.py").read_text())
+        # The old copy is named, not silently deleted — it is not this
+        # script's tree to remove.
+        self.assertEqual((old / "CRAFT.py").read_text(), "old install\n")
+        self.assertIn(str(old), result.stdout)
+
     def test_stable_entry_point_points_at_the_install(self):
         # GPUDEV_DIR is configurable, but the cell's second line is a `%run`
         # with a literal path, and IPython expands $VAR from the PYTHON
@@ -294,13 +337,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse((home / ".gpudev-client").is_symlink())
         self.assertIn(f"%run {self.install}/CRAFT.py", result.stdout)
 
-    def test_install_still_succeeds_without_a_usable_home(self):
+    def test_missing_home_fails_fast_rather_than_guessing(self):
+        # The default install path is home-relative, so an unset HOME has no
+        # sane fallback. Failing before anything is fetched beats installing
+        # somewhere arbitrary that the cell's line 2 will not find.
         env = self.env()
         env.pop("HOME", None)
         result = run_bootstrap(env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.install / "CRAFT.py").is_file())
-        self.assertIn(f"%run {self.install}/CRAFT.py", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HOME", result.stderr)
 
     def test_patterns_are_not_glob_expanded_by_the_shell(self):
         # `$PATTERNS` must reach tar literally. Unquoted and unguarded, the

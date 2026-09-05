@@ -514,20 +514,20 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 
 ### Step 1 — Start on the client in SolveIt
 
-Run this one cell. Line 1 installs or updates the client runtime — into
-`/app/data/gpudevd/gpudev` by default, or wherever you set `GPUDEV_DIR`
-([below](#choosing-where-the-files-go)). Line 2 loads CRAFT **and** runs setup,
-because `%run script.py args` fills `sys.argv` and `CRAFT.py` is already the
-entry point:
+Run this one cell. Line 1 installs the client runtime into `~/.gpudev-client`;
+line 2 loads CRAFT **and** runs setup from that same path, because `%run
+script.py args` fills `sys.argv` and `CRAFT.py` is already the entry point:
 
 ```text
 !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py alice --domain example.com
 ```
 
-> Installing somewhere else? Put `GPUDEV_DIR=<path>` before `sh` on line 1:
-> `... -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh`.
-> Line 2 never changes.
+**The destination is `~/.gpudev-client`, right there on line 2** — no hidden
+path, nothing to configure for the normal case. In SolveIt the home directory
+*is* the persistent storage (`cd ~` lands in `/app/data`), so this survives
+kernel restarts, and it is equally correct on a local Jupyter or Colab. It is
+the same reason `~/.ssh/gpudev-alice` persists.
 
 Ask your administrator for the domain — it is public DNS, not a secret, and it
 is the only thing the notebook cannot work out for itself.
@@ -537,30 +537,32 @@ the host-side scripts or repository history. Setup then installs/checks
 `cloudflared`, generates `~/.ssh/gpudev-alice`, and writes the SSH stanza. It
 never replaces an existing private key, and the private key stays in SolveIt.
 
-#### Choosing where the files go
+#### Installing somewhere other than the home directory
 
-By default the runtime is installed to `/app/data/gpudevd/gpudev` — SolveIt's
-persistent storage, so it survives kernel restarts. Set `GPUDEV_DIR` on line 1
-to put it anywhere else:
+Rarely needed — `~/.gpudev-client` is correct on SolveIt, local Jupyter and
+Colab alike. If you do want the files on a different volume, `GPUDEV_DIR` moves
+them:
 
 ```text
-!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && export GPUDEV_DIR=/data/gpudev && sh /tmp/gpudev-bootstrap.sh
 %run ~/.gpudev-client/CRAFT.py alice --domain example.com
 ```
 
-**Line 2 does not change.** The bootstrap points `~/.gpudev-client` at whatever
-you chose, so the cell is correct wherever you install — see
-[below](#why-the-cell-says-gpudev-client) for why it works this way. The script
-prints both paths, so a non-default install is never silent:
+**Line 2 still does not change.** When `GPUDEV_DIR` points elsewhere, the
+bootstrap makes `~/.gpudev-client` a symlink to it, and says so:
 
 ```text
-  path:    /home/you/gpudev-client
-  entry:   ~/.gpudev-client → /home/you/gpudev-client
+  path:    /data/gpudev
+  entry:   ~/.gpudev-client → /data/gpudev
 ```
 
-Worth setting on a **local Jupyter or Colab**, where `/app/data` does not exist.
-Pick somewhere persistent: a temp directory means re-fetching after every
-restart.
+Pick somewhere persistent — a temp directory means re-fetching after every
+kernel restart.
+
+> **Keep the `export`.** `GPUDEV_DIR=… && sh …` sets a shell variable the `sh`
+> child never inherits, so the install silently lands in the default directory —
+> no error, just files somewhere you did not choose. Use `export … && sh …` as
+> above, or the prefix form `GPUDEV_DIR=… sh …` with no `&&` between them.
 
 If this client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA
 compilation, add the variant to the same line:
@@ -605,18 +607,20 @@ shell environment — `%run $GPUDEV_DIR/CRAFT.py` fails with *File not found*. A
 `!` shell escape cannot set a Python variable either, so line 1 has no way to
 tell line 2 where the install went.
 
-The bootstrap therefore points `~/.gpudev-client` at whatever `GPUDEV_DIR` is.
-`%run` expands `~`, and `__file__.resolve()` follows the link, so imports and
-addons resolve against the real directory. The cell stays correct wherever you
-install — and carries no SolveIt-specific path, so it works unchanged on a
-local Jupyter or anywhere `/app/data` does not exist.
+So the install goes to `~/.gpudev-client` by default, and line 2 names that
+same directory — no indirection at all in the normal case. Only an overridden
+`GPUDEV_DIR` needs a bridge, and there the bootstrap makes `~/.gpudev-client` a
+symlink to it. `%run` expands `~`, and `__file__.resolve()` follows a symlink,
+so imports and addons resolve against the real directory either way.
 
-```bash
-GPUDEV_DIR=~/gpudev-client sh /tmp/gpudev-bootstrap.sh   # cell line 2 unchanged
-```
+Home-relative rather than a fixed path because it is correct everywhere: in
+SolveIt `$HOME` *is* the persistent storage, and on a local Jupyter or Colab a
+SolveIt path would not exist at all.
 
-If `~/.gpudev-client` already exists as a real directory, the bootstrap leaves
-it alone and prints the literal path to use instead.
+If `~/.gpudev-client` exists as a real directory that this script did not
+create, it is left alone and the literal install path is printed instead.
+Upgrading from the earlier layout is handled too: a leftover symlink there is
+replaced with the real install, and the old copy is named so you can remove it.
 
 ### Step 2 — The round trip through the administrator
 

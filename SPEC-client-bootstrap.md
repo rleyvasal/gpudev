@@ -277,17 +277,38 @@ in gpudev rather than a bad download.
 The swap is per-directory rename, so a reader mid-import either sees the whole
 old tree or the whole new one.
 
-### Path override
+### The install path is home-relative
 
 ```
-GPUDEV_DIR=${GPUDEV_DIR:-/app/data/gpudevd/gpudev}
+GPUDEV_ENTRY="${HOME}/.gpudev-client"
+GPUDEV_DIR="${GPUDEV_DIR:-$GPUDEV_ENTRY}"
 ```
 
-`/app/data/gpudevd/gpudev` is SolveIt's persistent storage and stays the
-default, so no existing instruction changes. It is currently hardcoded in four
-places (`gpudev`, `README.md`, `LINUX-QUICKSTART.md`,
-`SPEC-client-onboarding.md`); after this change the default lives in the script
-and the docs reference the script.
+The obvious default was `/app/data/gpudevd/gpudev`, SolveIt's persistent
+storage, hardcoded in four places (`gpudev`, `README.md`,
+`LINUX-QUICKSTART.md`, `SPEC-client-onboarding.md`).
+
+**That was unnecessary.** In SolveIt, `$HOME` *is* `/app/data`:
+
+```
+solveit@4b2faf433461:~$ cd ~
+solveit@4b2faf433461:~$ pwd
+/app/data
+```
+
+So the "SolveIt-specific persistent path" was the home directory all along —
+which is also why `~/.ssh/gpudev-<name>` persists across kernel restarts. A
+home-relative default gets the same persistence in SolveIt **and** is correct
+on a local Jupyter or Colab, where no SolveIt path exists.
+
+Consequences:
+
+- The published cell contains **no environment-specific path**. The same two
+  lines work everywhere.
+- `~/.gpudev-client` is normally the install itself, so the symlink below is
+  needed only when `GPUDEV_DIR` is overridden.
+- `$HOME` becomes required. The script fails fast when it is unset rather than
+  installing somewhere arbitrary.
 
 The script prints the resolved directory, so a non-default install is never
 silent.
@@ -319,18 +340,19 @@ expands `~`, and because `__file__.resolve()` follows the link, `_GPUDEV_ROOT`,
 `_ADDONS` and `VERSION_FILE` all land on the real directory — addons load
 through the symlink unchanged.
 
-Two consequences beyond the configurability fix:
+Because the default install path **is** `~/.gpudev-client`, no symlink exists in
+the normal case — the cell simply names the directory the files are in. The
+symlink appears only when `GPUDEV_DIR` points elsewhere.
 
-- The cell carries **no SolveIt-specific path**, so it works unchanged on a
-  local Jupyter or anywhere `/app/data` does not exist. That is the case
-  `GPUDEV_DIR` was for, and it now needs no second edit.
-- Old cells keep working. The install still defaults to
-  `/app/data/gpudevd/gpudev`, so a previously pasted literal path resolves to
-  the same tree.
+If `~/.gpudev-client` exists as a real directory this script did not create, it
+is left untouched and the literal install path is printed instead — never
+replace what you did not create.
 
-If `~/.gpudev-client` exists and is **not** a symlink, it is left untouched and
-the literal path is printed instead — the script must never replace a directory
-it did not create. A missing or unwritable `$HOME` degrades the same way.
+**Upgrade path.** An install from before the default moved left
+`~/.gpudev-client` as a *symlink*. Renaming a real directory onto a symlink
+would place the tree inside the link's target rather than replacing it, so the
+swap drops the link first, installs a real directory, and names the now-unused
+old copy rather than deleting a tree it did not create.
 
 ### Version stamp
 
