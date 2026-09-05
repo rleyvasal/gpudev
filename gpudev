@@ -2122,9 +2122,10 @@ cmd_power() {
 #   the BuildKit cache                 this is what makes a reinstall fast: the
 #                                      base image rebuilt in 6.8s from a warm
 #                                      cache versus ~13 minutes cold
-#   every sshd and SSH setting         reset is run by someone who is staying on
-#                                      the box; changing the port mid-reset only
-#                                      creates work. `uninstall` owns that.
+#   sshd port and password policy      reset is run by someone who is staying on
+#                                      the box; changing either only creates
+#                                      work. The managed admin key is unwrapped
+#                                      before its dispatcher is removed.
 #
 # Client DATA volumes are kept too. A reinstall re-adopts them by name, and they
 # are the one thing here that cannot be rebuilt. --purge-data opts out.
@@ -2219,7 +2220,8 @@ reset_manifest() {
             echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
         fi
         echo "  images gpudev-base*                   (replaced by the next build)"
-        echo "  every sshd/SSH setting                (port, password policy, your key)"
+        echo "  sshd port and password policy         (unchanged)"
+        echo "  admin key                             (preserved as a normal SSH key)"
     fi
     if [ "$purge_data" != "1" ]; then
         echo "  client data volumes                   (re-adopted by name; --purge-data to remove)"
@@ -2280,6 +2282,22 @@ Or --force if you accept being disconnected."
         printf "Type the host's tunnel hostname (%s) to confirm: " "$host_cf"
         IFS= read -r confirm
         [ "$confirm" = "$host_cf" ] || { echo "Aborted."; return 0; }
+    fi
+
+    # The managed key runs every login through ~/bin/gpudev-ssh-dispatch.
+    # Reset removes that binary, so leaving the wrapper behind would preserve
+    # the key text while making every new SSH session fail. Convert it back to
+    # the same bare public key before removing anything, then verify the exact
+    # type+blob is present in a form sshd can use without the dispatcher.
+    local admin_key
+    admin_key="$(host_get admin_ssh_key)"
+    if [ -n "$admin_key" ]; then
+        if [ "$(unwrap_admin_key "$admin_key")" = "unwrapped" ]; then
+            log "Admin key preserved as a normal SSH key."
+        fi
+        admin_key_is_bare "$admin_key" \
+            || fail "Could not preserve the admin key as a normal authorized_keys entry.
+Nothing has been removed. Fix ~/.ssh/authorized_keys and try again."
     fi
 
     local cf_ctx="" cf_token="" cf_zone=""
@@ -2372,10 +2390,10 @@ Or --force if you accept being disconnected."
     fi
 
     if [ "$cold" = "1" ]; then
-        log "Reset complete (cold). Docker, the toolkit and SSH are untouched;"
+        log "Reset complete (cold). Docker and the toolkit are untouched; SSH access is preserved;"
         log "the build cache is gone, so the next install builds from scratch."
     else
-        log "Reset complete. Docker, the toolkit, the build cache and SSH are untouched."
+        log "Reset complete. Docker, the toolkit and the build cache are untouched; SSH access is preserved."
     fi
     log ""
     log "Reinstall with:"
@@ -2383,8 +2401,10 @@ Or --force if you accept being disconnected."
 }
 
 # ── gpudev uninstall ──────────────────────────────────────────────────────────
-# Everything reset does, plus images, the build cache, the SSH revert and the
-# key unwrap.
+# Everything reset does, plus images, the build cache, and the sshd policy
+# revert. Reset already unwraps the key so deleting the dispatcher cannot break
+# ordinary SSH; uninstall performs the same unwrap earlier, before its access
+# proof, and the reset call later sees an already-bare key.
 #
 # The ordering exists because of one trap: the admin key is not a plain
 # authorized_keys entry. gpudev-ssh-dispatch rewrites it as
@@ -2394,9 +2414,9 @@ Or --force if you accept being disconnected."
 # be unwrapped BEFORE ~/bin is touched, and access proven before anything
 # irreversible happens.
 
-# Rewrite the admin entry as a bare key, dropping any forced-command prefix.
-# Matches on type + blob so a wrapped entry is recognised, the same predicate
-# linux-setup.sh and gpudev-ssh-dispatch use.
+# Shared by reset and uninstall. Rewrite the admin entry as a bare key, dropping
+# any forced-command prefix. Matches on type + blob so a wrapped entry is
+# recognised, the same predicate linux-setup.sh and gpudev-ssh-dispatch use.
 unwrap_admin_key() {
     local key="$1" file="${HOME}/.ssh/authorized_keys"
     [ -f "$file" ] || return 0
@@ -2418,6 +2438,19 @@ if changed:
     path.write_text("\n".join(out) + "\n")
     print("unwrapped")
 PY
+}
+
+# True only when the configured admin key exists without leading options or a
+# forced command. Matching type+blob ignores comments while rejecting the
+# dispatcher-wrapped form whose first field is command="...".
+admin_key_is_bare() {
+    local key="$1" file="${HOME}/.ssh/authorized_keys" type blob
+    [ -f "$file" ] || return 1
+    type="$(printf '%s' "$key" | awk '{print $1}')"
+    blob="$(printf '%s' "$key" | awk '{print $2}')"
+    [ -n "$type" ] && [ -n "$blob" ] || return 1
+    awk -v t="$type" -v b="$blob" \
+        '$1 == t && $2 == b { found = 1 } END { exit !found }' "$file"
 }
 
 # Re-enabling password auth on an account that has none moves the port, removes

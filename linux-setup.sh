@@ -57,7 +57,11 @@ CUDA_DEV_BASE_IMAGE="nvidia/cuda:12.8.1-devel-ubuntu24.04"
 CUDA_DEV_TORCH_BACKEND="cu128"
 PROFILING_REQS="${CONFIG_DIR}/requirements-profiling.txt"
 
-HOST_SSH_PORT=52100
+# Resolved after environment detection and config loading. Fresh bare-metal
+# Linux hosts keep OpenSSH on its standard LAN port; WSL retains the high port
+# because its listener is internal to the VM. An explicit environment value or
+# an existing host.json always wins.
+HOST_SSH_PORT="${HOST_SSH_PORT:-}"
 PORT_BASE=52200
 GPU_INVENTORY="${CONFIG_DIR}/gpu-inventory.csv"
 TORCH_INPUT="${CONFIG_DIR}/requirements-torch.in"
@@ -150,17 +154,39 @@ require_debian_family() {
 # ── Step 1: Configuration ─────────────────────────────────────────────────────
 
 load_host_config() {
-    [ -f "$HOST_CONFIG" ] || return 0
-    CF_DOMAIN="${CF_DOMAIN:-$(python3 -c "
+    if [ -f "$HOST_CONFIG" ]; then
+        CF_DOMAIN="${CF_DOMAIN:-$(python3 -c "
 import json, pathlib
 d = json.loads(pathlib.Path('$HOST_CONFIG').read_text())
 print(d.get('cf_domain', ''))
 " 2>/dev/null || true)}"
-    ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-$(python3 -c "
+        ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-$(python3 -c "
 import json, pathlib
 d = json.loads(pathlib.Path('$HOST_CONFIG').read_text())
 print(d.get('admin_ssh_key', ''))
 " 2>/dev/null || true)}"
+        HOST_SSH_PORT="${HOST_SSH_PORT:-$(python3 -c "
+import json, pathlib
+d = json.loads(pathlib.Path('$HOST_CONFIG').read_text())
+print(d.get('host_ssh_port', ''))
+" 2>/dev/null || true)}"
+    fi
+
+    # Reset deliberately removes host.json but leaves SSH untouched. Recover an
+    # explicit current port before choosing a fresh-host default so a reset of
+    # a legacy 52100 installation does not silently become a port migration.
+    if [ -z "$HOST_SSH_PORT" ]; then
+        HOST_SSH_PORT="$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null \
+                        | awk '{print $2}' | head -1)"
+    fi
+
+    if [ -z "$HOST_SSH_PORT" ]; then
+        if [ "$HOST_ENV" = "linux" ]; then
+            HOST_SSH_PORT=22
+        else
+            HOST_SSH_PORT=52100
+        fi
+    fi
 }
 
 validate_ssh_public_key() {

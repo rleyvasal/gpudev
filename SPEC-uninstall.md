@@ -51,11 +51,15 @@ machine usable and reachable.
 **Removes:** clients (containers + ingress + CNAMEs), the tunnel, gpudev state
 and system files from the table above, `~/.config/gpudev`, `~/bin` scripts.
 
-**Keeps:** Docker, the toolkit, cloudflared, **all sshd and SSH settings**, and
-the build cache (unless `--cold`).
+**Keeps:** Docker, the toolkit, cloudflared, the sshd port and password policy,
+the admin public key, and the build cache (unless `--cold`).
 
-**Does not touch sshd at all.** The operator is staying on the box and
-reinstalling immediately; changing the port mid-reset only creates work.
+**Does not touch sshd.** The operator is staying on the box and reinstalling
+immediately; changing the port or password policy mid-reset only creates work.
+Before deleting `~/bin/gpudev-ssh-dispatch`, reset removes that forced-command
+wrapper from the admin key and verifies the same type+blob remains as a normal
+`authorized_keys` entry. This keeps ordinary SSH access working while still
+removing all gpudev executables.
 
 ### Why it keeps the build cache and the lock
 
@@ -96,8 +100,9 @@ deliberate rather than accidental.
 
 ## `gpudev uninstall`
 
-Everything `reset` does, plus images, build cache, the SSH revert, and the key
-unwrap.
+Everything `reset` does, plus images, build cache, and the sshd policy revert.
+Both paths unwrap the admin key before removing the dispatcher; uninstall does
+it earlier because its fresh-login proof depends on the unwrapped key.
 
 ### Flags
 

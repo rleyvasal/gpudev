@@ -87,6 +87,49 @@ class UninstallExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((root / "home/reset-args").read_text().strip(), "--yes --force")
 
+    def test_reset_unwraps_admin_key_before_removing_dispatcher(self):
+        body = r'''
+        mkdir -p "$HOME/.ssh" "$HOME/bin"
+        printf '%s\n' \
+          'command="/home/gpudev/bin/gpudev-ssh-dispatch" ssh-ed25519 AAAATEST admin' \
+          'ssh-ed25519 AAAAOTHER other' > "$HOME/.ssh/authorized_keys"
+        touch "$HOME/bin/gpudev-ssh-dispatch"
+        require_interactive_sudo() { :; }
+        session_rides_tunnel() { return 1; }
+        reset_manifest() { :; }
+        cf_api_context() { return 1; }
+        all_client_names() { :; }
+        command_exists() { return 1; }
+        gpudev_system_files() { :; }
+        docker_cmd() { :; }
+        cmd_reset --yes
+        '''
+        result, root, td = self.run_harness(body)
+        self.addCleanup(td.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        authorized = (root / "home/.ssh/authorized_keys").read_text()
+        self.assertIn("ssh-ed25519 AAAATEST admin", authorized)
+        self.assertNotIn("gpudev-ssh-dispatch", authorized)
+        self.assertIn("ssh-ed25519 AAAAOTHER other", authorized)
+        self.assertFalse((root / "home/bin/gpudev-ssh-dispatch").exists())
+
+    def test_reset_stops_before_removal_when_admin_key_cannot_be_preserved(self):
+        body = r'''
+        mkdir -p "$HOME/bin"
+        touch "$HOME/bin/gpudev-ssh-dispatch"
+        require_interactive_sudo() { :; }
+        session_rides_tunnel() { return 1; }
+        reset_manifest() { :; }
+        command_exists() { return 1; }
+        cmd_reset --yes
+        '''
+        result, root, td = self.run_harness(body)
+        self.addCleanup(td.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Nothing has been removed", result.stderr)
+        self.assertTrue((root / "home/bin/gpudev-ssh-dispatch").exists())
+        self.assertTrue((root / "home/.config/gpudev/host.json").exists())
+
     def test_dry_run_does_not_probe_sudo_or_docker(self):
         body = r'''
         require_interactive_sudo() { touch "$HOME/sudo-called"; }

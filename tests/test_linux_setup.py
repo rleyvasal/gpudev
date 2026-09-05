@@ -19,6 +19,17 @@ def function_body(name: str) -> str:
 
 
 class LinuxSetupTests(unittest.TestCase):
+    def test_bare_linux_uses_port_22_without_migrating_existing_hosts(self):
+        body = function_body("load_host_config")
+        recorded = body.index("host_ssh_port")
+        configured = body.index("/etc/ssh/sshd_config")
+        default = body.index("HOST_SSH_PORT=22")
+
+        self.assertLess(recorded, configured)
+        self.assertLess(configured, default)
+        self.assertIn('if [ "$HOST_ENV" = "linux" ]', body)
+        self.assertIn("HOST_SSH_PORT=52100", body)
+
     def test_cuda_downloads_have_resilient_uv_settings(self):
         self.assertIn("UV_HTTP_TIMEOUT=300", SCRIPT)
         self.assertIn("UV_HTTP_RETRIES=5", SCRIPT)
