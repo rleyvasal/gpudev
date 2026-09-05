@@ -90,6 +90,32 @@ class LinuxSetupTests(unittest.TestCase):
         self.assertNotIn("apply_ssh_port", body)
         self.assertNotIn('set_sshd_option "Port"', body)
 
+    def test_reset_removes_every_system_file_the_installer_creates(self):
+        # Two hand-maintained lists in different files. If linux-setup.sh starts
+        # writing a new drop-in and reset is not told, that file survives a
+        # "reset" and the next install is not testing a clean host.
+        import re
+
+        gpudev = (ROOT / "gpudev").read_text(encoding="utf-8")
+        created = set(re.findall(
+            r"/etc/(?:systemd/system|sudoers\.d|systemd/logind\.conf\.d"
+            r"|apt/apt\.conf\.d|modprobe\.d)/[A-Za-z0-9._-]+",
+            SCRIPT,
+        ))
+        removed = set(re.findall(r"^/etc/\S+$", gpudev, re.M))
+
+        # 20auto-upgrades is a STOCK Ubuntu file that linux-setup.sh overwrites
+        # rather than creates. Deleting it on reset would remove a distro file
+        # the host had before gpudev existed.
+        exceptions = {"/etc/apt/apt.conf.d/20auto-upgrades"}
+
+        missing = sorted(created - removed - exceptions)
+        self.assertEqual(
+            missing, [],
+            "linux-setup.sh writes these but `gpudev reset` never removes them: "
+            + ", ".join(missing),
+        )
+
     def test_docker_probe_prefers_unprivileged_access(self):
         # sudo needs a TTY, so probing it first breaks non-interactive runs on a
         # host where docker-group membership already grants access.

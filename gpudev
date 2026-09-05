@@ -2105,6 +2105,229 @@ cmd_power() {
     esac
 }
 
+# ── gpudev reset ──────────────────────────────────────────────────────────────
+# Returns the host to its state before linux-setup.sh, so a clean install can be
+# tested without rebuilding the world. Deliberately KEEPS three things:
+#
+#   Docker, the toolkit, cloudflared   reinstalling them is slow and they may
+#                                      serve other workloads on this machine
+#   the BuildKit cache                 this is what makes a reinstall fast: the
+#                                      base image rebuilt in 6.8s from a warm
+#                                      cache versus ~13 minutes cold
+#   every sshd and SSH setting         reset is run by someone who is staying on
+#                                      the box; changing the port mid-reset only
+#                                      creates work. `uninstall` owns that.
+#
+# Client DATA volumes are kept too. A reinstall re-adopts them by name, and they
+# are the one thing here that cannot be rebuilt. --purge-data opts out.
+
+# Resolve a zone id and token once, so a reset with many clients does not
+# re-derive them per record. Prints "<token> <zone_id>", empty when unavailable.
+cf_api_context() {
+    local token zone creds domain
+    token="$(host_get cf_api_token)"
+    if [ -n "$token" ]; then
+        domain="$(host_get cf_domain)"
+        zone="$(curl -sf -H "Authorization: Bearer ${token}" \
+                "https://api.cloudflare.com/client/v4/zones?name=${domain}&status=active" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+    else
+        creds="$(cf_creds_from_cert 2>/dev/null || true)"
+        [ -n "$creds" ] || return 1
+        token="${creds%% *}"
+        zone="${creds##* }"
+    fi
+    [ -n "$token" ] && [ -n "$zone" ] || return 1
+    printf '%s %s\n' "$token" "$zone"
+}
+
+cf_delete_cname() {
+    local token="$1" zone="$2" hostname="$3" record_id
+    record_id="$(curl -sf -H "Authorization: Bearer ${token}" \
+        "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records?name=${hostname}&type=CNAME" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)"
+    [ -n "$record_id" ] || return 1
+    curl -sf -X DELETE -H "Authorization: Bearer ${token}" \
+        "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${record_id}" >/dev/null
+}
+
+# Files linux-setup.sh writes outside $HOME. Kept as one list so the manifest
+# and the removal cannot drift apart.
+gpudev_system_files() {
+    cat <<'PATHS'
+/etc/systemd/system/gpudev-tunnel.service
+/etc/systemd/system/gpudev-wol.service
+/etc/sudoers.d/gpudev-tunnel
+/etc/sudoers.d/gpudev-power
+/etc/sudoers.d/gpudev-clocks
+/etc/systemd/logind.conf.d/gpudev.conf
+/etc/apt/apt.conf.d/52gpudev-security
+/etc/modprobe.d/gpudev-nvidia-profiling.conf
+PATHS
+}
+
+reset_manifest() {
+    local purge_data="$1"
+    local names cf_domain
+    names="$(all_client_names 2>/dev/null || true)"
+    cf_domain="$(host_get cf_domain)"
+
+    echo ""
+    echo "This will REMOVE:"
+    echo ""
+    if [ -n "$names" ]; then
+        local n
+        while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            echo "  client      ${n}  (container, ingress rule, DNS ${n}.${cf_domain})"
+            if [ "$purge_data" = "1" ]; then
+                echo "              └─ volume ${n}-data  ** DATA WILL BE LOST **"
+            fi
+        done <<< "$names"
+    else
+        echo "  clients     (none registered)"
+    fi
+    echo "  tunnel      $(host_get host_cf_hostname) and the cloudflared tunnel"
+    echo "  systemd     gpudev-tunnel.service, gpudev-wol.service"
+    echo "  sudoers     gpudev-tunnel, gpudev-power, gpudev-clocks"
+    echo "  config      ~/.config/gpudev, ~/gpudev, ~/bin/gpudev*"
+    echo "  drop-ins    logind, apt security, nvidia profiling"
+    echo ""
+    echo "This will KEEP:"
+    echo ""
+    echo "  Docker, NVIDIA toolkit, cloudflared   (may serve other workloads)"
+    echo "  the BuildKit cache                    (a reinstall rebuilds in seconds)"
+    echo "  images gpudev-base*                   (replaced by the next build)"
+    if [ "$purge_data" != "1" ]; then
+        echo "  client data volumes                   (re-adopted by name; --purge-data to remove)"
+    fi
+    echo "  every sshd/SSH setting                (port, password policy, your key)"
+    echo "  ~/.cloudflared/cert.pem               (account login; avoids a browser round-trip)"
+    echo ""
+}
+
+cmd_reset() {
+    local dry_run=0 purge_data=0 assume_yes=0 force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run)    dry_run=1; shift ;;
+            --purge-data) purge_data=1; shift ;;
+            --yes)        assume_yes=1; shift ;;
+            --force)      force=1; shift ;;
+            *) fail "Unknown option '$1'. Usage: gpudev reset [--dry-run] [--purge-data] [--yes] [--force]" ;;
+        esac
+    done
+
+    require_host_setup
+
+    # Reset deletes the tunnel, which is the path a remote session arrives on.
+    # Running it from such a session cuts the operator off mid-reset, with the
+    # host reachable only over the LAN or the console until linux-setup.sh runs
+    # again. Same reasoning as ssh lockdown deferring its restart.
+    if session_rides_tunnel && [ "$force" != "1" ]; then
+        fail "This session arrives over the tunnel, and reset deletes it.
+
+You would lose access part-way through, with no tunnel until linux-setup.sh
+has run again. Re-run from the console or a LAN session:
+
+  ssh -p $(host_get host_ssh_port) $(host_get linux_user)@<lan-ip>
+
+Or --force if you accept being disconnected."
+    fi
+
+    reset_manifest "$purge_data"
+
+    if [ "$dry_run" = "1" ]; then
+        log "--dry-run: nothing was changed."
+        return 0
+    fi
+
+    if [ "$assume_yes" != "1" ]; then
+        local host_cf confirm
+        host_cf="$(host_get host_cf_hostname)"
+        printf "Type the host's tunnel hostname (%s) to confirm: " "$host_cf"
+        IFS= read -r confirm
+        [ "$confirm" = "$host_cf" ] || { echo "Aborted."; return 0; }
+    fi
+
+    local cf_ctx="" cf_token="" cf_zone=""
+    cf_ctx="$(cf_api_context 2>/dev/null || true)"
+    if [ -n "$cf_ctx" ]; then
+        cf_token="${cf_ctx%% *}"
+        cf_zone="${cf_ctx##* }"
+    else
+        warn "No usable Cloudflare credentials — DNS records will be left behind."
+    fi
+
+    local cf_domain names name
+    cf_domain="$(host_get cf_domain)"
+    names="$(all_client_names 2>/dev/null || true)"
+
+    if [ -n "$names" ]; then
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            log "Removing client '${name}'..."
+            docker_cmd rm -f "$name" >/dev/null 2>&1 || true
+            if [ "$purge_data" = "1" ]; then
+                docker_cmd volume rm "${name}-data" >/dev/null 2>&1 || true
+                log "  volume ${name}-data removed"
+            fi
+            if [ -n "$cf_token" ]; then
+                if cf_delete_cname "$cf_token" "$cf_zone" "${name}.${cf_domain}"; then
+                    log "  DNS ${name}.${cf_domain} deleted"
+                fi
+            fi
+        done <<< "$names"
+    fi
+
+    # The tunnel goes after the clients so its ingress rules are already moot.
+    local tunnel_name host_cf
+    tunnel_name="$(host_get linux_user)"
+    host_cf="$(host_get host_cf_hostname)"
+    if command_exists systemctl; then
+        sudo systemctl disable --now gpudev-tunnel.service >/dev/null 2>&1 || true
+        sudo systemctl disable --now gpudev-wol.service >/dev/null 2>&1 || true
+    fi
+    if [ -n "$cf_token" ] && [ -n "$host_cf" ]; then
+        cf_delete_cname "$cf_token" "$cf_zone" "$host_cf" \
+            && log "DNS ${host_cf} deleted"
+    fi
+    if command_exists cloudflared && [ -n "$tunnel_name" ]; then
+        cloudflared tunnel delete -f "$tunnel_name" >/dev/null 2>&1 \
+            && log "Cloudflare tunnel '${tunnel_name}' deleted" \
+            || warn "Could not delete tunnel '${tunnel_name}' — remove it in the dashboard."
+    fi
+
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        sudo rm -f "$f" 2>/dev/null || true
+    done < <(gpudev_system_files)
+    command_exists systemctl && sudo systemctl daemon-reload >/dev/null 2>&1 || true
+    log "System files removed."
+
+    # cert.pem is the ACCOUNT credential from `cloudflared tunnel login`, not
+    # tunnel state. Keeping it saves a browser round-trip on the next install.
+    rm -f "${HOME}/.cloudflared/config.yml" 2>/dev/null || true
+    rm -f "${HOME}"/.cloudflared/*.json 2>/dev/null || true
+
+    # Drop the interactive dashboard hook this install added to .bashrc.
+    if [ -f "${HOME}/.bashrc" ]; then
+        sed -i '/gpudev status 2>\/dev\/null/d' "${HOME}/.bashrc" 2>/dev/null || true
+    fi
+
+    rm -rf "${HOME}/.config/gpudev" "${HOME}/gpudev" 2>/dev/null || true
+    # Removing the running script is safe: the inode stays open for this process.
+    rm -f "${HOME}/bin/gpudev" "${HOME}/bin/gpudev-ssh-dispatch" \
+          "${HOME}/bin/client-setup.sh" "${HOME}/bin/kernel-manager.sh" 2>/dev/null || true
+
+    echo ""
+    log "Reset complete. Docker, the toolkit, the build cache and SSH are untouched."
+    log ""
+    log "Reinstall with:"
+    log "  bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)"
+}
+
 # ── gpudev self-update ────────────────────────────────────────────────────────
 
 cmd_self_update() {
@@ -2291,6 +2514,7 @@ Power:
 
 Other:
   gpudev self-update
+  gpudev reset [--dry-run] [--purge-data] [--yes] [--force]
 EOF
 }
 
@@ -2351,6 +2575,10 @@ main() {
             ;;
         power)
             cmd_power "${2:-}" "${3:-}" "${4:-}"
+            ;;
+        reset)
+            shift
+            cmd_reset "$@"
             ;;
         self-update)
             cmd_self_update
