@@ -300,10 +300,16 @@ the port. Resolving it here removes that placeholder.
 
 ## Still open
 
-- **`ssh.socket` handling.** Drop-in overriding `ListenStream`, or disable the
-  socket and enable `ssh.service`? Needs a look at the real host state before
-  choosing; both `22` and `52100` answered on the one install observed. This is
-  the last thing blocking the port `TODO` in `LINUX-QUICKSTART.md`.
-- **Cleanup of pre-existing duplicates.** `a2e5efc` stops new ones; nothing
-  removes one already on disk. Decide whether `gpudev ssh status` merely
-  reports it or offers to collapse the entries.
+- **`ssh.socket` handling — RESOLVED.** Neither option was needed. Ubuntu's
+  `openssh-server` ships `sshd-socket-generator`, which reads `Port` from
+  `sshd_config` and regenerates the socket's `ListenStream` on every
+  daemon-reload, so the config file is authoritative after all. Writing an
+  `/etc` drop-in was actively wrong: the generator's `addresses.conf` sorts
+  after a numeric prefix and its reset would win. Fixed in `a955740`; the port
+  `TODO` in `LINUX-QUICKSTART.md` is gone.
+- **Pre-existing duplicates — DECIDED: report only.** `gpudev ssh status` names
+  the duplicate and the one command that fixes it
+  (`gpudev-ssh-dispatch --install`, already idempotent and blob-based). It does
+  not rewrite `authorized_keys` itself: a command called "status" that silently
+  edits an auth file is a surprise that costs more trust than the keystroke
+  saves, and `a2e5efc` stops new duplicates at the source.

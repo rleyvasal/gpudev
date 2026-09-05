@@ -232,12 +232,18 @@ Default **no** on every one.
 | Cloudflare API unreachable | remove local state, warn that CNAMEs remain |
 | run twice | idempotent; absent files are not errors |
 
-## Open questions
+## Decisions
 
-1. Should `reset` also drop the build cache behind a flag, for testing a genuine
-   cold build? Probably `--cold`.
-2. Should `uninstall` offer to remove the `docker` group membership? It is
-   harmless to leave, and removing it affects the user's other work.
-3. Does `reset` need the client-data question at all, or is keeping volumes
-   always right there? Keeping is proposed, since a reinstall re-adopts them by
-   name.
+1. **`reset --cold` exists.** The default keeps the build cache because that is
+   what makes iterating on the installer cheap. `--cold` prunes it, because a
+   warm cache skips the layers where image builds actually fail — the uv install
+   of the CUDA wheels among them, which is where this project's first observed
+   build failure lived. Shipped in `1f4a5b7`.
+2. **The `docker` group membership is left.** It is a change to the operator's
+   account rather than to gpudev, and removing it would strip Docker access
+   while leaving Docker installed — the normal outcome, since Docker is kept
+   whenever anything else uses it. The closing output names it and gives the
+   command to undo it, so it is stated rather than silent. Shipped in `2cd53cd`.
+3. **Client data volumes are kept.** A reinstall re-adopts them by name, and
+   they are the one artifact here that cannot be rebuilt. `--purge-data` opts
+   out and the manifest marks it as data loss.
