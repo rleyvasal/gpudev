@@ -1,17 +1,31 @@
 # CRAFT dialog — load sequence
 
-## First-time client setup (four steps)
+## First-time client setup (three steps)
 
-1. On the host: `gpudev client invite solveite`.
-2. In SolveIt: paste the one cell printed by the invitation. It installs or
-   updates gpudev, loads CRAFT, and runs `%gpu_setup`.
-3. Send the single `gpudev client add solveite --key "..."` line printed by
-   `%gpu_setup` to the administrator, who runs it on the host.
-4. In each notebook: `%gpu solveite`.
+1. In SolveIt, one cell — fetch the client runtime, then load CRAFT and run
+   setup on the same `%run` line:
 
-`%gpu_setup` generates the private key locally, updates `~/.ssh/config`, and
-automatically records a new server fingerprint. No JSON config, terminal login,
-or manual first-connection confirmation is needed.
+   ```text
+   !curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+   %run /app/data/gpudevd/gpudev/CRAFT.py solveite --domain <domain>
+   ```
+2. Forward the single `gpudev client add solveite --key "..."` line it prints;
+   the administrator runs it.
+3. `%gpu solveite`.
+
+The bootstrap fetches only the ten files a client runs (~192 KB), and re-running
+the cell is the update path — it costs a 40-byte request when already current.
+`--verify` re-hashes an install, `--force` repairs one, `GPUDEV_REF` pins to a
+commit.
+
+Setup generates the private key locally and writes `~/.ssh/config`, recording a
+new server fingerprint automatically. No JSON config, terminal login, or manual
+first-connection confirmation is needed. Without `--domain` the key is still
+generated; the stanza waits for `%gpu solveite --hostname <host>`.
+
+For a development client, add `--variant cuda-dev` to the `%run` line. The host
+builds the opt-in image automatically on its first request. An admin-first
+`gpudev client invite solveite` remains available as an optional shortcut.
 
 ```text
 gpudev/

@@ -23,6 +23,21 @@ log()  { echo "$*"; }
 warn() { echo "Warning: $*" >&2; }
 fail() { echo "Error: $*" >&2; exit 1; }
 
+# The commit REPO_DIR is at, stamped into containers so the client runtime can
+# detect drift between its half and the container's. Mirrors client-setup.sh's
+# repo_sha: a git checkout, else the SHA self-update pinned to. Empty when
+# neither is available — unknown must never be reported as a version.
+repo_sha() {
+    local sha=""
+    if [ -d "${REPO_DIR}/.git" ]; then
+        sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    if [ -z "$sha" ] && [ -f "${REPO_DIR}/.self-update-sha" ]; then
+        sha="$(tr -d '[:space:]' < "${REPO_DIR}/.self-update-sha" 2>/dev/null || true)"
+    fi
+    printf '%s' "$sha"
+}
+
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 sanitize_client_name() {
@@ -897,6 +912,11 @@ Build it with: gpudev image build $variant"
     # (sourced from REPO_DIR — not the deployed ~/bin copy).
     local km_src="${REPO_DIR}/kernel-manager.sh"
     if [ -f "$km_src" ]; then
+        # Restamp the version alongside the script. A rebuild that refreshed the
+        # script but left the old stamp would make the client's drift warning
+        # actively wrong, which is worse than having no stamp at all.
+        local km_sha
+        km_sha="$(repo_sha)"
         docker_cmd run --rm \
             -v "${name}-data:/home/gpudev" \
             -v "${km_src}:/tmp/kernel-manager.sh:ro" \
@@ -904,6 +924,11 @@ Build it with: gpudev image build $variant"
 mkdir -p /home/gpudev/bin
 cp /tmp/kernel-manager.sh /home/gpudev/bin/kernel-manager.sh
 chmod +x /home/gpudev/bin/kernel-manager.sh
+if [ -n '${km_sha}' ]; then
+  printf '%s\n' '${km_sha}' > /home/gpudev/bin/VERSION
+else
+  rm -f /home/gpudev/bin/VERSION
+fi
 "
         log "  Refreshed kernel-manager.sh from repo."
     fi
@@ -1034,29 +1059,30 @@ cmd_client_logs() {
 # ── gpudev client info ────────────────────────────────────────────────────────
 
 print_solveit_bootstrap() {
-    local name="$1" hostname="$2"
+    local name="$1" domain="$2"
 
     echo "── SolveIt bootstrap ──"
     echo ""
-    echo "Step 2 of 4 — paste ONE cell into SolveIt:"
+    echo "Step 1 of 3 — paste ONE cell into SolveIt:"
     echo ""
     # One cell, not two. `!` shell escapes coexist with %run and a line magic in
     # the same cell; only %%bash forced the split, because a cell magic must be
-    # alone. Verified in SolveIt. No `mkdir -p` either: git clone creates its
-    # leading directories, checked against a three-level missing path.
-    # -q on both keeps git's progress out of the cell, which would otherwise
-    # land BELOW the setup report — the notebook renders stream output after
-    # rich output regardless of when it was written.
+    # alone. Verified in SolveIt.
+    #
+    # Two lines rather than three: `%run script.py args` fills sys.argv, and
+    # CRAFT.py is already the %run entry point, so loading the magics and
+    # running setup ride the same line. Two is the floor — a cold client has to
+    # fetch something before it can run it.
     cat <<EOF
-!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
-%run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup ${name} --hostname ${hostname}
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run /app/data/gpudevd/gpudev/CRAFT.py ${name} --domain ${domain}
 EOF
     echo ""
-    echo "Step 3 of 4 — the private key never leaves SolveIt. Setup prints a"
+    echo "  (add --variant cuda-dev to the %run line for nvcc/ncu/nsys/TensorRT)"
+    echo ""
+    echo "Step 2 of 3 — the private key never leaves SolveIt. Setup prints a"
     echo "single 'gpudev client add ...' line; send that to your administrator."
-    echo "  (add --variant cuda-dev to that command for nvcc/ncu/nsys/TensorRT)"
-    echo "Step 4 of 4 — connect each notebook independently with: %gpu ${name}"
+    echo "Step 3 of 3 — connect each notebook independently with: %gpu ${name}"
     echo "No JSON file, manual SSH edit, terminal login, or host-key prompt is needed."
     echo ""
 }
@@ -1087,7 +1113,7 @@ cmd_client_invite() {
         echo "  Host:     not provisioned yet (this invitation makes no host changes)"
     fi
     echo ""
-    print_solveit_bootstrap "$name" "$hostname"
+    print_solveit_bootstrap "$name" "$cf_domain"
 }
 
 cmd_client_info() {

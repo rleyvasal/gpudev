@@ -6,8 +6,8 @@ because you have a physical console and no Windows host underneath.
 
 **Part 1 — admin setup**: from BIOS settings on bare hardware, through the
 Ubuntu install and remote SSH access, to a finished `linux-setup.sh`.
-**Part 2 — onboarding a notebook client**: `client invite` → `%gpu_setup` →
-`client add` → `%gpu`.
+**Part 2 — onboarding a notebook client**: `%gpu_setup` → `client add` →
+`%gpu`.
 
 ---
 
@@ -460,47 +460,57 @@ the flow below hits it.
 
 ---
 
-## Step 1 (admin) — invite
+## Step 1 (user) — run one cell in SolveIt
+
+```
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run /app/data/gpudevd/gpudev/CRAFT.py solveit --domain example.com
+```
+
+The first line installs the client runtime into `/app/data`, which is
+persistent, so it survives kernel restarts. It fetches only the ten files a
+client actually runs (~192 KB) — not the host-side scripts, and not repository
+history.
+
+The second line loads CRAFT **and** runs setup: `%run script.py args` fills
+`sys.argv`, and `CRAFT.py` is already the `%run` entry point. Two lines is the
+floor here, because a cold client has to fetch something before it can run it.
+
+Setup is idempotent: re-running reuses the existing key rather than replacing
+it, so it is safe to paste again.
+
+If the client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA compilation,
+add `--variant cuda-dev` to the second line. The generated admin command carries
+the choice forward and warns that this variant grants the container `SYS_ADMIN`
+and `PERFMON`.
+
+### Updating later
+
+Re-run the same cell. The bootstrap resolves the ref first — a 40-byte request —
+and prints `Already at <sha> (main). Nothing to do.` when there is nothing to
+fetch, leaving a working install untouched.
 
 ```bash
-gpudev client invite solveit
+sh /tmp/gpudev-bootstrap.sh --verify   # re-hash the install against VERSION
+sh /tmp/gpudev-bootstrap.sh --force    # re-fetch, repairing what --verify found
 ```
 
-This makes **no changes** to the host. It prints the one cell the user pastes
-into SolveIt, with the client's hostname already filled in. Send that output to
-the user.
-
-> Only needed the first time, or when you want the hostname filled in for
-> someone. A user who already knows the domain can skip straight to Step 2.
-
-## Step 2 (user) — run one cell in SolveIt
-
-```
-!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
-%run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup solveit --hostname solveit.example.com
-```
-
-The first line installs or updates CRAFT into `/app/data`, which is persistent,
-so it survives kernel restarts. Re-running pulls instead of cloning — that is
-how a notebook picks up fixes.
-
-`%gpu_setup` is idempotent: re-running reuses the existing key rather than
-replacing it, so it is safe to paste again.
-
-If the client needs nvcc/ncu/nsys/TensorRT, add `--variant cuda-dev` to the
-`gpudev client add ...` command that `%gpu_setup` prints for the administrator.
-That variant grants SYS_ADMIN to the container, so it remains an administrator
-decision rather than part of the default invitation.
+`GPUDEV_REF` pins to a tag or commit and `GPUDEV_DIR` changes the location. If
+an update ever breaks a notebook, the commit that worked is recorded in
+`<install>/VERSION` — pin to it and carry on.
 
 ### Hostnames
 
-You will not normally type one. If any gpudev client is already set up on this
-machine, the domain is read from its SSH entry. Only the very first client on a
-fresh notebook needs `--hostname <name>.<domain>`, and if you omit it there,
-`%gpu` prints the exact line to run once the administrator confirms.
+`--domain` is the normal path: the client knows its own name, and the domain is
+public DNS rather than a secret, so an administrator publishes it once.
 
-## Step 3 (user → admin) — send one line
+You do not strictly need it. Without `--domain` the key is still generated and
+the admin command still printed; if another gpudev client is already configured
+on this notebook, CRAFT learns the domain from its SSH entry anyway. Otherwise
+the administrator returns the hostname after provisioning and the user supplies
+it once on the first `%gpu`.
+
+## Step 2 (user ↔ admin) — one round trip
 
 `%gpu_setup` prints the administrator's whole command:
 
@@ -513,16 +523,19 @@ Send this line to your gpudev administrator:
 Send **that line**. Do not send the private key path, and do not retype the
 key — forward the line as printed.
 
-## Step 4 (admin) — add the client
+### The admin side
 
-Paste it on the host:
+The administrator pastes it on the host:
 
 ```bash
 gpudev client add solveit --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... gpudev-solveit"
 ```
 
-Add `--variant cuda-dev` for a client that needs `nvcc`, `ncu`, `nsys` or
-TensorRT. Build that image first with `gpudev image build cuda-dev`.
+When the received command includes `--variant cuda-dev`, gpudev builds that
+image automatically if it is not ready, then continues creating the client.
+The first build can take about 25 minutes and uses several GB; later clients
+reuse it. An administrator can optionally prewarm it with
+`gpudev image build cuda-dev`.
 
 This creates the volume, the container, the tunnel route and the ingress rule,
 reloads the connector, and then proves the client answers through the tunnel:
@@ -544,20 +557,47 @@ Send this line back to the client:
   %gpu solveit --hostname solveit.example.com
 ```
 
-## Step 5 (user) — connect
+## Step 3 (user) — connect
+
+If step 1 used `--domain`, the SSH entry already exists:
 
 ```
 %gpu solveit
 ```
 
-Or, if you skipped the hostname in Step 2, the line the admin sent back:
+If it did not, run the line the administrator sent back once, which writes the
+entry and connects:
 
 ```
 %gpu solveit --hostname solveit.example.com
 ```
 
-That writes the SSH entry and connects. Afterwards plain `%gpu solveit` is
-enough, in this and every other notebook.
+Either way, plain `%gpu solveit` is the everyday command from then on, in this
+and every other notebook that shares the same persistent SolveIt storage.
+
+### Version drift
+
+On connecting, `%gpu` compares this client's `VERSION` against the container's
+`kernel-manager.sh version` and notes a mismatch once per session:
+
+```
+Note: client and container were built from different commits.
+  this notebook: a08cbc0
+  container:     cd8d68d
+```
+
+The two halves are maintained by different people — the user re-runs the
+bootstrap cell, the administrator runs `gpudev client rebuild <name>` — so they
+drift on their own. The contract between them is small and usually compatible,
+so this is a note, not a refusal. A container built before this existed reports
+nothing and the check stays quiet.
+
+## Optional admin-first invitation
+
+An administrator can run `gpudev client invite solveit` to print the same
+two-line cell with `--domain` already filled in, rather than telling the user
+the domain. The invitation makes no host changes. A convenience, not a
+prerequisite.
 
 ---
 
@@ -569,7 +609,7 @@ the `%gpu <name> --hostname <host>` line the administrator printed.
 **`Could not resolve hostname gpudev-solveit`** — you used the alias without
 the entry existing. Same fix as above.
 
-**`NO SSH BANNER` during Step 4** — the container is up but the tunnel does not
+**`NO SSH BANNER` during `client add`** — the container is up but the tunnel does not
 reach it. Usually the connector is serving an older config. On the host:
 
 ```bash

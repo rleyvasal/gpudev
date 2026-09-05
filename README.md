@@ -158,8 +158,9 @@ ssh gpudev reboot 15m         # reboot it in 15 minutes
 ```
 
 The setup keeps normal SSH commands working, so after opening the dashboard you
-can still run `gpudev client add alice` to provision a client container. Each
-notebook you onboard gets its own SSH key, container, and GPU access.
+can still run `gpudev client add alice --key "ssh-ed25519 ..."` to provision a
+client container from the key the user's `%gpu_setup` printed. Each notebook you
+onboard gets its own SSH key, container, and GPU access.
 
 ---
 
@@ -479,14 +480,18 @@ That's it — the host is ready.
 A "client" is an isolated Linux container with its own SSH key, its own home
 volume, and the gpudev base image's Python environment.
 
-### Four-step setup
+### Three-step setup
 
-1. **Admin creates an invitation:** `gpudev client invite <name>`.
-2. **User pastes the one printed SolveIt cell:** it installs/updates CRAFT,
-   runs `%gpu_setup`, generates the local key, and updates `~/.ssh/config`.
-3. **Admin enrolls the printed public key:** run the exact
-   `gpudev client add <name> --key "..."` line printed by `%gpu_setup`.
-4. **User connects from their notebook:** `%gpu <name>`.
+Three actions and one round trip. Nothing is typed from scratch — each step
+either pastes a cell or forwards a line the tool printed.
+
+| | Who | Does |
+|---|---|---|
+| **1** | user | pastes one cell in SolveIt — fetches the runtime, generates the key, prints the admin's command |
+| **2** | → admin → | forwards that command; the admin runs it |
+| **3** | user | `%gpu <name>` |
+
+Everyday use after that is `%gpu <name>`, in this and every other notebook.
 
 No `craft.json`, manual SSH-config editing, terminal login, private-key transfer,
 or first-connect confirmation is required. New host fingerprints are accepted
@@ -501,59 +506,125 @@ deliberately different and prefixed with `gpudev-` / fixed at `gpudev`:
 
 | What | Value | Why |
 |---|---|---|
-| Admin command | `gpudev client add alice` | the client identity |
+| Admin command | `gpudev client add alice --key "ssh-ed25519 ..."` | provisions the identity with the public key generated in SolveIt |
 | SSH alias on notebook | `ssh gpudev-alice` | unmistakably a gpudev resource (not a LAN host) |
 | In-container user | `gpudev` | uniform across clients; makes the prompt obviously different from the notebook |
 | Prompt after SSH | `gpudev@gpudev-alice:~$` | tells you "you are user gpudev on the gpudev box for alice" |
 | DNS hostname | `alice.<domain>` | unchanged (the alias / HostName mismatch is fine — that's what `Host` is for) |
 
-### Step 1 — Create an invitation on the host
+### Step 1 — Start on the client in SolveIt
 
-```bash
-ssh gpudev                         # opens admin shell on the host
-gpudev client invite alice         # makes no changes; prints the SolveIt bootstrap
-```
-
-### Step 2 — Run the one-cell SolveIt bootstrap
-
-Give the printed bootstrap to the SolveIt user. It contains one cell, which
-installs or updates this repository in SolveIt's persistent storage:
+Run this one cell. Line 1 installs or updates the client runtime in SolveIt's
+persistent storage; line 2 loads CRAFT **and** runs setup, because `%run
+script.py args` fills `sys.argv` and `CRAFT.py` is already the entry point:
 
 ```text
-!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
-%run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup alice --hostname alice.example.com
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run /app/data/gpudevd/gpudev/CRAFT.py alice --domain example.com
 ```
 
-`%gpu_setup` installs/checks `cloudflared`, generates
-`~/.ssh/gpudev-alice`, and installs a marked `Host gpudev-alice` SSH stanza.
-It never replaces an existing private key. The private key stays in SolveIt;
-the output contains only the public key to return to the administrator. New SSH
-host fingerprints are accepted and recorded automatically; changed fingerprints
-remain blocked and trigger CRAFT's targeted stale-key recovery.
+Ask your administrator for the domain — it is public DNS, not a secret, and it
+is the only thing the notebook cannot work out for itself.
 
-### Step 3 — Enroll the public key on the host
+`client-bootstrap.sh` fetches only the ten files a client runs (~192 KB), never
+the host-side scripts or repository history. Setup then installs/checks
+`cloudflared`, generates `~/.ssh/gpudev-alice`, and writes the SSH stanza. It
+never replaces an existing private key, and the private key stays in SolveIt.
 
-Send the single command printed by `%gpu_setup` to the administrator, who runs
-it on the host:
+If this client needs `nvcc`, `ncu`, `nsys`, TensorRT or custom CUDA
+compilation, add the variant to the same line:
+
+```text
+%run /app/data/gpudevd/gpudev/CRAFT.py alice --domain example.com --variant cuda-dev
+```
+
+That choice is carried into the administrator command automatically. It also
+warns that `cuda-dev` grants the container `SYS_ADMIN` and `PERFMON`, which is
+why the standard image remains the default.
+
+> **Don't know the domain yet?** Drop `--domain`. The key is still generated and
+> the admin command still printed; the stanza is written later by the
+> `%gpu alice --hostname alice.example.com` line that `client add` prints back.
+
+#### Re-running the cell is how you get fixes
+
+It is safe and cheap to re-run. The bootstrap resolves the ref first — a
+40-byte request — and does nothing when you are already current:
+
+```text
+Already at a08cbc0 (main). Nothing to do.
+```
+
+Two flags are worth knowing:
+
+```bash
+sh /tmp/gpudev-bootstrap.sh --verify   # re-hash the install; is it intact?
+sh /tmp/gpudev-bootstrap.sh --force    # re-fetch and repair
+```
+
+`GPUDEV_REF` pins to a tag or commit, and `GPUDEV_DIR` changes the install
+location. Pinning is the recovery lever if an update ever breaks you: the
+commit you were on is recorded in `VERSION`.
+
+### Step 2 — The round trip through the administrator
+
+`%gpu_setup` prints a complete command containing only the public key. Forward
+that whole line — do not retype or extract the key:
 
 ```bash
 gpudev client add alice --key "ssh-ed25519 AAAA... gpudev-alice"
 ```
 
-### Step 4 — Connect the notebook
+The administrator runs it as-is from an admin session on the host. It creates
+the client volume, container, DNS route and tunnel ingress, then verifies that
+the container's SSH service answers through Cloudflare. When it succeeds it
+prints one line, which the administrator returns to the user:
 
-The user can now connect any SolveIt notebook kernel independently:
-
-```python
-%gpu alice     # send subsequent cells to alice's GPU container
+```text
+%gpu alice --hostname alice.example.com
 ```
 
-The first `%gpu alice` triggers an SSH to `gpudev-alice`, lands as user `gpudev` on
-hostname `gpudev-alice`, attaches the kernel, and starts routing. From that
-point on, every cell runs on the GPU container; `%local` flips back to the
-notebook. A different notebook kernel can simultaneously use `%gpu bob`; the
-client selection is kept only in that notebook kernel's memory.
+If the forwarded command carried `--variant cuda-dev` and that image is not
+built yet, `client add` builds it first (~25 minutes, several GB) and then
+continues. No separate build command is needed.
+
+### Step 3 — Connect in SolveIt
+
+If step 1 had `--domain`, the SSH stanza already exists and this is all there is:
+
+```python
+%gpu alice
+```
+
+That connects as user `gpudev`, records the host fingerprint, attaches the
+kernel, and starts routing. `%local` switches execution back to the notebook.
+
+If you skipped `--domain`, run the line the administrator sent back instead —
+once — and plain `%gpu alice` works from then on, in this and every other
+notebook:
+
+```python
+%gpu alice --hostname alice.example.com
+```
+
+Either way, unexpectedly changed fingerprints remain blocked.
+
+> On connecting, `%gpu` compares this client's version against the container's
+> and notes a mismatch once per session. The two halves are updated by different
+> people — you re-run the bootstrap cell, the administrator runs
+> `gpudev client rebuild <name>` — so they can drift. It is a note, not a block.
+
+### Optional — let the administrator go first
+
+An administrator who would rather send a ready-made cell than tell someone the
+domain can run:
+
+```bash
+gpudev client invite alice
+```
+
+The invitation makes no host changes. It prints the same two-line cell as step
+1, with `--domain` already filled in. A convenience, not a prerequisite.
 
 ### Long downloads, installs, and training progress
 
@@ -621,8 +692,8 @@ connects as that client (e.g. `solveit`) attaches to the **same** process:
 - One notebook’s `%restart_kernel` clears state for everyone on that client.
 - Concurrent cells from two notebooks interleave on one REPL.
 
-For isolated work, use a **second client** (`gpudev client add bob`) or restart
-when you need a clean slate.
+For isolated work, onboard a **second client** (`bob`, via the three steps
+above) or restart when you need a clean slate.
 
 ### Rebuilds and SSH host keys
 
@@ -800,7 +871,7 @@ Then, on the installed system:
 
 ```bash
 # Enable ncu profiling for all users (opt-in; see the caveat below).
-GPUDEV_ENABLE_PROFILING=1 bash <(curl -fsSL   https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)
+GPUDEV_ENABLE_PROFILING=1 bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-setup.sh)
 ```
 
 Omit `GPUDEV_ENABLE_PROFILING=1` on a shared host: it lifts the driver's
@@ -858,14 +929,26 @@ to compile it. That single gap is why `nvcc`, `nsys` and `ncu` are all absent:
 one root cause, three symptoms.
 
 For profiling work or building custom CUDA ops, use the opt-in `cuda-dev`
-variant. It is several GB larger and much slower to build, so it is never built
-by default.
+variant. It is several GB larger and much slower to build, so the host installer
+builds only the standard image. The first `client add --variant cuda-dev`
+automatically builds the missing image and then continues provisioning; later
+`cuda-dev` clients reuse it.
 
 ```bash
-gpudev image list                              # what is built
-gpudev image build cuda-dev                    # ~25 min, several GB
-gpudev client add bev --variant cuda-dev
+gpudev image list                              # show which images are ready
+gpudev image build cuda-dev                    # optional prewarm (~25 min, several GB)
+gpudev client add bev --variant cuda-dev --key "ssh-ed25519 ..."
 ```
+
+For client-first onboarding, the user normally chooses the variant in SolveIt:
+
+```text
+%gpu_setup bev --variant cuda-dev
+```
+
+The printed administrator command already includes `--variant cuda-dev`. An
+administrator who knows profiling clients are coming can prewarm the image with
+`gpudev image build cuda-dev`; otherwise no extra step is required.
 
 It ships CUDA 12.8 devel (`nvcc`), Nsight Compute (`ncu`), Nsight Systems
 (`nsys`), TensorRT (`tensorrt-cu12`), ONNX and onnxruntime-gpu, with torch
@@ -1031,27 +1114,64 @@ All on the host (via `ssh gpudev`):
 
 ```
 gpudev status                         # dashboard — also auto-shows on login
+gpudev host status                    # host-only view (no client detail)
+
+# clients
 gpudev client list                    # all clients with status + uptime
-gpudev client invite <name>           # complete SolveIt bootstrap (no host changes)
-gpudev client add <name>              # new client (prompts for pubkey)
+gpudev client add <name> --key "..."  # provision a client from the key %gpu_setup printed
+gpudev client invite <name>           # optional admin-first bootstrap cell (no host changes)
 gpudev client info <name>             # SSH stanza for an existing client
+gpudev client start|stop <name>       # free GPU memory without deleting anything
 gpudev client restart <name>          # restart a stuck container
+gpudev client rebuild <name|--all>    # rebuild on the current image [--reset-venv] [--variant ...]
+gpudev client remove <name> [--yes]   # container + ingress + CNAME; keeps the data volume
 gpudev client logs <name>             # tail container logs
-gpudev kernel doctor <name>           # diagnose a stuck Jupyter kernel
+
+# images
+gpudev image list                     # which variants are built, and their size
+gpudev image build cuda-dev           # optional prewarm; client add builds it on demand
+
+# kernels
+gpudev kernel status <name>           # is the client's Jupyter kernel alive
+gpudev kernel restart <name>          # restart it
+gpudev kernel doctor <name>           # diagnose a stuck kernel
+
+# status
 gpudev gpu                            # full nvidia-smi
-gpudev cloudflare                     # tunnel + ingress + edge HTTP check
+gpudev cloudflare                     # tunnel + ingress + DNS + edge check
 gpudev cloudflare token-set           # store Zone.DNS Edit token for client remove
 gpudev disk                           # host + Docker volume usage
+
+# ssh / host access
+gpudev ssh status                     # listening port, password auth, admin key state
+gpudev ssh lockdown                   # key-only auth on the gpudev port (proves a key first)
+gpudev ssh unlock                     # recovery: passwords back on, port 22
+
+# power
+gpudev power setup                    # (re)install the power sudoers + logind rules
 gpudev power reboot [15m]             # reboot now or schedule it
 gpudev power sleep [60m]              # sleep now or schedule it
 gpudev power status                   # list scheduled power jobs
 gpudev power cancel [all|sleep|reboot|job-id]
+
+# lifecycle
 gpudev self-update                    # pull latest CLI into ~/bin
+gpudev reset [--dry-run] [--cold]     # back to "before linux-setup.sh"; SSH untouched
+gpudev uninstall [--dry-run]          # decommission; reverts SSH, keeps data volumes
 gpudev help                           # full reference
 ```
 
 `gpudev help` is the complete reference; the dashboard footer covers the
 daily-driver subset.
+
+`reset` and `uninstall` both take `--dry-run`, which prints the manifest and
+changes nothing — run that first. Client data volumes survive both unless you
+pass `--purge-data`.
+
+The `cloudflare` edge check speaks **SSH**, not HTTPS, for `ssh://` ingress
+rules. An HTTPS probe cannot see the failure it is meant to catch: Cloudflare
+Access answers at the edge before the connector is ever consulted, so a broken
+tunnel still returns 200.
 
 ---
 

@@ -65,18 +65,22 @@ into a prompt-only path on security grounds.
 
 ## Tier 1 — one-cell bootstrap
 
-`print_solveit_bootstrap` now emits one cell using a shell escape followed by
-`%run` and `%gpu_setup`:
+`print_solveit_bootstrap` emits one cell: a shell escape that fetches the client
+runtime, then a `%run` that both loads CRAFT and runs setup.
 
 ```python
-!if [ -d /app/data/gpudevd/gpudev/.git ]; then git -C /app/data/gpudevd/gpudev pull --ff-only -q; else git clone -q https://github.com/rleyvasal/gpudev.git /app/data/gpudevd/gpudev; fi
-%run /app/data/gpudevd/gpudev/CRAFT.py
-%gpu_setup <name> --hostname <name>.<domain>
+!curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/client-bootstrap.sh -o /tmp/gpudev-bootstrap.sh && sh /tmp/gpudev-bootstrap.sh
+%run /app/data/gpudevd/gpudev/CRAFT.py <name> --domain <domain>
 ```
 
 This combination was verified in SolveIt. The former `%%bash` cell magic could
 not coexist with the other lines, which was why the earlier flow required two
 cells.
+
+Two lines rather than three: `%run script.py args` fills `sys.argv` and
+`CRAFT.py` is already the `%run` entry point, so setup rides the same line. Two
+is the floor — a cold client must fetch something before it can run it. See
+`SPEC-client-bootstrap.md` for the fetch, verification and version stamp.
 
 ---
 

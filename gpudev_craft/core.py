@@ -81,6 +81,13 @@ CLIENT_NAME = ""
 KERNEL_MANAGER = "/home/gpudev/bin/kernel-manager.sh"
 KERNEL_RUNTIME = "/home/gpudev/.local/share/jupyter/runtime/kernel.json"
 
+# Written by client-bootstrap.sh next to this package.
+VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
+
+# Clients whose container version has already been compared this kernel
+# session. The check is a courtesy, not a gate, so it must not nag.
+_VERSION_CHECKED: set[str] = set()
+
 # SSH alias is derived from client_name — must match what `gpudev client info`
 # prints and what client-setup.sh sets as the container hostname.
 SSH_HOST = ""
@@ -394,6 +401,60 @@ def _ssh_with_input(remote_cmd, input_text, check=True, _hostkey_retried=False):
             stderr=result.stderr,
         )
     return result
+
+
+# ── Version drift ─────────────────────────────────────────────────────────────
+# The two halves of gpudev are updated by different people through different
+# mechanisms: this runtime by the user re-running the bootstrap cell, and the
+# container's kernel-manager.sh by the administrator via `gpudev client rebuild`
+# or `self-update`. They talk over a small fixed contract (start/restart/doctor),
+# and nothing used to notice when they disagreed — a mismatch surfaced as a
+# confusing runtime failure with no hint that two versions were involved.
+#
+# This warns and continues. The contract is usually compatible across versions,
+# so blocking a working session over a version string would cost more than the
+# drift does.
+def client_version() -> str:
+    """The commit this client runtime was installed from, or ''."""
+    try:
+        for line in VERSION_FILE.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "sha":
+                return parts[1]
+    except Exception:
+        pass
+    return ""
+
+
+def _warn_on_version_drift(name: str) -> None:
+    if name in _VERSION_CHECKED:
+        return
+    _VERSION_CHECKED.add(name)
+
+    mine = client_version()
+    if not mine:
+        # A pre-bootstrap install (a git clone) has no VERSION. Unknown is not
+        # a mismatch, and a warning here would fire for every existing user.
+        return
+
+    try:
+        result = _ssh(f"{KERNEL_MANAGER} version", capture_output=True, check=False)
+        theirs = (result.stdout or "").strip()
+    except Exception:
+        return  # a broken connection is reported by the caller, not here
+
+    # An older container has no `version` subcommand: it prints usage and exits
+    # nonzero. That is "unknown", not "mismatched".
+    if not theirs or len(theirs) != 40 or not all(c in "0123456789abcdef" for c in theirs):
+        return
+
+    if theirs != mine:
+        print(f"Note: client and container were built from different commits.")
+        print(f"  this notebook: {mine[:7]}")
+        print(f"  container:     {theirs[:7]}")
+        print("  Usually fine. If something misbehaves, update both halves:")
+        print(f"    admin, on the host:  gpudev client rebuild {name}")
+        print("    here:                re-run the bootstrap cell")
 
 
 # ── Cloudflared ───────────────────────────────────────────────────────────────
@@ -2140,22 +2201,29 @@ _KNOWN_VARIANTS = ("default", "cuda-dev")
 
 
 def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
-    """Parse ``%gpu_setup <name> [--hostname <host>]``.
+    """Parse ``%gpu_setup <name> [--domain <d> | --hostname <host>]``.
 
-    ``--hostname`` is OPTIONAL. Requiring it was the only reason the
-    administrator had to go first: the hostname is per-client, so the notebook
-    could not know it unaided. Without it the key is still generated and can be
-    sent onward; the ssh config stanza is written later, on the first
-    ``%gpu <name> --hostname <host>``.
+    Both are OPTIONAL. Requiring one was the only reason the administrator had
+    to go first: the hostname is per-client, so the notebook could not know it
+    unaided. Without either, the key is still generated and can be sent onward;
+    the ssh config stanza is written later, on the first ``%gpu <name>
+    --hostname <host>``.
+
+    ``--domain`` is the friendlier half of that pair and the normal path. The
+    client already knows its own name, and the domain is public DNS rather than
+    a secret, so an administrator can publish it once and every client
+    afterwards is self-service. ``--hostname`` stays for the line ``client
+    add`` prints back, which is a full hostname.
     """
     usage = ("Usage: %gpu_setup <client-name> [--variant cuda-dev] "
-             "[--hostname <client.domain>]")
+             "[--domain <domain> | --hostname <client.domain>]")
     tokens = shlex.split(line or "")
     if not tokens:
         raise ValueError(usage)
 
     name = tokens.pop(0)
     hostname = None
+    domain = None
     variant = "default"
     while tokens:
         token = tokens.pop(0)
@@ -2163,6 +2231,10 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
             hostname = tokens.pop(0)
         elif token.startswith("--hostname="):
             hostname = token.split("=", 1)[1]
+        elif token == "--domain" and tokens:
+            domain = tokens.pop(0)
+        elif token.startswith("--domain="):
+            domain = token.split("=", 1)[1]
         elif token == "--variant" and tokens:
             variant = tokens.pop(0)
         elif token.startswith("--variant="):
@@ -2171,6 +2243,13 @@ def _parse_gpu_setup_args(line: str) -> tuple[str, str | None, str]:
             raise ValueError(f"Unknown argument {token!r}. {usage}")
     if hostname is not None and not hostname:
         raise ValueError("--hostname was given an empty value.")
+    if domain is not None and not domain:
+        raise ValueError("--domain was given an empty value.")
+    if domain and hostname:
+        raise ValueError("Use --domain or --hostname, not both.")
+    if domain:
+        # Mirrors the host: `gpudev client add` routes <name>.<cf_domain>.
+        hostname = f"{normalize_client_name(name)}.{domain.lstrip('.')}"
     if variant not in _KNOWN_VARIANTS:
         raise ValueError(
             f"Unknown variant {variant!r}. Known variants: "
@@ -2332,6 +2411,8 @@ def gpu(line):
 
     if _ensure_connected():
         ROUTER.set(PY_BACKEND)
+        # After connecting, so it never delays or blocks the connection itself.
+        _warn_on_version_drift(name)
 
 
 def local(line):

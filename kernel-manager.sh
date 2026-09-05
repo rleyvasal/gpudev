@@ -342,6 +342,20 @@ cmd_doctor() {
     tail -n 15 "$LOG_FILE" 2>/dev/null || log "(no log)"
 }
 
+# The commit this container's scripts came from, written by client-setup.sh at
+# build time. CRAFT's client runtime compares it against its own VERSION and
+# warns on drift: the two halves are updated by different people (the admin
+# rebuilds the container, the user re-runs the bootstrap cell), so they can
+# disagree with nothing to notice it.
+#
+# Prints nothing and exits nonzero when unstamped, which is how a container
+# built before this existed reports "unknown" rather than a wrong answer.
+cmd_version() {
+    local stamp="${HOME_DIR}/bin/VERSION"
+    [ -s "$stamp" ] || return 1
+    cat "$stamp"
+}
+
 usage() {
     cat <<EOF
 Usage: kernel-manager.sh <command>
@@ -352,6 +366,7 @@ Commands:
   restart  Force a fresh kernel with a new connection key
   status   Show kernel state and connection file path
   doctor   Print diagnostics (pids, ports, key, log tail)
+  version  Print the commit these container scripts were installed from
 EOF
 }
 
@@ -361,5 +376,6 @@ case "${1:-}" in
     restart) cmd_restart ;;
     status)  cmd_status  ;;
     doctor)  cmd_doctor  ;;
+    version) cmd_version ;;
     *)       usage; exit 1 ;;
 esac

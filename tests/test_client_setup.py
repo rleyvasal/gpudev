@@ -212,6 +212,74 @@ class ClientInviteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_gpu_setup_args("a --variant bogus")
 
+    def test_gpu_setup_expands_domain_into_a_hostname(self):
+        # --domain is the normal path: the client already knows its own name,
+        # and the domain is public DNS rather than a secret, so an admin can
+        # publish it once instead of returning a hostname per client.
+        from gpudev_craft.core import _parse_gpu_setup_args
+
+        self.assertEqual(
+            _parse_gpu_setup_args("alice --domain example.com"),
+            ("alice", "alice.example.com", "default"),
+        )
+        self.assertEqual(
+            _parse_gpu_setup_args("alice --domain=example.com --variant cuda-dev"),
+            ("alice", "alice.example.com", "cuda-dev"),
+        )
+        # It must agree with the host, which routes <name>.<domain>, and reject
+        # a name the host would refuse rather than minting a hostname for it.
+        self.assertEqual(
+            _parse_gpu_setup_args("ALICE --domain example.com")[1],
+            "alice.example.com",
+        )
+        with self.assertRaises(ValueError):
+            _parse_gpu_setup_args("Alice_B --domain example.com")
+        # A leading dot is the obvious typo; silently doubling it would produce
+        # a hostname that never resolves.
+        self.assertEqual(
+            _parse_gpu_setup_args("alice --domain .example.com")[1],
+            "alice.example.com",
+        )
+        with self.assertRaises(ValueError):
+            _parse_gpu_setup_args("alice --domain example.com --hostname a.b.com")
+        with self.assertRaises(ValueError):
+            _parse_gpu_setup_args("alice --domain ''")
+
+    def test_craft_entrypoint_only_trusts_its_own_argv(self):
+        # `%run CRAFT.py alice --domain x` fills sys.argv, which is what lets
+        # one line load the magics AND run setup. Imported another way, argv
+        # belongs to the kernel launcher (-f …kernel.json), and treating that
+        # as a client name would fail confusingly.
+        source = (REPO_ROOT / "CRAFT.py").read_text()
+        self.assertIn("_setup_args", source)
+        self.assertIn("Path(argv[0]).name != Path(__file__).name", source)
+
+        import sys as _sys_mod
+
+        namespace: dict = {
+            "__file__": str(REPO_ROOT / "CRAFT.py"),
+            "Path": Path,
+            "shlex": __import__("shlex"),
+            "sys": _sys_mod,
+        }
+        body = source[source.index("def _setup_args"):source.index("_args = _setup_args()")]
+        exec(compile(body, "CRAFT.py", "exec"), namespace)
+        setup_args = namespace["_setup_args"]
+
+        import sys as _sys
+
+        saved = _sys.argv
+        try:
+            _sys.argv = ["CRAFT.py"]
+            self.assertIsNone(setup_args())
+            _sys.argv = ["CRAFT.py", "alice", "--domain", "example.com"]
+            self.assertEqual(setup_args(), "alice --domain example.com")
+            # The kernel launcher's argv must never be read as setup arguments.
+            _sys.argv = ["ipykernel_launcher.py", "-f", "/tmp/kernel.json"]
+            self.assertIsNone(setup_args())
+        finally:
+            _sys.argv = saved
+
     def test_rebuild_still_accepts_all_as_a_target(self):
         # Adding --variant introduced an option parser, whose `-*` catch-all
         # swallowed `--all` and broke rebuilding every client. --all is a
@@ -265,18 +333,24 @@ class ClientInviteTests(unittest.TestCase):
             )
 
             self.assertIn("solveite.example.com", result.stdout)
-            self.assertIn("https://github.com/rleyvasal/gpudev.git", result.stdout)
+            self.assertIn("client-bootstrap.sh", result.stdout)
             # One cell, not two. %%bash is a CELL magic and cannot share a cell
             # with %run, which is the only reason the bootstrap was ever split;
             # `!` escapes can, verified in SolveIt. Reintroducing %%bash would
             # silently split it again.
             self.assertNotIn("%%bash", result.stdout)
-            self.assertIn("!if [ -d /app/data/gpudevd/gpudev/.git ]", result.stdout)
-            self.assertIn("%run /app/data/gpudevd/gpudev/CRAFT.py", result.stdout)
+            # Two lines, not three: %run carries the setup arguments, because
+            # `%run script.py args` fills sys.argv and CRAFT.py is already the
+            # entry point. Splitting setup back onto its own %gpu_setup line
+            # would be a regression, not a style choice.
             self.assertIn(
-                "%gpu_setup solveite --hostname solveite.example.com", result.stdout
+                "%run /app/data/gpudevd/gpudev/CRAFT.py solveite --domain example.com",
+                result.stdout,
             )
+            self.assertNotIn("%gpu_setup", result.stdout)
             self.assertIn("%gpu solveite", result.stdout)
+            # The cell must not have drifted back to a repository clone.
+            self.assertNotIn("git clone", result.stdout)
             self.assertEqual(clients_path.read_bytes(), before)
 
 

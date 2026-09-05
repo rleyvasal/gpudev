@@ -11,7 +11,23 @@ CONFIG_DIR="${HOME}/.config/gpudev"
 HOST_CONFIG="${CONFIG_DIR}/host.json"
 CLIENTS_CONFIG="${CONFIG_DIR}/clients.json"
 BASE_IMAGE="gpudev-base:latest"
-KERNEL_MANAGER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel-manager.sh"
+REPO_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KERNEL_MANAGER_SRC="${REPO_SRC_DIR}/kernel-manager.sh"
+
+# The commit the host's scripts came from, stamped into each container so the
+# client runtime can detect drift between the two halves. Both host install
+# modes are covered: a git checkout, and the curl-bootstrapped production host
+# where `gpudev self-update` records the SHA it pinned to.
+repo_sha() {
+    local sha=""
+    if [ -d "${REPO_SRC_DIR}/.git" ]; then
+        sha="$(git -C "$REPO_SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    if [ -z "$sha" ] && [ -f "${REPO_SRC_DIR}/.self-update-sha" ]; then
+        sha="$(tr -d '[:space:]' < "${REPO_SRC_DIR}/.self-update-sha" 2>/dev/null || true)"
+    fi
+    printf '%s' "$sha"
+}
 
 # ── Image variants ────────────────────────────────────────────────────────────
 # GPUDEV_VARIANT selects which base image a client is built on. Empty/"default"
@@ -436,6 +452,9 @@ install_kernel_manager() {
 
     [ -f "$KERNEL_MANAGER_SRC" ] || fail "kernel-manager.sh not found at $KERNEL_MANAGER_SRC"
 
+    local sha
+    sha="$(repo_sha)"
+
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
         -v "${KERNEL_MANAGER_SRC}:/tmp/kernel-manager.sh:ro" \
@@ -443,6 +462,13 @@ install_kernel_manager() {
 mkdir -p ${CONTAINER_HOME}/bin
 cp /tmp/kernel-manager.sh ${CONTAINER_HOME}/bin/kernel-manager.sh
 chmod +x ${CONTAINER_HOME}/bin/kernel-manager.sh
+# An unresolvable SHA leaves no stamp rather than a wrong one: 'kernel-manager.sh
+# version' then reports unknown, and the client treats unknown as 'do not warn'.
+if [ -n '${sha}' ]; then
+  printf '%s\n' '${sha}' > ${CONTAINER_HOME}/bin/VERSION
+else
+  rm -f ${CONTAINER_HOME}/bin/VERSION
+fi
 "
 }
 
