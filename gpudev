@@ -775,17 +775,49 @@ echo "  Venv ready (thin + base overlay)."
 '
 }
 
+# Record a client's variant after a switch. Without this the next rebuild reads
+# the OLD variant and silently puts the client back on the previous image.
+set_client_variant() {
+    local name="$1" variant="$2"
+    NAME_VAL="$name" VARIANT_VAL="$variant" python3 - "$CLIENTS_CONFIG" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+for client in data.get("clients", []):
+    if client.get("name") == os.environ["NAME_VAL"]:
+        client["variant"] = os.environ["VARIANT_VAL"]
+path.write_text(json.dumps(data, indent=2))
+PY
+    chmod 600 "$CLIENTS_CONFIG" 2>/dev/null || true
+}
+
 rebuild_one() {
     local name="$1"
     local reset="${2:-0}"
+    local want_variant="${3:-}"
     local ssh_port
     ssh_port="$(client_get "$name" ssh_port)"
 
     # Rebuild onto the image this client was CREATED on, not the default. Without
     # this a cuda-dev client silently drops back to the standard image on rebuild,
     # losing its toolchain and leaving a venv that references the other image.
-    local variant image extra_flags
-    variant="$(client_variant "$name")"
+    local variant image extra_flags current_variant
+    current_variant="$(client_variant "$name")"
+    variant="$current_variant"
+
+    # An explicit --variant is the one case where changing it is intended. The
+    # venv is a .pth overlay onto THAT image's /opt/venv, so carrying it across a
+    # switch leaves it pointing at the wrong base — which is exactly the breakage
+    # the pinning above exists to prevent. Force the venv rebuild rather than
+    # letting the operator choose wrongly.
+    if [ -n "$want_variant" ] && [ "$want_variant" != "$current_variant" ]; then
+        variant="$want_variant"
+        if [ "$reset" != "1" ]; then
+            log "  Variant change ${current_variant} -> ${variant}: rebuilding the venv"
+            log "  (it overlays the image's /opt/venv, so it cannot survive the switch)."
+            reset=1
+        fi
+    fi
     image="$(variant_image "$variant")"
     extra_flags="$(variant_run_flags "$variant")"
     docker_cmd image inspect "$image" >/dev/null 2>&1 \
@@ -793,6 +825,9 @@ rebuild_one() {
 Build it with: gpudev image build $variant"
 
     log "Rebuilding '$name' (volume data preserved, variant: $variant)..."
+    if [ "$variant" != "$current_variant" ]; then
+        set_client_variant "$name" "$variant"
+    fi
 
     if docker_cmd ps -a --format '{{.Names}}' | grep -qx "$name"; then
         docker_cmd rm -f "$name"
@@ -855,11 +890,32 @@ chmod +x /home/gpudev/bin/kernel-manager.sh
     warn "  '$name' may not be fully ready. Check: gpudev client logs $name"
 }
 
+CLIENT_REBUILD_USAGE="Usage: gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev]"
+
 cmd_client_rebuild() {
-    local target="${1:-}"
-    local reset=0
-    [ "${2:-}" = "--reset-venv" ] && reset=1
-    [ -n "$target" ] || fail "Usage: gpudev client rebuild <name|--all> [--reset-venv]"
+    local target="" reset=0 want_variant=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reset-venv) reset=1; shift ;;
+            --variant)    want_variant="${2:-}"; shift 2 ;;
+            --variant=*)  want_variant="${1#*=}"; shift ;;
+            --all)        [ -z "$target" ] && target="--all" || fail "Unexpected argument '$1'."; shift ;;
+            -*)           fail "Unknown option '$1'. $CLIENT_REBUILD_USAGE" ;;
+            *)            [ -z "$target" ] && target="$1" || fail "Unexpected argument '$1'."; shift ;;
+        esac
+    done
+    [ -n "$target" ] || fail "$CLIENT_REBUILD_USAGE"
+    if [ -n "$want_variant" ]; then
+        case "$want_variant" in
+            default|cuda-dev) ;;
+            *) fail "Unknown variant '$want_variant'. Known variants: default, cuda-dev." ;;
+        esac
+        # Switching every client at once is almost never meant, and a mistake
+        # there rebuilds every venv on the host.
+        if [ "$target" = "--all" ]; then
+            fail "--variant applies to one client, not --all."
+        fi
+    fi
     require_host_setup
 
     if [ "$target" = "--all" ]; then
@@ -877,7 +933,7 @@ cmd_client_rebuild() {
             # which exits) is contained to the subshell and doesn't abort the
             # whole batch. Output still streams live via tee; we keep a copy to
             # extract the failure reason for the summary.
-            if rebuild_one "$name" "$reset" 2>&1 | tee "$logf"; then
+            if rebuild_one "$name" "$reset" "" 2>&1 | tee "$logf"; then
                 :
             else
                 reason="$(grep -aE '^(Error|Warning):' "$logf" | tail -n 1)"
@@ -901,7 +957,7 @@ cmd_client_rebuild() {
         log "All clients rebuilt."
     else
         client_exists "$target" || fail "Client '$target' not found."
-        rebuild_one "$target" "$reset"
+        rebuild_one "$target" "$reset" "$want_variant"
     fi
 }
 
@@ -1148,6 +1204,7 @@ cmd_status() {
     echo "  gpudev client info <name>    print SSH config stanza for a client"
     echo "  gpudev client restart <name> restart a client container"
     echo "  gpudev client rebuild <name> recreate the container, keep the volume"
+    echo "                               (--variant switches image, keeps data)"
     # Listing every other lifecycle verb but not remove reads as "there is no
     # way to remove a client", which is worse than the line it saves.
     echo "  gpudev client remove <name>  delete a client AND its data volume"
@@ -2763,7 +2820,7 @@ Clients:
   gpudev client start <name>
   gpudev client stop <name>
   gpudev client restart <name>
-  gpudev client rebuild <name|--all> [--reset-venv]
+  gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev]
   gpudev client logs <name>
   gpudev client info <name>
 
@@ -2821,7 +2878,7 @@ main() {
                 start)   cmd_client_start "${3:-}" ;;
                 stop)    cmd_client_stop "${3:-}" ;;
                 restart) cmd_client_restart "${3:-}" ;;
-                rebuild) cmd_client_rebuild "${3:-}" "${4:-}" ;;
+                rebuild) shift 2; cmd_client_rebuild "$@" ;;
                 logs)    cmd_client_logs "${3:-}" ;;
                 info)    cmd_client_info "${3:-}" ;;
                 *)       usage; exit 1 ;;

@@ -142,6 +142,35 @@ class ClientInviteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_gpu_setup_args("a --variant bogus")
 
+    def test_rebuild_still_accepts_all_as_a_target(self):
+        # Adding --variant introduced an option parser, whose `-*` catch-all
+        # swallowed `--all` and broke rebuilding every client. --all is a
+        # TARGET that merely looks like a flag.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            config_dir = home / ".config" / "gpudev"
+            config_dir.mkdir(parents=True)
+            (config_dir / "host.json").write_text(
+                json.dumps({"cf_domain": "example.com", "linux_user": "gpudev"})
+            )
+            (config_dir / "clients.json").write_text(json.dumps({"clients": []}))
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                [str(REPO_ROOT / "gpudev"), "client", "rebuild", "--all"],
+                cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+            )
+            self.assertNotIn("Unknown option '--all'", result.stderr)
+
+            # --variant is single-client only: switching every client at once
+            # would rebuild every venv on the host.
+            refused = subprocess.run(
+                [str(REPO_ROOT / "gpudev"), "client", "rebuild", "--all",
+                 "--variant", "cuda-dev"],
+                cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+            )
+            self.assertIn("applies to one client", refused.stderr)
+
     def test_invite_prints_complete_non_mutating_bootstrap(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
