@@ -2245,12 +2245,17 @@ cmd_reset() {
     # host reachable only over the LAN or the console until linux-setup.sh runs
     # again. Same reasoning as ssh lockdown deferring its restart.
     if session_rides_tunnel && [ "$force" != "1" ]; then
+        # The host knows its own address; making the operator go and look it up
+        # to obey an error message is friction the message can remove itself.
+        local lan_ip
+        lan_ip="$(ip -4 addr show scope global 2>/dev/null \
+                  | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
         fail "This session arrives over the tunnel, and reset deletes it.
 
 You would lose access part-way through, with no tunnel until linux-setup.sh
 has run again. Re-run from the console or a LAN session:
 
-  ssh -p $(host_get host_ssh_port) $(host_get linux_user)@<lan-ip>
+  ssh -p $(host_get host_ssh_port) $(host_get linux_user)@${lan_ip:-<lan-ip>}
 
 Or --force if you accept being disconnected."
     fi
