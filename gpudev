@@ -2239,7 +2239,6 @@ cmd_reset() {
     done
 
     require_host_setup
-    require_interactive_sudo "gpudev reset"
 
     # Reset deletes the tunnel, which is the path a remote session arrives on.
     # Running it from such a session cuts the operator off mid-reset, with the
@@ -2262,6 +2261,10 @@ Or --force if you accept being disconnected."
         log "--dry-run: nothing was changed."
         return 0
     fi
+
+    # Only past the dry-run gate: reset writes to /etc, and without sudo those
+    # removals fail silently while the run still reports success.
+    require_interactive_sudo "gpudev reset"
 
     if [ "$assume_yes" != "1" ]; then
         local host_cf confirm
@@ -2475,7 +2478,6 @@ cmd_uninstall() {
     done
 
     require_host_setup
-    require_interactive_sudo "gpudev uninstall"
     local user admin_key
     user="$(host_get linux_user)"
     admin_key="$(host_get admin_ssh_key)"
@@ -2510,6 +2512,8 @@ cmd_uninstall() {
         log "--dry-run: nothing was changed."
         return 0
     fi
+
+    require_interactive_sudo "gpudev uninstall"
 
     if session_rides_tunnel && [ "$force" != "1" ]; then
         fail "This session arrives over the tunnel, which uninstall deletes.
