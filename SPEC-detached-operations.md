@@ -1,10 +1,20 @@
 # Spec — detached admin operations
 
-Status: IMPLEMENTED — all three phases, with 33 tests in
-`tests/test_jobs.py`. Decisions and wiring are covered against a stubbed
-systemd; **`systemd-run` itself has never executed**, because the Mac the suite
-runs on has neither systemd nor flock. A real detached job, a deferred install,
-and `gpudev image build base` all still need a run on the host.
+Status: IMPLEMENTED AND VERIFIED ON A LIVE HOST — all three phases, with 37
+tests in `tests/test_jobs.py`.
+
+Confirmed on hardware: a job survives the SSH session that started it, `flock`
+serializes client mutations, `jobs logs`/`cancel` work against a live unit, the
+deferred install skips Step 5 and prints its closing note, and two image builds
+run concurrently to completion (base 15m 45s, cuda-dev 29m 45s, together in
+29m 45s against ~45m serial).
+
+Four bugs were found only by running it, never by the tests: jobs resolved
+`gpudev` through PATH instead of the running script; a cancelled job left no
+record; a detached launcher blocked on the lock it had just handed off; and the
+serialization decision below was based on an unmeasured assumption.
+
+Not yet exercised: a `client add` against the new images.
 Scope: `gpudev` (`image build`, `client add`, `client rebuild`, `status`, new
 `jobs`), `client-setup.sh` (locking, base-image message), `linux-setup.sh`
 (defer the base image build; tmux hint), `README.md`, `LINUX-QUICKSTART.md`.
@@ -310,9 +320,39 @@ eventually request a variant nobody prewarmed, and it must not lock up their
 terminal for half an hour. It demotes it from expected path to safety net,
 which is the right status for a behaviour that surprises people.
 
-**Builds must serialize.** Two concurrent image builds contend for disk, CPU and
-the layer cache with no benefit. The job lock covers image builds as well as
-client mutations; a second build queues rather than racing.
+**Builds run in parallel — the opposite of what this spec first said.**
+
+The original claim was that two concurrent builds contend for disk, CPU and the
+layer cache with no benefit. It was asserted, never measured, and measurement
+refuted it on every count:
+
+| | One build | Two builds |
+|---|---|---|
+| CPU (24 cores) | 0.2% | still 99.8% idle |
+| Network | 58 Mbps | **92 Mbps** of 1 Gbps |
+| Disk write | 31 MB/s | NVMe does 1000+ |
+| RAM | 1 GB | 1 GB of 29 GB |
+
+They do not split a fixed resource; aggregate throughput rose ~1.6×, because
+the work is upstream download latency. Confirmed by a real run: base 15m 45s,
+cuda-dev 29m 45s, both finishing in **29m 45s** against ~45m serial — 35% saved.
+
+**The lock was protecting something real, just not that.** Both builds call
+`write_base_requirements`, and `cat > file` truncates before writing, so one
+could read `requirements-torch.in` or `requirements-base.txt` mid-rewrite.
+Identical content, so the failure would have been rare and baffling rather than
+obvious. Those writes are now temp + rename, which removes the hazard without
+removing the concurrency.
+
+**The real cost of parallelism** is cache reuse, not contention. Both Dockerfiles
+mount `type=cache,target=/root/.cache/uv`, so a *sequential* second build reads
+the first's downloads. Run together, the ~21 non-torch packages they share may
+be fetched twice — roughly 200–300 MB. The dominant wheels are not shared at
+all: base installs torch cu130, cuda-dev pins cu128 to match its toolkit. On a
+metered link, serial is the better trade.
+
+Client mutations still serialize: they walk `clients.json`, the ingress and the
+connector, which genuinely do not tolerate two writers.
 
 **Ship first, because it is nearly free and needs no new mechanism:**
 
@@ -340,8 +380,8 @@ the machine they just built.
 
 A single lock (`flock` on `~/.config/gpudev/.lock`) around the mutating
 sequence: `clients.json` write → ingress edit → tunnel reload. Image builds
-take it too, so two prewarm jobs queue instead of contending for disk, CPU and
-the layer cache.
+**Image builds do not take it** — see the measurements above; they contend for
+nothing, and the files they share are written atomically instead.
 
 Not optional alongside this work. Two concurrent `client add`s can today
 interleave a read-modify-write of `clients.json`
@@ -393,7 +433,7 @@ on the result. Revisit only if that proves insufficient in practice.
 | two mutating commands at once | second blocks on the lock; neither corrupts `clients.json` |
 | lock held by a dead process | `flock` releases on process exit; no stale-lock recovery needed |
 | job fails while nobody is watching | non-zero exit retained; surfaced by `status` on next login |
-| two image builds started at once | second queues on the lock; neither thrashes the layer cache |
+| two image builds started at once | both run; the shared requirements files are written atomically |
 | `client add` before the base image is built | refuse with the build command, not "run linux-setup.sh first" |
 | `client add` for an unbuilt variant | the whole command re-runs detached; operator is told it is safe to disconnect |
 | detached copy re-enters `client add` | `GPUDEV_IN_JOB=1` stops it detaching again |
@@ -416,20 +456,26 @@ on the result. Revisit only if that proves insufficient in practice.
    Moving that phase past the mandatory reconnect turns `sudo docker` into
    plain `docker`, which is what makes it detachable at all; the rest of the
    installer keeps its TTY and is covered by `tmux`.
-6. **Images are prewarmed by the administrator after install.** A build should
+6. **Image builds are concurrent; client mutations are not.** The claim that
+   builds contend was asserted without measurement and proved false — two
+   builds raised throughput 58→92 Mbps with the CPU 99.8% idle, finishing in
+   30 minutes against 45 serial. What the lock was actually protecting, a
+   truncating rewrite of two shared requirements files, is fixed by writing
+   them atomically.
+7. **Images are prewarmed by the administrator after install.** A build should
    be paid at an idle moment by the person running the host, never by a user
    waiting on the `%gpudev` line that finishes their onboarding. This makes the
    `client add` auto-detach a safety net rather than the expected path.
-7. **A finished job's result is a file, not systemd unit state.** What the
+8. **A finished job's result is a file, not systemd unit state.** What the
    operator needs on return is a value — the `%gpudev` line — and a structured
    value should not have to be grepped back out of log text. Files also survive
    a reboot or user-manager restart, which transient units do not; `--collect`
    then lets systemd clean up normally. The journal keeps the full logs.
-8. **Detaching the installer itself is rejected.** Deferring the base image is
+9. **Detaching the installer itself is rejected.** Deferring the base image is
    why it no longer matters: what remains in `linux-setup.sh` is apt, `/etc`
    writes and three interactive points, all of which want a TTY. `tmux` covers
    a dropped connection there.
-9. **`client add` detaches itself exactly when it will be slow** — a missing
+10. **`client add` detaches itself exactly when it will be slow** — a missing
    variant image, nothing else. It does not print a command to re-run: the
    detached copy does the whole job, and `status` reports the result. The fast
    path, which is every other `client add`, is untouched.

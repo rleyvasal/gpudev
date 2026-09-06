@@ -367,8 +367,26 @@ gpudev image list                       # both should read "built" before onboar
 Prewarming `cuda-dev` matters more than it looks: without it, the first
 `client add --variant cuda-dev` builds the image on the spot, so the **first
 user to ask** waits 25 minutes for the line that completes their setup — a cost
-that has nothing to do with them. Builds serialize, so starting both at once is
-fine.
+that has nothing to do with them.
+
+**Start both at once — they run in parallel.** Measured on a 24-core host:
+
+| | Serial | Parallel |
+|---|---|---|
+| base | 15m 45s | 15m 45s |
+| cuda-dev | +29m 45s | (concurrent) |
+| **total** | **~45m** | **~30m** |
+
+Nothing contends: one build used 0.2% of 24 cores, 58 Mbps of a 1 Gbps link and
+31 MB/s of an NVMe. Two together reached 92 Mbps with the CPU still 99.8% idle —
+they use more of the pipe rather than splitting it, because the work is upstream
+download latency, not local resource.
+
+The one cost: both Dockerfiles share a uv download cache, and running
+concurrently means the ~21 non-torch packages they have in common may be fetched
+twice instead of once — roughly 200–300 MB. The large downloads are *not*
+duplicated, since base installs torch cu130 and cuda-dev pins cu128 to match its
+toolkit. If bandwidth is metered, build them one at a time instead.
 
 `--build-base-image` passed to `linux-setup.sh` restores the old inline
 behaviour for anyone who wants one command that ends with a usable host.

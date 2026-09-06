@@ -410,8 +410,18 @@ gpudev image build cuda-dev --detach
 Doing it here rather than later matters: a `client add --variant cuda-dev` on a
 host without that image builds it on the spot, so the **first user to ask**
 waits 25 minutes for the line that finishes their setup — a cost that has
-nothing to do with them. Builds serialize, so starting both is fine; the second
-queues.
+nothing to do with them.
+
+**Start both at once — they run in parallel.** Measured here: base took 15m 45s
+and cuda-dev 29m 45s, finishing together in **~30 minutes** rather than the ~45
+they take one after the other. Nothing contends — two builds pushed the link to
+92 Mbps of 1 Gbps with the CPU 99.8% idle, because the work is download latency
+rather than local resource.
+
+They do share a uv download cache, so running concurrently re-fetches the ~21
+packages they have in common (~200–300 MB). The big wheels differ — base uses
+torch cu130, cuda-dev cu128 — so those are not duplicated. On a metered link,
+build them one at a time.
 
 Watch either with:
 
