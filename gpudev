@@ -1286,7 +1286,8 @@ Build it with: gpudev image build $variant"
         docker_cmd run --rm \
             -v "${name}-data:/home/gpudev" \
             -v "${km_src}:/tmp/kernel-manager.sh:ro" \
-            "$image" bash -c "
+            --entrypoint bash \
+            "$image" -c "
 mkdir -p /home/gpudev/bin
 cp /tmp/kernel-manager.sh /home/gpudev/bin/kernel-manager.sh
 chmod +x /home/gpudev/bin/kernel-manager.sh
@@ -1562,7 +1563,13 @@ EOF
     echo "  gpudev client remove deletes the volume → new keys on re-add."
     echo "  CRAFT auto-clears a stale known_hosts entry once if a key did change."
     echo ""
-    print_solveit_bootstrap "$name" "$hostname"
+    # cf_domain, not hostname: the helper emits `--domain`, and setup builds
+    # <name>.<domain> from it. Passing the full hostname here produced
+    # `--domain solveitrc.qsoftss.com`, which resolves to
+    # solveitrc.solveitrc.qsoftss.com. This call site was missed when the
+    # helper changed from --hostname to --domain; `client invite` was updated
+    # and this one was not.
+    print_solveit_bootstrap "$name" "$cf_domain"
     echo "── Connect ──"
     echo ""
     echo "  ssh gpudev-${name}"

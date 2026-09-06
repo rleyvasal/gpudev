@@ -416,7 +416,8 @@ setup_ssh_authorized_keys() {
 
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
-        "$BASE_IMAGE" bash -c "
+        --entrypoint bash \
+        "$BASE_IMAGE" -c "
 useradd -M -s /bin/bash -d ${CONTAINER_HOME} ${CONTAINER_USER} 2>/dev/null || true
 mkdir -p ${CONTAINER_HOME}/.ssh
 echo '${public_key}' > ${CONTAINER_HOME}/.ssh/authorized_keys
@@ -433,7 +434,8 @@ setup_client_venv() {
 
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
-        "$BASE_IMAGE" bash -c "
+        --entrypoint bash \
+        "$BASE_IMAGE" -c "
 if [ -x ${CONTAINER_HOME}/.venv/bin/python ]; then
     echo 'Client venv already exists, skipping.'
     exit 0
@@ -465,7 +467,8 @@ install_kernel_manager() {
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
         -v "${KERNEL_MANAGER_SRC}:/tmp/kernel-manager.sh:ro" \
-        "$BASE_IMAGE" bash -c "
+        --entrypoint bash \
+        "$BASE_IMAGE" -c "
 mkdir -p ${CONTAINER_HOME}/bin
 cp /tmp/kernel-manager.sh ${CONTAINER_HOME}/bin/kernel-manager.sh
 chmod +x ${CONTAINER_HOME}/bin/kernel-manager.sh
@@ -557,7 +560,8 @@ EOF
     docker run --rm \
         -v "${name}-data:${CONTAINER_HOME}" \
         -v "${tmp_script}:/tmp/start.sh:ro" \
-        "$BASE_IMAGE" bash -c "
+        --entrypoint bash \
+        "$BASE_IMAGE" -c "
 cp /tmp/start.sh ${CONTAINER_HOME}/start.sh
 chmod +x ${CONTAINER_HOME}/start.sh
 "

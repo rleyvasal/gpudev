@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -269,6 +270,20 @@ class ClientInviteTests(unittest.TestCase):
         # mismatch there would silently register the wrong magic name.
         for name, fn in core._CORE_MAGIC_FUNCS:
             self.assertEqual(fn.__name__, name)
+
+    def test_every_bootstrap_printer_is_given_a_domain_not_a_hostname(self):
+        # print_solveit_bootstrap emits `--domain`, and setup builds
+        # <name>.<domain> from it. `client info` still passed $hostname, so it
+        # printed `--domain solveitrc.qsoftss.com` — which would resolve to
+        # solveitrc.solveitrc.qsoftss.com. One call site was updated when the
+        # helper changed and the other was not, so scan them all.
+        source = (REPO_ROOT / "gpudev").read_text()
+        calls = re.findall(r"print_solveit_bootstrap [^\n]+", source)
+        self.assertGreaterEqual(len(calls), 2)
+        for call in calls:
+            with self.subTest(call=call):
+                self.assertNotIn("$hostname", call)
+                self.assertIn("cf_domain", call)
 
     def test_rebuild_still_accepts_all_as_a_target(self):
         # Adding --variant introduced an option parser, whose `-*` catch-all

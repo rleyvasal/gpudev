@@ -479,3 +479,26 @@ class InstallerFlagTests(unittest.TestCase):
         result = self.run_setup("--bogus")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Unknown option", result.stderr)
+
+
+class ContainerInitNoiseTests(unittest.TestCase):
+    """Volume-init containers must not print NVIDIA's entrypoint banner.
+
+    On the cuda-dev image every `docker run` printed the CUDA banner plus
+    "WARNING: The NVIDIA Driver was not detected" — four times during one
+    `client add`, burying the actual progress messages and reading like a
+    failure in a run that succeeded. These containers set up a volume and never
+    touch the GPU, so bypassing nvidia_entrypoint.sh loses nothing.
+    """
+
+    def test_init_containers_bypass_the_nvidia_entrypoint(self):
+        import re
+        for name in ("client-setup.sh", "gpudev"):
+            source = (REPO_ROOT / name).read_text()
+            with self.subTest(file=name):
+                # No invocation may run the image's default entrypoint.
+                self.assertNotRegex(source, r'"\$(?:BASE_IMAGE|image)" bash -c')
+                runs = len(re.findall(r'"\$(?:BASE_IMAGE|image)" -c "', source))
+                entrypoints = source.count("--entrypoint bash")
+                self.assertEqual(runs, entrypoints,
+                                 f"{name}: {runs} init runs but {entrypoints} --entrypoint flags")
