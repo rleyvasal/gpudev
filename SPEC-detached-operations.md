@@ -1,11 +1,12 @@
 # Spec — detached admin operations
 
-Status: PHASE 1 IMPLEMENTED — locking, `run_detached`, `gpudev jobs` and the
-dashboard Jobs section are in, with 17 tests in `tests/test_jobs.py`. Phases 2
-(`--detach` flags, `client add` auto-detach) and 3 (defer the base image build)
-are not started. The detached path itself has not run on a systemd host: the
-Mac the suite runs on has neither systemd nor flock, so both degraded paths are
-what is covered here.
+Status: PHASES 1 AND 2 IMPLEMENTED — locking, `run_detached`, `gpudev jobs`,
+the dashboard Jobs section, `--detach`/`--wait` on `image build` and
+`client rebuild`, and `client add`'s automatic detach, with 24 tests in
+`tests/test_jobs.py`. Phase 3 (defer the base image build) is not started.
+The detach *decision* is covered against a stubbed systemd; `systemd-run`
+itself has never executed, because the Mac the suite runs on has neither
+systemd nor flock.
 Scope: `gpudev` (`image build`, `client add`, `client rebuild`, `status`, new
 `jobs`), `client-setup.sh` (locking, base-image message), `linux-setup.sh`
 (defer the base image build; tmux hint), `README.md`, `LINUX-QUICKSTART.md`.

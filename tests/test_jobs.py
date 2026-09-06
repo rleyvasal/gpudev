@@ -212,3 +212,105 @@ class LockTests(JobsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DetachDecisionTests(JobsTestCase):
+    """Detaching follows duration: slow work goes to the background, fast work
+    stays in front of the operator who is waiting to read its output."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / "bin"
+        self.bin.mkdir()
+        self.state = self.home / "state"
+        self.state.mkdir()
+        (self.home / ".config" / "gpudev" / "host.json").write_text(
+            json.dumps({"cf_domain": "example.com", "linux_user": "gpudev",
+                        "port_base": 52200})
+        )
+        # systemd present, but launches nothing — just records the request.
+        (self.bin / "systemd-run").write_text(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$TEST_STATE/launched\"\n"
+        )
+        (self.bin / "systemctl").write_text("#!/usr/bin/env bash\nexit 0\n")
+        # base image built, cuda-dev not.
+        (self.bin / "docker").write_text(
+            '#!/usr/bin/env bash\n'
+            'if [ "$1 $2" = "image inspect" ]; then\n'
+            '  [ "$3" = "gpudev-base:latest" ] && exit 0\n'
+            '  exit 1\n'
+            'fi\n'
+            'exit 0\n'
+        )
+        for f in self.bin.iterdir():
+            f.chmod(0o755)
+
+    def add(self, *args, **env_extra):
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.home),
+            "PATH": f"{self.bin}:{env['PATH']}",
+            "TEST_STATE": str(self.state),
+        })
+        env.update(env_extra)
+        return subprocess.run(
+            [str(GPUDEV), "client", "add", *args],
+            env=env, capture_output=True, text=True,
+        )
+
+    def launched(self):
+        f = self.state / "launched"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def test_fast_path_stays_in_the_foreground(self):
+        # The image is present, so this is seconds. Detaching it would bury the
+        # %gpudev line the operator has to forward.
+        self.add("alice", "--key", "ssh-ed25519 AAAA test")
+        self.assertEqual(self.launched(), [])
+
+    def test_missing_image_detaches_automatically(self):
+        result = self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("safe to disconnect", result.stdout)
+        self.assertEqual(len(self.launched()), 1)
+
+    def test_the_detached_copy_gets_everything_it_needs(self):
+        # It is a fresh `client add`, not a resumption, so the key must travel
+        # with it — including a key that arrived by prompt or --key-file.
+        self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test")
+        launched = self.launched()[0]
+        self.assertIn("client add bob", launched)
+        self.assertIn("--variant cuda-dev", launched)
+        self.assertIn("--key ssh-ed25519 AAAA test", launched)
+        self.assertIn("--wait", launched)
+
+    def test_wait_beats_the_automatic_decision(self):
+        # --wait once lost to auto-detect, so an operator who asked to watch
+        # the build was detached anyway.
+        self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test", "--wait")
+        self.assertEqual(self.launched(), [])
+
+    def test_a_detached_copy_never_detaches_again(self):
+        self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test",
+                 GPUDEV_IN_JOB="1")
+        self.assertEqual(self.launched(), [])
+
+    def test_detach_forces_background_even_when_fast(self):
+        self.add("alice", "--key", "ssh-ed25519 AAAA test", "--detach")
+        self.assertEqual(len(self.launched()), 1)
+
+    def test_contradictory_flags_are_refused(self):
+        for cmd in (
+            ["client", "add", "a", "--key", "ssh-ed25519 AAAA t", "--detach", "--wait"],
+            ["client", "rebuild", "a", "--detach", "--wait"],
+            ["image", "build", "cuda-dev", "--detach", "--wait"],
+        ):
+            with self.subTest(cmd=cmd):
+                env = os.environ.copy()
+                env.update({"HOME": str(self.home),
+                            "PATH": f"{self.bin}:{env['PATH']}",
+                            "TEST_STATE": str(self.state)})
+                r = subprocess.run([str(GPUDEV), *cmd], env=env,
+                                   capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("contradictory", r.stderr)

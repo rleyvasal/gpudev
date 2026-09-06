@@ -159,6 +159,34 @@ json.dump({
 ' 2>/dev/null || warn "Could not record the result for ${unit}."
 }
 
+# Should this invocation detach? Not when it is already the detached copy, not
+# when the operator asked to wait, and not on a host with no systemd to detach
+# into — where saying so beats pretending.
+should_detach() {
+    local wanted="$1"
+    [ "$wanted" = "1" ] || return 1
+    [ -z "${GPUDEV_IN_JOB:-}" ] || return 1
+    if ! jobs_supported; then
+        warn "systemd is unavailable here — running in the foreground instead."
+        return 1
+    fi
+    return 0
+}
+
+# Start <command...> detached and tell the operator how to follow it.
+detach_job() {
+    local verb="$1" target="$2" eta="$3"; shift 3
+    local unit
+    unit="$(run_detached "$verb" "$target" "$@")"
+    echo ""
+    echo "Running in the background — safe to disconnect."
+    echo "  Job:    ${unit}"
+    [ -z "$eta" ] || echo "  Takes:  ${eta}"
+    echo "  Follow: gpudev jobs logs ${unit}"
+    echo ""
+    echo "Reconnect whenever; 'gpudev status' reports the result."
+}
+
 # Units systemd currently knows about, running or not.
 job_active_units() {
     jobs_supported || return 0
@@ -600,12 +628,14 @@ nohup cloudflared tunnel run '${tunnel_name}' >>'${HOME}/.cloudflared/tunnel.log
     warn "Check: systemctl status gpudev-tunnel"
 }
 
-CLIENT_ADD_USAGE="Usage: gpudev client add <name> [--variant cuda-dev] [--key \"<pubkey>\" | --key-file <path>]"
+CLIENT_ADD_USAGE="Usage: gpudev client add <name> [--variant cuda-dev] [--key \"<pubkey>\" | --key-file <path>] [--detach|--wait]"
 
 cmd_client_add() {
-    local name="" variant="default" ssh_key="" key_file=""
+    local name="" variant="default" ssh_key="" key_file="" want_wait=0 want_detach=0
     while [ $# -gt 0 ]; do
         case "$1" in
+            --wait)       want_wait=1; shift ;;
+            --detach)     want_detach=1; shift ;;
             --variant)    variant="${2:-}"; shift 2 ;;
             --variant=*)  variant="${1#*=}"; shift ;;
             # A public key is NOT a secret — it is the half meant to be
@@ -655,6 +685,40 @@ cmd_client_add() {
         *) fail "That does not look like an SSH public key. Expected a line starting
 with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-file." ;;
     esac
+
+    [ "$want_detach" = "1" ] && [ "$want_wait" = "1" ] \
+        && fail "--detach and --wait are contradictory."
+
+    # Detach only when this will actually be slow — a missing image, which is
+    # the one case that turns a ten-second command into a ~25-minute one. The
+    # check sits here, after the key is resolved and validated, because that is
+    # the point where nothing is left to prompt for: the detached copy gets the
+    # key as --key and needs no stdin.
+    #
+    # The re-run is a fresh `gpudev client add`, not a resumption; GPUDEV_IN_JOB
+    # stops that copy detaching again. It briefly waits on the lock this
+    # invocation still holds, which is the serialization working, not a hang.
+    # --wait is checked FIRST: it has to beat the automatic decision, or an
+    # operator who explicitly asked to watch the build gets detached anyway.
+    # It is also what the detached copy is launched with, so this is the guard
+    # that keeps GPUDEV_IN_JOB from being the only thing preventing recursion.
+    local want_bg=0
+    if [ "$want_wait" = "1" ]; then
+        want_bg=0
+    elif [ "$want_detach" = "1" ]; then
+        want_bg=1
+    elif ! docker_cmd image inspect "$(variant_image "$variant")" >/dev/null 2>&1; then
+        want_bg=1
+    fi
+    if should_detach "$want_bg"; then
+        echo ""
+        echo "The ${variant} image is not built yet, so this will take about 25 minutes."
+        detach_job add "$name" "about 25 minutes" \
+            gpudev client add "$name" --variant "$variant" --key "$ssh_key" --wait
+        echo "It will finish provisioning ${name} on its own, and 'gpudev status'"
+        echo "will show the %gpudev line to send back."
+        return 0
+    fi
 
     ensure_client_variant_image "$variant"
     GPUDEV_VARIANT="$variant" bash "$CLIENT_SETUP" "$name" "$ssh_key"
@@ -754,8 +818,22 @@ cmd_jobs() {
 
 # ── gpudev image build <variant> ──────────────────────────────────────────────
 
+IMAGE_USAGE="Usage: gpudev image [list|build <cuda-dev> [--detach|--wait]]"
+
 cmd_image() {
-    local sub="${1:-}" variant="${2:-}"
+    local sub="${1:-}" variant="" want_detach=0 want_wait=0
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --detach) want_detach=1; shift ;;
+            --wait)   want_wait=1; shift ;;
+            -*)       fail "Unknown option '$1'. $IMAGE_USAGE" ;;
+            *)        [ -z "$variant" ] && variant="$1" || fail "Unexpected argument '$1'."; shift ;;
+        esac
+    done
+    [ "$want_detach" = "1" ] && [ "$want_wait" = "1" ] \
+        && fail "--detach and --wait are contradictory."
+
     case "$sub" in
         build)
             [ -n "$variant" ] || fail "Usage: gpudev image build <default|cuda-dev>"
@@ -763,6 +841,13 @@ cmd_image() {
                 cuda-dev)
                     local setup="${REPO_DIR}/linux-setup.sh"
                     [ -f "$setup" ] || fail "linux-setup.sh not found at $setup (run: gpudev self-update)"
+                    # A build is the archetypal walk-away operation, so
+                    # --detach is honoured here before anything starts.
+                    if should_detach "$want_detach"; then
+                        detach_job build "$variant" "about 25 minutes, several GB" \
+                            gpudev image build "$variant" --wait
+                        return 0
+                    fi
                     echo "Building the cuda-dev image. This is several GB and takes a while."
                     bash "$setup" --build-cuda-dev
                     ;;
@@ -1181,12 +1266,14 @@ fi
     warn "  '$name' may not be fully ready. Check: gpudev client logs $name"
 }
 
-CLIENT_REBUILD_USAGE="Usage: gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev]"
+CLIENT_REBUILD_USAGE="Usage: gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev] [--detach|--wait]"
 
 cmd_client_rebuild() {
-    local target="" reset=0 want_variant=""
+    local target="" reset=0 want_variant="" want_detach=0 want_wait=0
     while [ $# -gt 0 ]; do
         case "$1" in
+            --detach)     want_detach=1; shift ;;
+            --wait)       want_wait=1; shift ;;
             --reset-venv) reset=1; shift ;;
             --variant)    want_variant="${2:-}"; shift 2 ;;
             --variant=*)  want_variant="${1#*=}"; shift ;;
@@ -1196,6 +1283,21 @@ cmd_client_rebuild() {
         esac
     done
     [ -n "$target" ] || fail "$CLIENT_REBUILD_USAGE"
+    [ "$want_detach" = "1" ] && [ "$want_wait" = "1" ] \
+        && fail "--detach and --wait are contradictory."
+
+    # Rebuilding every client is the case worth walking away from; one client
+    # is usually quick, but the flag is honoured either way.
+    if should_detach "$want_detach"; then
+        local eta="a few minutes"
+        [ "$target" != "--all" ] || eta="minutes per client"
+        local -a fwd=(client rebuild "$target" --wait)
+        [ "$reset" = "1" ] && fwd+=(--reset-venv)
+        [ -z "$want_variant" ] || fwd+=(--variant "$want_variant")
+        detach_job rebuild "${target#--}" "$eta" gpudev "${fwd[@]}"
+        return 0
+    fi
+
     if [ -n "$want_variant" ]; then
         case "$want_variant" in
             default|cuda-dev) ;;
@@ -3337,15 +3439,15 @@ Host:
 
 Clients:
   gpudev client list
-  gpudev client add <name> [--variant cuda-dev] [--key "<pubkey>" | --key-file <path>]
+  gpudev client add <name> [--variant cuda-dev] [--key "<pubkey>" | --key-file <path>] [--detach|--wait]
   gpudev client invite <name>
   gpudev image list
-  gpudev image build cuda-dev
+  gpudev image build cuda-dev [--detach|--wait]
   gpudev client remove <name> [--yes]
   gpudev client start <name>
   gpudev client stop <name>
   gpudev client restart <name>
-  gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev]
+  gpudev client rebuild <name|--all> [--reset-venv] [--variant default|cuda-dev] [--detach|--wait]
   gpudev client logs <name>
   gpudev client info <name>
 
@@ -3399,7 +3501,7 @@ main() {
         image)
             # Builds serialize with each other and with client mutations:
             # two concurrent builds only contend for the layer cache.
-            with_lock cmd_image "${2:-}" "${3:-}"
+            shift; with_lock cmd_image "$@"
             ;;
         client)
             case "${2:-}" in
