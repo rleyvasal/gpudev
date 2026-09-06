@@ -2157,12 +2157,43 @@ main() {
         exit 0
     fi
 
-    # Unattended runs must never be blocked by, or half-apply, sshd hardening.
-    if [ "${1:-}" = "--no-lockdown" ]; then
-        GPUDEV_NO_LOCKDOWN=1
-        export GPUDEV_NO_LOCKDOWN
-        shift
+    # Sub-entry point: build ONLY the base image. This is what
+    # `gpudev image build base` calls after install, and it is the whole reason
+    # the build can be detached at all — see the deferral note at Step 5.
+    if [ "${1:-}" = "--build-base" ]; then
+        assert_not_root
+        detect_environment
+        require_debian_family
+        ensure_docker_running
+        resolve_ml_stack
+        build_base_image
+        verify_torch_cuda
+        exit 0
     fi
+
+    # A loop rather than positional checks: with two flags, order-sensitive
+    # parsing silently ignores whichever came second, and a silently ignored
+    # --build-base-image would defer a build the operator asked to run inline.
+    GPUDEV_BUILD_BASE_INLINE=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # Unattended runs must never be blocked by, or half-apply, sshd
+            # hardening.
+            --no-lockdown)
+                GPUDEV_NO_LOCKDOWN=1
+                export GPUDEV_NO_LOCKDOWN
+                shift ;;
+            # The base image build is deferred to after the install by default;
+            # this forces the old inline behaviour for anyone who wants one
+            # command that ends with a usable host.
+            --build-base-image)
+                GPUDEV_BUILD_BASE_INLINE=1
+                shift ;;
+            *)
+                fail "Unknown option '$1'.
+Usage: linux-setup.sh [--no-lockdown] [--build-base-image]" ;;
+        esac
+    done
 
     assert_not_root
     assert_sudo
@@ -2198,11 +2229,25 @@ main() {
     step "gpudev Step 4b: Detect GPUs and resolve ML stack"
     resolve_ml_stack
 
-    step "gpudev Step 5: Build base image"
-    build_base_image
+    # Deferred by default. The build is the longest phase here (~13 min plus
+    # multi-GB downloads) and the one least able to survive a dropped
+    # connection — but inside the install it cannot be detached: the docker
+    # group is not active in this shell yet, so docker_probe falls back to
+    # `sudo docker`, and sudo needs a TTY. After the mandatory reconnect the
+    # group IS active, docker needs no sudo, and the same build detaches
+    # cleanly. Deferring it removes the blocker rather than working around it.
+    if [ "$GPUDEV_BUILD_BASE_INLINE" = "1" ]; then
+        step "gpudev Step 5: Build base image"
+        build_base_image
 
-    step "gpudev Step 5b: Verify torch CUDA"
-    verify_torch_cuda
+        step "gpudev Step 5b: Verify torch CUDA"
+        verify_torch_cuda
+    else
+        step "gpudev Step 5: Base image (deferred)"
+        log "Skipping the base image build so the install stays short and this"
+        log "session can end safely. It runs after you reconnect — see the"
+        log "closing note. Use --build-base-image to build it inline instead."
+    fi
 
     step "gpudev Step 6: Install cloudflared on host"
     install_cloudflared_host
@@ -2245,6 +2290,27 @@ main() {
         echo ""
         echo "NOTE: You were added to the docker group."
         echo "      Run 'newgrp docker' or re-login before using Docker without sudo."
+    fi
+
+    # Say this loudly: the install finished but the host cannot take clients
+    # yet, and that is surprising unless it is stated plainly.
+    if [ "$GPUDEV_BUILD_BASE_INLINE" != "1" ]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════════"
+        echo "One step left: the base image is NOT built yet, so 'gpudev client"
+        echo "add' will refuse until it is. Reconnect (the SSH port changed and"
+        echo "the docker group needs a fresh session), then run:"
+        echo ""
+        echo "    gpudev image build base --detach"
+        echo ""
+        echo "It takes ~13 minutes and runs in the background, so you can"
+        echo "disconnect. Building cuda-dev now too is worth it if profiling"
+        echo "clients are coming — it saves the FIRST user a 25-minute wait:"
+        echo ""
+        echo "    gpudev image build cuda-dev --detach"
+        echo ""
+        echo "'gpudev status' shows progress and results."
+        echo "═══════════════════════════════════════════════════════════════════"
     fi
 
     if [ "$NEED_HOST_TUNNEL_RESTART" -eq 1 ]; then

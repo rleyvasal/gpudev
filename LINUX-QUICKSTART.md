@@ -382,7 +382,52 @@ ssh gpudev
 
 ---
 
-## 8. Confirm the install is healthy
+## 8. Build the images
+
+`linux-setup.sh` deliberately does **not** build the base image. That build is
+the longest phase of the install and the one least able to survive a dropped
+connection — and inside the installer it cannot run in the background, because
+the docker group is not active in that shell yet so every docker call needs
+`sudo`, which needs a TTY. After the reconnect you just did, the group is
+active, docker needs no sudo, and the same build detaches cleanly.
+
+So it runs now, in the background:
+
+```bash
+gpudev image build base --detach
+```
+
+**Until it finishes, `gpudev client add` will refuse** — that is expected, and
+it says so. It takes around 13 minutes and you can disconnect.
+
+If any client will need `nvcc`, `ncu`, `nsys` or TensorRT, build that image
+now too:
+
+```bash
+gpudev image build cuda-dev --detach
+```
+
+Doing it here rather than later matters: a `client add --variant cuda-dev` on a
+host without that image builds it on the spot, so the **first user to ask**
+waits 25 minutes for the line that finishes their setup — a cost that has
+nothing to do with them. Builds serialize, so starting both is fine; the second
+queues.
+
+Watch either with:
+
+```bash
+gpudev jobs
+```
+
+Both images should read `built` before you onboard anyone:
+
+```bash
+gpudev image list
+```
+
+---
+
+## 9. Confirm the install is healthy
 
 ```bash
 gpudev status

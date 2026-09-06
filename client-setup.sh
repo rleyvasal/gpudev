@@ -105,7 +105,14 @@ validate_public_key() {
 require_host_setup() {
     [ -f "$HOST_CONFIG" ] || fail "Host not set up. Run linux-setup.sh first."
     [ -f "$CLIENTS_CONFIG" ] || fail "clients.json missing. Run linux-setup.sh first."
-    docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || fail "Base image '$BASE_IMAGE' not found. Run linux-setup.sh first."
+    # linux-setup.sh defers this build, so "run linux-setup.sh first" became
+    # wrong advice — it already ran, and re-running it would not build the
+    # image either. Distinguish "never installed" (host.json absent, handled
+    # above) from "installed, image not built yet" and name the real remedy.
+    docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || fail "The base image '$BASE_IMAGE' is not built yet.
+
+Build it first:  gpudev image build base --detach
+Progress:        gpudev status"
     command_exists cloudflared || fail "cloudflared not found. Run linux-setup.sh first."
 }
 

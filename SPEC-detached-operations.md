@@ -1,12 +1,10 @@
 # Spec — detached admin operations
 
-Status: PHASES 1 AND 2 IMPLEMENTED — locking, `run_detached`, `gpudev jobs`,
-the dashboard Jobs section, `--detach`/`--wait` on `image build` and
-`client rebuild`, and `client add`'s automatic detach, with 24 tests in
-`tests/test_jobs.py`. Phase 3 (defer the base image build) is not started.
-The detach *decision* is covered against a stubbed systemd; `systemd-run`
-itself has never executed, because the Mac the suite runs on has neither
-systemd nor flock.
+Status: IMPLEMENTED — all three phases, with 33 tests in
+`tests/test_jobs.py`. Decisions and wiring are covered against a stubbed
+systemd; **`systemd-run` itself has never executed**, because the Mac the suite
+runs on has neither systemd nor flock. A real detached job, a deferred install,
+and `gpudev image build base` all still need a run on the host.
 Scope: `gpudev` (`image build`, `client add`, `client rebuild`, `status`, new
 `jobs`), `client-setup.sh` (locking, base-image message), `linux-setup.sh`
 (defer the base image build; tmux hint), `README.md`, `LINUX-QUICKSTART.md`.
@@ -278,9 +276,10 @@ being confusing:
 - Step 5b (verify torch CUDA) depends on the image, so it moves into the build
   job rather than staying in the installer.
 
-Whether the deferral is the default or an opt-in `--defer-base-image` is worth
-deciding when implementing: the default is friendlier to a remote operator, and
-worse for someone who wants one command that ends with a working host.
+**Decided: deferred by default**, with `--build-base-image` forcing the old
+inline behaviour. The remote-operator case is the one this project is built
+around, and deferring lets lockdown finish while the operator is present rather
+than competing with a 13-minute build.
 
 #### Prewarming is the administrator's job, and it moves the wait off the user
 

@@ -303,7 +303,13 @@ ensure_client_variant_image() {
     fi
 
     if [ "$variant" != "cuda-dev" ]; then
-        fail "Base image '$image' not found. Run linux-setup.sh first."
+        # The install defers this build, so "run linux-setup.sh" would be wrong
+        # advice — it already ran. Name the command that actually fixes it.
+        fail "The base image is not built yet. Build it first:
+
+    gpudev image build base --detach
+
+'gpudev status' will show when it finishes."
     fi
 
     setup="${REPO_DIR}/linux-setup.sh"
@@ -818,7 +824,7 @@ cmd_jobs() {
 
 # ── gpudev image build <variant> ──────────────────────────────────────────────
 
-IMAGE_USAGE="Usage: gpudev image [list|build <cuda-dev> [--detach|--wait]]"
+IMAGE_USAGE="Usage: gpudev image [list|build <base|cuda-dev> [--detach|--wait]]"
 
 cmd_image() {
     local sub="${1:-}" variant="" want_detach=0 want_wait=0
@@ -836,7 +842,7 @@ cmd_image() {
 
     case "$sub" in
         build)
-            [ -n "$variant" ] || fail "Usage: gpudev image build <default|cuda-dev>"
+            [ -n "$variant" ] || fail "Usage: gpudev image build <base|cuda-dev> [--detach|--wait]"
             case "$variant" in
                 cuda-dev)
                     local setup="${REPO_DIR}/linux-setup.sh"
@@ -851,10 +857,20 @@ cmd_image() {
                     echo "Building the cuda-dev image. This is several GB and takes a while."
                     bash "$setup" --build-cuda-dev
                     ;;
-                default)
-                    fail "The default image is built by linux-setup.sh. Re-run it to rebuild."
+                base|default)
+                    local setup="${REPO_DIR}/linux-setup.sh"
+                    [ -f "$setup" ] || fail "linux-setup.sh not found at $setup (run: gpudev self-update)"
+                    # The install defers this build, so it has to be buildable
+                    # here — this is the command its closing note names.
+                    if should_detach "$want_detach"; then
+                        detach_job build base "about 13 minutes" \
+                            gpudev image build base --wait
+                        return 0
+                    fi
+                    echo "Building the base image. This takes around 13 minutes."
+                    bash "$setup" --build-base
                     ;;
-                *) fail "Unknown variant '$variant'. Known variants: cuda-dev." ;;
+                *) fail "Unknown variant '$variant'. Known variants: base, cuda-dev." ;;
             esac
             ;;
         list|"")
@@ -869,6 +885,7 @@ cmd_image() {
                 fi
             done
             echo ""
+            echo "  gpudev image build base       the standard image (required)"
             echo "  gpudev image build cuda-dev   CUDA 12.8 devel + nvcc/ncu/nsys + TensorRT"
             ;;
         *) fail "Usage: gpudev image [list|build <variant>]" ;;
@@ -3442,7 +3459,7 @@ Clients:
   gpudev client add <name> [--variant cuda-dev] [--key "<pubkey>" | --key-file <path>] [--detach|--wait]
   gpudev client invite <name>
   gpudev image list
-  gpudev image build cuda-dev [--detach|--wait]
+  gpudev image build <base|cuda-dev> [--detach|--wait]
   gpudev client remove <name> [--yes]
   gpudev client start <name>
   gpudev client stop <name>

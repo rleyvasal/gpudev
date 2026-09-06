@@ -314,3 +314,97 @@ class DetachDecisionTests(JobsTestCase):
                                    capture_output=True, text=True)
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("contradictory", r.stderr)
+
+
+class DeferredBaseImageTests(unittest.TestCase):
+    """The install defers its base image build so it can be detached at all.
+
+    Inside the installer the docker group is not active yet, so docker_probe
+    falls back to `sudo docker` and sudo needs a TTY. After the mandatory
+    reconnect the group is active and the same build needs no sudo.
+    """
+
+    SETUP = REPO_ROOT / "linux-setup.sh"
+
+    def test_install_skips_the_build_unless_asked(self):
+        source = self.SETUP.read_text()
+        self.assertIn('if [ "$GPUDEV_BUILD_BASE_INLINE" = "1" ]; then', source)
+        self.assertIn("gpudev Step 5: Base image (deferred)", source)
+        self.assertIn("--build-base-image)", source)
+
+    def test_there_is_a_sub_entry_point_to_build_it_later(self):
+        # `gpudev image build base` needs something to call.
+        source = self.SETUP.read_text()
+        self.assertIn('"${1:-}" = "--build-base"', source)
+        # Step 5b moves with it; the verification is useless without the image.
+        entry = source[source.index('"${1:-}" = "--build-base"'):]
+        entry = entry[:entry.index("--no-lockdown")]
+        self.assertIn("build_base_image", entry)
+        self.assertIn("verify_torch_cuda", entry)
+
+    def test_the_closing_note_names_the_command_and_the_consequence(self):
+        source = self.SETUP.read_text()
+        self.assertIn("gpudev image build base --detach", source)
+        self.assertIn("is NOT built yet", source)
+
+    def test_gpudev_can_build_the_base_image(self):
+        source = (REPO_ROOT / "gpudev").read_text()
+        self.assertIn("bash \"$setup\" --build-base", source)
+        # The old refusal would strand a host installed with the new default.
+        self.assertNotIn("The default image is built by linux-setup.sh", source)
+
+    def test_missing_base_image_advice_is_actionable(self):
+        # For a missing base image, "Run linux-setup.sh first" became wrong: it
+        # already ran, and running it again would not build the image either.
+        for path in (REPO_ROOT / "gpudev", REPO_ROOT / "client-setup.sh"):
+            with self.subTest(path=path.name):
+                source = path.read_text()
+                self.assertNotIn("Base image '$BASE_IMAGE' not found", source)
+                self.assertNotIn("Base image '$image' not found", source)
+                self.assertIn("gpudev image build base --detach", source)
+
+    def test_never_installed_still_says_to_run_the_installer(self):
+        # The other half of the distinction: a host with no host.json really
+        # does need linux-setup.sh, and that advice must survive.
+        source = (REPO_ROOT / "client-setup.sh").read_text()
+        self.assertIn('Host not set up. Run linux-setup.sh first.', source)
+
+
+class PrewarmDocsTests(unittest.TestCase):
+    def test_guides_tell_the_admin_to_build_images_after_installing(self):
+        # A build should be paid at an idle moment by the administrator, never
+        # by the first user waiting on the line that finishes their onboarding.
+        for doc in ("README.md", "LINUX-QUICKSTART.md"):
+            with self.subTest(doc=doc):
+                text = (REPO_ROOT / doc).read_text()
+                self.assertIn("gpudev image build base --detach", text)
+                self.assertIn("gpudev image build cuda-dev --detach", text)
+                self.assertIn("client add", text)
+
+
+class InstallerFlagTests(unittest.TestCase):
+    SETUP = REPO_ROOT / "linux-setup.sh"
+
+    def run_setup(self, *args):
+        return subprocess.run(
+            ["bash", str(self.SETUP), *args], capture_output=True, text=True
+        )
+
+    def test_flags_are_accepted_in_either_order(self):
+        # Positional parsing silently ignored whichever flag came second, and a
+        # silently ignored --build-base-image would defer a build the operator
+        # asked to run inline.
+        for args in (
+            ["--no-lockdown"],
+            ["--build-base-image"],
+            ["--no-lockdown", "--build-base-image"],
+            ["--build-base-image", "--no-lockdown"],
+        ):
+            with self.subTest(args=args):
+                # Stops at a later precondition (sudo/OS), never at parsing.
+                self.assertNotIn("Unknown option", self.run_setup(*args).stderr)
+
+    def test_an_unknown_flag_is_refused(self):
+        result = self.run_setup("--bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown option", result.stderr)

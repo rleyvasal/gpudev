@@ -344,6 +344,35 @@ bash <(curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpudev/main/linux-
 >
 > Developing on the host (rare)? `git clone https://github.com/rleyvasal/gpudev.git ~/gpudev` and run from there — `linux-setup.sh` detects the git checkout and skips the curl-downloads.
 
+#### B.2b — Build the images afterwards
+
+The installer deliberately **does not build the base image**. That build is its
+longest phase and the one least able to survive a dropped connection, and
+inside the installer it cannot be backgrounded: the docker group is not active
+in that shell yet, so docker calls fall back to `sudo`, which needs a TTY.
+After the reconnect the install requires anyway, the group is active, docker
+needs no sudo, and the same build detaches cleanly.
+
+So when the install finishes, reconnect and run:
+
+```bash
+gpudev image build base --detach        # ~13 min, required
+gpudev image build cuda-dev --detach    # optional; do it now if profiling clients are coming
+gpudev jobs                             # progress
+gpudev image list                       # both should read "built" before onboarding anyone
+```
+
+**`gpudev client add` refuses until the base image exists**, and says so.
+
+Prewarming `cuda-dev` matters more than it looks: without it, the first
+`client add --variant cuda-dev` builds the image on the spot, so the **first
+user to ask** waits 25 minutes for the line that completes their setup — a cost
+that has nothing to do with them. Builds serialize, so starting both at once is
+fine.
+
+`--build-base-image` passed to `linux-setup.sh` restores the old inline
+behaviour for anyone who wants one command that ends with a usable host.
+
 #### B.3 — What the script does
 
 In order:
