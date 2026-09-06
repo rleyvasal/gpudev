@@ -52,6 +52,24 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 GPUDEV_LOCK="${CONFIG_DIR}/.lock"
 GPUDEV_LOCK_WAIT="${GPUDEV_LOCK_WAIT:-1800}"
 
+# Acquire the lock for the rest of this process. Commands call it themselves,
+# AFTER deciding whether they are going to do the work or merely launch it:
+# a launcher that took the lock would block for the length of the build it just
+# started, so `image build cuda-dev --detach` would appear to hang for 13
+# minutes behind `image build base --detach`. Held until exit; the kernel
+# releases it if the process dies.
+take_lock() {
+    if ! command_exists flock; then
+        [ -n "${GPUDEV_LOCK_WARNED:-}" ] || warn "flock unavailable — concurrent gpudev commands are not serialized."
+        GPUDEV_LOCK_WARNED=1
+        return 0
+    fi
+    mkdir -p "$CONFIG_DIR"
+    exec 9>>"$GPUDEV_LOCK" || fail "Cannot open the gpudev lock at ${GPUDEV_LOCK}."
+    flock -w "$GPUDEV_LOCK_WAIT" 9 || fail "Another gpudev operation still holds the lock after ${GPUDEV_LOCK_WAIT}s.
+Check what is running:  gpudev jobs"
+}
+
 with_lock() {
     # Absent on macOS, where the test suite runs. Degrade loudly rather than
     # refusing: the guarantee is for the Linux host, and pretending to hold a
@@ -748,6 +766,7 @@ with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-
         return 0
     fi
 
+    take_lock
     ensure_client_variant_image "$variant"
     GPUDEV_VARIANT="$variant" bash "$CLIENT_SETUP" "$name" "$ssh_key"
 
@@ -876,6 +895,7 @@ cmd_image() {
                             image build "$variant" --wait
                         return 0
                     fi
+                    take_lock
                     echo "Building the cuda-dev image. This is several GB and takes a while."
                     bash "$setup" --build-cuda-dev
                     ;;
@@ -889,6 +909,7 @@ cmd_image() {
                             image build base --wait
                         return 0
                     fi
+                    take_lock
                     echo "Building the base image. This takes around 13 minutes."
                     bash "$setup" --build-base
                     ;;
@@ -1336,6 +1357,8 @@ cmd_client_rebuild() {
         detach_job rebuild "${target#--}" "$eta" "${fwd[@]}"
         return 0
     fi
+
+    take_lock
 
     if [ -n "$want_variant" ]; then
         case "$want_variant" in
@@ -3540,18 +3563,18 @@ main() {
         image)
             # Builds serialize with each other and with client mutations:
             # two concurrent builds only contend for the layer cache.
-            shift; with_lock cmd_image "$@"
+            shift; cmd_image "$@"
             ;;
         client)
             case "${2:-}" in
                 list)    cmd_client_list ;;
-                add)     shift 2; with_lock cmd_client_add "$@" ;;
+                add)     shift 2; cmd_client_add "$@" ;;
                 invite)  cmd_client_invite "${3:-}" ;;
                 remove)  with_lock cmd_client_remove "${3:-}" "${4:-}" ;;
                 start)   cmd_client_start "${3:-}" ;;
                 stop)    cmd_client_stop "${3:-}" ;;
                 restart) cmd_client_restart "${3:-}" ;;
-                rebuild) shift 2; with_lock cmd_client_rebuild "$@" ;;
+                rebuild) shift 2; cmd_client_rebuild "$@" ;;
                 logs)    cmd_client_logs "${3:-}" ;;
                 info)    cmd_client_info "${3:-}" ;;
                 *)       usage; exit 1 ;;

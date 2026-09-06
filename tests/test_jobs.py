@@ -173,18 +173,28 @@ class DashboardTests(JobsTestCase):
 
 
 class LockTests(JobsTestCase):
-    def test_mutating_commands_are_wrapped_in_the_lock(self):
+    def test_mutating_commands_take_the_lock(self):
         # Detaching removes the accidental serialization that came from the
-        # operator waiting, so every mutating dispatch must take the lock.
+        # operator waiting, so every mutation must serialize.
         source = GPUDEV.read_text()
-        for dispatch in (
-            "add)     shift 2; with_lock cmd_client_add",
-            "remove)  with_lock cmd_client_remove",
-            "rebuild) shift 2; with_lock cmd_client_rebuild",
-            "with_lock cmd_image",
+        self.assertIn("remove)  with_lock cmd_client_remove", source)
+        # The three that can detach lock themselves, past the detach decision.
+        self.assertGreaterEqual(source.count("\n    take_lock"), 2)
+        self.assertGreaterEqual(source.count("take_lock\n"), 4)
+
+    def test_a_launcher_does_not_hold_the_lock_it_just_handed_off(self):
+        # Locking at dispatch meant `image build cuda-dev --detach` blocked
+        # behind the 13-minute build that `image build base --detach` had just
+        # started — the launcher waiting for the work it delegated. Launchers
+        # must return immediately.
+        source = GPUDEV.read_text()
+        for dispatched in (
+            "shift; with_lock cmd_image",
+            "shift 2; with_lock cmd_client_add",
+            "shift 2; with_lock cmd_client_rebuild",
         ):
-            with self.subTest(dispatch=dispatch):
-                self.assertIn(dispatch, source)
+            with self.subTest(dispatched=dispatched):
+                self.assertNotIn(dispatched, source)
 
     def test_read_only_commands_do_not_take_the_lock(self):
         source = GPUDEV.read_text()
