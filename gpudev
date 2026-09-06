@@ -66,8 +66,17 @@ take_lock() {
     fi
     mkdir -p "$CONFIG_DIR"
     exec 9>>"$GPUDEV_LOCK" || fail "Cannot open the gpudev lock at ${GPUDEV_LOCK}."
-    flock -w "$GPUDEV_LOCK_WAIT" 9 || fail "Another gpudev operation still holds the lock after ${GPUDEV_LOCK_WAIT}s.
+
+    # Say so before blocking. Two queued jobs both report ActiveState=active,
+    # because systemd only knows the process exists — so a job waiting its turn
+    # looks identical to one doing work, and silence for 13 minutes reads as a
+    # stall. This line lands in the journal, so `gpudev jobs logs` shows the
+    # difference immediately.
+    if ! flock -n 9; then
+        echo "Waiting for another gpudev operation to finish (see: gpudev jobs)..."
+        flock -w "$GPUDEV_LOCK_WAIT" 9 || fail "Another gpudev operation still holds the lock after ${GPUDEV_LOCK_WAIT}s.
 Check what is running:  gpudev jobs"
+    fi
 }
 
 with_lock() {

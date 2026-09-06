@@ -214,6 +214,15 @@ class LockTests(JobsTestCase):
         # Degraded, not disabled: the command still reached its real work.
         self.assertIn("not found", result.stderr)
 
+    def test_waiting_for_the_lock_announces_itself(self):
+        # Two queued jobs both report ActiveState=active — systemd only knows
+        # the process exists — so a job waiting its turn is indistinguishable
+        # from one doing work, and silence reads as a stall. Observed with two
+        # real builds on the host.
+        source = GPUDEV.read_text()
+        self.assertIn("flock -n 9", source)
+        self.assertIn("Waiting for another gpudev operation", source)
+
     def test_lock_degradation_is_a_warning_not_a_refusal(self):
         source = GPUDEV.read_text()
         self.assertIn("flock unavailable", source)
