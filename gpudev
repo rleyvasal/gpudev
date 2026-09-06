@@ -904,7 +904,13 @@ cmd_image() {
                             image build "$variant" --wait
                         return 0
                     fi
-                    take_lock
+                    # No lock. Measured on a 24-core host: one build used
+                    # 0.2% CPU, 58 Mbps of a 1 Gbps link and 31 MB/s of an
+                    # NVMe — nothing near saturation, because the work is
+                    # upstream download latency. Serializing them cost ~13
+                    # minutes and bought nothing. The one genuinely shared
+                    # thing, the requirements files, is written atomically by
+                    # write_base_requirements instead.
                     echo "Building the cuda-dev image. This is several GB and takes a while."
                     bash "$setup" --build-cuda-dev
                     ;;
@@ -918,7 +924,7 @@ cmd_image() {
                             image build base --wait
                         return 0
                     fi
-                    take_lock
+                    # No lock — see the cuda-dev branch above.
                     echo "Building the base image. This takes around 13 minutes."
                     bash "$setup" --build-base
                     ;;

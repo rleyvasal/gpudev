@@ -463,13 +463,24 @@ write_base_requirements() {
     # this host's GPUs/driver and turns it into a fully pinned pylock.toml.
     # Do NOT pin numpy here — torch pulls a compatible numpy (often 2.x).
     # numba must support that numpy: 0.60.x only allows numpy<2.1 → use >=0.61.
+    #
+    # Written atomically. Both the base and cuda-dev builds call this, and
+    # `cat > file` truncates before writing — so a build reading these while
+    # the other rewrote them could see a partial file. The content is identical
+    # either way, which makes the failure rare, intermittent and baffling.
+    # temp + rename means a reader sees the whole old file or the whole new
+    # one, and nothing in between. This is what lets the two builds run
+    # concurrently without a lock between them.
     mkdir -p "$CONFIG_DIR"
-    cat > "$TORCH_INPUT" <<'REQ'
+    local tmp_torch tmp_base
+    tmp_torch="$(mktemp "${CONFIG_DIR}/.requirements-torch.in.XXXXXX")"
+    tmp_base="$(mktemp "${CONFIG_DIR}/.requirements-base.txt.XXXXXX")"
+    cat > "$tmp_torch" <<'REQ'
 torch
 torchvision
 torchaudio
 REQ
-    cat > "${CONFIG_DIR}/requirements-base.txt" <<'REQ'
+    cat > "$tmp_base" <<'REQ'
 ipykernel==6.29.5
 jupyter_client==8.6.3
 # numpy: left unpinned — already installed by the torch layer
@@ -489,6 +500,8 @@ requests>=2.32.0
 transformers>=4.46.0,<4.50
 datasets>=3.0.0,<3.3
 REQ
+    mv -f "$tmp_torch" "$TORCH_INPUT"
+    mv -f "$tmp_base" "${CONFIG_DIR}/requirements-base.txt"
     log "Wrote ML requirements intent to ${TORCH_INPUT} and requirements-base.txt"
 }
 

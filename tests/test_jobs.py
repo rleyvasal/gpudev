@@ -173,14 +173,23 @@ class DashboardTests(JobsTestCase):
 
 
 class LockTests(JobsTestCase):
-    def test_mutating_commands_take_the_lock(self):
-        # Detaching removes the accidental serialization that came from the
-        # operator waiting, so every mutation must serialize.
+    def test_client_mutations_serialize_but_image_builds_do_not(self):
+        # Client mutations walk clients.json, the ingress and the connector,
+        # none of which tolerate two writers. Image builds share only the
+        # requirements files, which are written atomically — and measurement
+        # showed they contend for no resource worth serializing over.
         source = GPUDEV.read_text()
         self.assertIn("remove)  with_lock cmd_client_remove", source)
-        # The three that can detach lock themselves, past the detach decision.
-        self.assertGreaterEqual(source.count("\n    take_lock"), 2)
-        self.assertGreaterEqual(source.count("take_lock\n"), 4)
+
+        def body(fn):
+            start = source.index(f"{fn}() {{")
+            return source[start:source.index("\n}\n", start)]
+
+        for fn in ("cmd_client_add", "cmd_client_rebuild"):
+            with self.subTest(locks=fn):
+                self.assertIn("\n    take_lock", body(fn))
+        with self.subTest(does_not_lock="cmd_image"):
+            self.assertNotIn("take_lock", body("cmd_image"))
 
     def test_a_launcher_does_not_hold_the_lock_it_just_handed_off(self):
         # Locking at dispatch meant `image build cuda-dev --detach` blocked
@@ -213,6 +222,21 @@ class LockTests(JobsTestCase):
         self.assertIn("flock unavailable", result.stderr)
         # Degraded, not disabled: the command still reached its real work.
         self.assertIn("not found", result.stderr)
+
+    def test_image_builds_do_not_serialize(self):
+        # Measured on the host: one build used 0.2% of 24 cores, 58 Mbps of a
+        # 1 Gbps link, 31 MB/s of an NVMe. Nothing was near saturation, so
+        # serializing builds cost ~13 minutes and bought nothing. The shared
+        # requirements files are made safe by atomic writes instead.
+        source = GPUDEV.read_text()
+        build_branch = source[source.index("Building the base image"):]
+        self.assertNotIn("take_lock", build_branch[:400])
+        setup = (REPO_ROOT / "linux-setup.sh").read_text()
+        body = setup[setup.index("write_base_requirements() {"):]
+        body = body[:body.index("\ndetect_gpu_inventory")]
+        # temp + rename, never a truncating `cat >` onto the live path.
+        self.assertIn('mv -f "$tmp_torch" "$TORCH_INPUT"', body)
+        self.assertNotIn('cat > "$TORCH_INPUT"', body)
 
     def test_waiting_for_the_lock_announces_itself(self):
         # Two queued jobs both report ActiveState=active — systemd only knows
