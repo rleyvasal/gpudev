@@ -40,6 +40,132 @@ repo_sha() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ── Serialization ─────────────────────────────────────────────────────────────
+# Every mutation touches the same three things in sequence: clients.json, the
+# ingress config.yml, and the tunnel connector. Nothing guarded them, which was
+# survivable only because the operator waited for each command to finish —
+# detached jobs remove that accidental serialization, so the lock has to exist
+# before anything runs in the background.
+#
+# flock is used rather than a mkdir lock because the kernel releases it when
+# the holder exits: a job killed mid-build leaves no stale lock to reap.
+GPUDEV_LOCK="${CONFIG_DIR}/.lock"
+GPUDEV_LOCK_WAIT="${GPUDEV_LOCK_WAIT:-1800}"
+
+with_lock() {
+    # Absent on macOS, where the test suite runs. Degrade loudly rather than
+    # refusing: the guarantee is for the Linux host, and pretending to hold a
+    # lock would be worse than saying it is not held.
+    if ! command_exists flock; then
+        [ -n "${GPUDEV_LOCK_WARNED:-}" ] || warn "flock unavailable — concurrent gpudev commands are not serialized."
+        GPUDEV_LOCK_WARNED=1
+        "$@"
+        return $?
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    local rc=0
+    exec 9>>"$GPUDEV_LOCK" || fail "Cannot open the gpudev lock at ${GPUDEV_LOCK}."
+    if ! flock -w "$GPUDEV_LOCK_WAIT" 9; then
+        exec 9>&-
+        fail "Another gpudev operation still holds the lock after ${GPUDEV_LOCK_WAIT}s.
+Check what is running:  gpudev jobs"
+    fi
+    "$@" || rc=$?
+    exec 9>&-
+    return "$rc"
+}
+
+# ── Background jobs ───────────────────────────────────────────────────────────
+# Long operations (image builds, and a client add that has to build one) must
+# survive the operator disconnecting. systemd-run --user is used rather than
+# nohup: lingering is already enabled at install, output lands in the journal
+# on its own, and the exit status is retained. It is the same mechanism the
+# power scheduler already uses.
+#
+# The result is ALSO written to a small JSON file. The journal has the logs,
+# but what the operator actually needs on return is a value — the %gpudev line
+# to send back to a user — and a structured value should not have to be
+# recovered by grepping log text. Files also outlive a reboot or a user-manager
+# restart, which transient units do not.
+GPUDEV_JOBS_DIR="${CONFIG_DIR}/jobs"
+
+jobs_supported() {
+    command_exists systemd-run && command_exists systemctl
+}
+
+job_unit_name() {
+    printf 'gpudev-job-%s-%s-%s' "$1" "$(sanitize_client_name "${2:-host}")" "$(date +%s)"
+}
+
+# run_detached <verb> <target> <command...>
+run_detached() {
+    local verb="$1" target="$2"; shift 2
+    local unit gpudev_bin
+    unit="$(job_unit_name "$verb" "$target")"
+    gpudev_bin="${HOME}/bin/gpudev"
+    [ -x "$gpudev_bin" ] || gpudev_bin="$(realpath "${BASH_SOURCE[0]}")"
+
+    mkdir -p "$GPUDEV_JOBS_DIR"
+    systemd-run --user \
+        --unit "$unit" \
+        --collect \
+        --setenv=GPUDEV_IN_JOB=1 \
+        "$gpudev_bin" job-exec "$unit" "$@" >/dev/null \
+        || fail "Could not start the background job. Is the user systemd manager running?"
+
+    printf '%s' "$unit"
+}
+
+# Internal. Runs the real command, then records how it went.
+cmd_job_exec() {
+    local unit="${1:-}"; shift || true
+    [ -n "$unit" ] || fail "job-exec needs a unit name."
+    [ $# -gt 0 ] || fail "job-exec needs a command."
+
+    local started out rc=0 summary=""
+    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    out="$(mktemp)"
+
+    # errexit + pipefail would abort here the moment the job fails, skipping
+    # write_job_result — losing the record for exactly the case an operator
+    # most needs to find on their return.
+    set +e
+    "$@" 2>&1 | tee "$out"
+    rc="${PIPESTATUS[0]}"
+    set -e
+
+    # The one line a returning operator has to act on.
+    summary="$(grep -oE '%gpudev [A-Za-z0-9_.-]+( --hostname [A-Za-z0-9.-]+)?' "$out" | tail -1 || true)"
+    write_job_result "$unit" "$rc" "$started" "$summary" "$*"
+    rm -f "$out"
+    return "$rc"
+}
+
+write_job_result() {
+    local unit="$1" rc="$2" started="$3" summary="$4" command="$5"
+    mkdir -p "$GPUDEV_JOBS_DIR"
+    UNIT="$unit" RC="$rc" STARTED="$started" SUMMARY="$summary" COMMAND="$command" \
+    OUT="${GPUDEV_JOBS_DIR}/${unit}.json" python3 -c '
+import json, os, datetime
+json.dump({
+    "unit":     os.environ["UNIT"],
+    "command":  os.environ["COMMAND"],
+    "started":  os.environ["STARTED"],
+    "finished": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "exit":     int(os.environ["RC"]),
+    "summary":  os.environ["SUMMARY"],
+}, open(os.environ["OUT"], "w"), indent=2)
+' 2>/dev/null || warn "Could not record the result for ${unit}."
+}
+
+# Units systemd currently knows about, running or not.
+job_active_units() {
+    jobs_supported || return 0
+    systemctl --user list-units --all --no-legend --plain 'gpudev-job-*' 2>/dev/null \
+        | awk '{print $1}' | sed 's/\.service$//' | grep -v '^$' || true
+}
+
 sanitize_client_name() {
     printf '%s' "$1" \
       | tr '[:upper:]' '[:lower:]' \
@@ -544,6 +670,86 @@ with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-
         echo "  %gpudev ${name} --hostname ${name}.${cf_domain}"
         echo ""
     fi
+}
+
+# ── gpudev jobs ───────────────────────────────────────────────────────────────
+
+job_result_files() {
+    [ -d "$GPUDEV_JOBS_DIR" ] || return 0
+    ls -1t "$GPUDEV_JOBS_DIR"/gpudev-job-*.json 2>/dev/null || true
+}
+
+# Finished jobs, newest first: "unit<TAB>exit<TAB>finished<TAB>summary"
+job_finished_rows() {
+    local limit="${1:-10}" f
+    job_result_files | head -n "$limit" | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        F="$f" python3 -c '
+import json, os, sys
+try:
+    d = json.load(open(os.environ["F"]))
+except Exception:
+    sys.exit(0)
+print("\t".join([d.get("unit",""), str(d.get("exit","?")),
+                 d.get("finished",""), d.get("summary","")]))
+' 2>/dev/null || true
+    done
+}
+
+cmd_jobs() {
+    local sub="${1:-list}" unit="${2:-}"
+    case "$sub" in
+        list|"")
+            local running finished
+            running="$(job_active_units)"
+            echo "Running:"
+            if ! jobs_supported; then
+                # Recorded results are files, so they still list here; only the
+                # running set needs systemd.
+                echo "  (systemd not available — nothing can run detached here)"
+            elif [ -z "$running" ]; then
+                echo "  None."
+            else
+                while IFS= read -r u; do
+                    [ -n "$u" ] || continue
+                    printf '  %-44s %s\n' "$u" "$(systemctl --user show "$u" --property=ActiveState --value 2>/dev/null)"
+                done <<< "$running"
+            fi
+
+            echo ""
+            echo "Finished:"
+            finished="$(job_finished_rows 10)"
+            if [ -z "$finished" ]; then
+                echo "  None recorded."
+            else
+                while IFS="$(printf '\t')" read -r u rc when summary; do
+                    [ -n "$u" ] || continue
+                    if [ "$rc" = "0" ]; then
+                        printf '  %-44s OK        %s\n' "$u" "$when"
+                    else
+                        printf '  %-44s FAILED(%s) %s\n' "$u" "$rc" "$when"
+                    fi
+                    [ -z "$summary" ] || printf '      → %s\n' "$summary"
+                done <<< "$finished"
+            fi
+            echo ""
+            echo "  gpudev jobs logs <unit>     full output"
+            echo "  gpudev jobs cancel <unit>   stop a running job"
+            ;;
+        logs)
+            [ -n "$unit" ] || fail "Usage: gpudev jobs logs <unit>"
+            command_exists journalctl || fail "journalctl not available on this host."
+            journalctl --user -u "$unit" --no-pager
+            ;;
+        cancel)
+            [ -n "$unit" ] || fail "Usage: gpudev jobs cancel <unit>"
+            jobs_supported || fail "Background jobs need systemd on this host."
+            systemctl --user stop "$unit" 2>/dev/null \
+                || fail "No running job named '${unit}'. See: gpudev jobs"
+            echo "Cancelled: ${unit}"
+            ;;
+        *) fail "Usage: gpudev jobs [list|logs <unit>|cancel <unit>]" ;;
+    esac
 }
 
 # ── gpudev image build <variant> ──────────────────────────────────────────────
@@ -1217,6 +1423,38 @@ cmd_kernel() {
 # Single-screen dashboard: platform, GPU, clients, tunnel, command cheat sheet.
 # Designed to auto-run on interactive SSH login so the admin never has to recall
 # which subcommand shows what. All read-only; safe to run anytime.
+# Running jobs, plus any that finished since the operator last looked. Silent
+# when there is nothing to report, so the dashboard does not grow a permanently
+# empty heading.
+status_jobs_section() {
+    local running finished
+    running="$(job_active_units)"
+    finished="$(job_finished_rows 3)"
+    [ -n "$running" ] || [ -n "$finished" ] || return 0
+
+    echo ""
+    echo "Jobs:"
+    if [ -n "$running" ]; then
+        while IFS= read -r u; do
+            [ -n "$u" ] || continue
+            printf '  %-46s running\n' "$u"
+        done <<< "$running"
+    fi
+    if [ -n "$finished" ]; then
+        while IFS="$(printf '\t')" read -r u rc when summary; do
+            [ -n "$u" ] || continue
+            if [ "$rc" = "0" ]; then
+                printf '  %-46s OK  %s\n' "$u" "$when"
+            else
+                printf '  %-46s FAILED (exit %s)\n' "$u" "$rc"
+            fi
+            [ -z "$summary" ] || printf '      send back: %s\n' "$summary"
+        done <<< "$finished"
+    fi
+    echo "  (gpudev jobs — full list and logs)"
+    echo ""
+}
+
 cmd_status() {
     require_host_setup
 
@@ -1300,6 +1538,11 @@ cmd_status() {
     echo "  gpudev client invite <name>  print complete SolveIt onboarding"
     echo "  gpudev client info <name>    print SSH config stanza for a client"
     echo "  gpudev client restart <name> restart a client container"
+    # Background jobs, ahead of the command list: the dashboard auto-runs on
+    # interactive login, so this is where an operator learns how a job they
+    # walked away from turned out. Only shown when there is something to say.
+    status_jobs_section
+
     echo "  gpudev client rebuild <name> recreate the container, keep the volume"
     echo "                               (--variant switches image, keeps data)"
     # Listing every other lifecycle verb but not remove reads as "there is no
@@ -3111,6 +3354,11 @@ Kernel:
   gpudev kernel restart <name>
   gpudev kernel doctor <name>
 
+Jobs:
+  gpudev jobs
+  gpudev jobs logs <unit>
+  gpudev jobs cancel <unit>
+
 Status:
   gpudev gpu
   gpudev cloudflare [status|token-set]
@@ -3149,18 +3397,20 @@ main() {
             esac
             ;;
         image)
-            cmd_image "${2:-}" "${3:-}"
+            # Builds serialize with each other and with client mutations:
+            # two concurrent builds only contend for the layer cache.
+            with_lock cmd_image "${2:-}" "${3:-}"
             ;;
         client)
             case "${2:-}" in
                 list)    cmd_client_list ;;
-                add)     shift 2; cmd_client_add "$@" ;;
+                add)     shift 2; with_lock cmd_client_add "$@" ;;
                 invite)  cmd_client_invite "${3:-}" ;;
-                remove)  cmd_client_remove "${3:-}" "${4:-}" ;;
+                remove)  with_lock cmd_client_remove "${3:-}" "${4:-}" ;;
                 start)   cmd_client_start "${3:-}" ;;
                 stop)    cmd_client_stop "${3:-}" ;;
                 restart) cmd_client_restart "${3:-}" ;;
-                rebuild) shift 2; cmd_client_rebuild "$@" ;;
+                rebuild) shift 2; with_lock cmd_client_rebuild "$@" ;;
                 logs)    cmd_client_logs "${3:-}" ;;
                 info)    cmd_client_info "${3:-}" ;;
                 *)       usage; exit 1 ;;
@@ -3171,6 +3421,15 @@ main() {
             ;;
         gpu)
             cmd_gpu
+            ;;
+        jobs)
+            cmd_jobs "${2:-}" "${3:-}"
+            ;;
+        job-exec)
+            # Internal: the wrapper systemd-run launches. Not in usage() on
+            # purpose — it is an implementation detail of `run_detached`, and
+            # the CLI-surface test exempts it by name.
+            shift; cmd_job_exec "$@"
             ;;
         cloudflare)
             cmd_cloudflare "${2:-}" "${3:-}"

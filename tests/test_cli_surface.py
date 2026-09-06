@@ -15,7 +15,10 @@ GPUDEV = (ROOT / "gpudev").read_text(encoding="utf-8")
 # the dispatcher accepts but help never mentions is a wrong claim.
 #
 # Listing "help" inside help would be noise, so it is exempt.
-_EXEMPT = {"help", "-h", "--help"}
+# `job-exec` is the wrapper systemd-run launches inside a detached job. It is
+# an implementation detail of run_detached, never typed by a human, so
+# documenting it in help would advertise a command nobody should run.
+_EXEMPT = {"help", "-h", "--help", "job-exec"}
 
 
 def usage_text() -> str:
