@@ -185,7 +185,11 @@ cmd_job_exec() {
     set -e
 
     # The one line a returning operator has to act on.
-    summary="$(grep -oE '%gpudev [A-Za-z0-9_.-]+( --hostname [A-Za-z0-9.-]+)?' "$out" | tail -1 || true)"
+    # Prefer the primary "  %gpudev <name>" line. `tail -1` alone would pick
+    # the indented --hostname fallback printed after it, surfacing the
+    # exceptional form on the dashboard as though it were the normal one.
+    summary="$(grep -E '^  %gpudev [A-Za-z0-9_.-]+$' "$out" | tail -1 | sed 's/^ *//' || true)"
+    [ -n "$summary" ] || summary="$(grep -oE '%gpudev [A-Za-z0-9_.-]+( --hostname [A-Za-z0-9.-]+)?' "$out" | tail -1 || true)"
     write_job_result "$unit" "$rc" "$started" "$summary" "$*"
     rm -f "$out"
     return "$rc"
@@ -785,9 +789,16 @@ with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-
     cf_domain="$(host_get cf_domain 2>/dev/null || true)"
     if [ -n "$cf_domain" ]; then
         echo ""
-        echo "Send this line back to the client:"
+        echo "Tell the client they are ready:"
         echo ""
-        echo "  %gpudev ${name} --hostname ${name}.${cf_domain}"
+        echo "  %gpudev ${name}"
+        echo ""
+        # --hostname is only needed by a client that set up without --domain,
+        # which no longer happens on the documented path: %gpudev_setup takes
+        # --domain and writes the stanza then. Leading with the --hostname form
+        # made the normal case look like it needed an argument it does not.
+        echo "  (only if they set up without --domain, once:"
+        echo "     %gpudev ${name} --hostname ${name}.${cf_domain})"
         echo ""
     fi
 }

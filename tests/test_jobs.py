@@ -40,6 +40,30 @@ class JobsTestCase(unittest.TestCase):
 
 
 class JobResultTests(JobsTestCase):
+    def test_summary_prefers_the_primary_line_over_the_fallback(self):
+        # `client add` prints the normal form first and an indented
+        # --hostname fallback after it. `tail -1` alone picked the fallback,
+        # so the dashboard would show the exceptional form as if it were what
+        # the client should run.
+        self.run_gpudev(
+            "job-exec", "gpudev-job-add-solveitrc-9", "bash", "-c",
+            'echo "  %gpudev solveitrc"; '
+            'echo "     %gpudev solveitrc --hostname solveitrc.qsoftss.com)"',
+        )
+        r = self.result_for("gpudev-job-add-solveitrc-9")
+        self.assertEqual(r["summary"], "%gpudev solveitrc")
+
+    def test_summary_falls_back_when_only_a_hostname_form_is_printed(self):
+        # A client that set up without --domain genuinely needs that line.
+        self.run_gpudev(
+            "job-exec", "gpudev-job-add-bob-9", "bash", "-c",
+            'echo "  %gpudev bob --hostname bob.example.com"',
+        )
+        self.assertEqual(
+            self.result_for("gpudev-job-add-bob-9")["summary"],
+            "%gpudev bob --hostname bob.example.com",
+        )
+
     def test_success_records_the_line_the_operator_must_forward(self):
         # The point of a result file rather than the journal: the %gpudev line
         # is a value to act on, not log text to grep back out.
