@@ -103,15 +103,26 @@ run_detached() {
     local verb="$1" target="$2"; shift 2
     local unit gpudev_bin
     unit="$(job_unit_name "$verb" "$target")"
-    gpudev_bin="${HOME}/bin/gpudev"
-    [ -x "$gpudev_bin" ] || gpudev_bin="$(realpath "${BASH_SOURCE[0]}")"
+    # THIS script, not ~/bin/gpudev. The power scheduler prefers the installed
+    # copy, and rightly — a timer firing hours from now should run whatever is
+    # current then. A job is the opposite: it is a continuation of this
+    # invocation, so it must run the same code with the same behaviour.
+    # Preferring the installed copy handed a newer script's work to an older
+    # one that rejected the arguments outright — observed on a live host.
+    gpudev_bin="$(realpath "${BASH_SOURCE[0]}")"
 
     mkdir -p "$GPUDEV_JOBS_DIR"
+    # The job re-runs THIS script by absolute path, never a bare `gpudev` from
+    # PATH. Two reasons, one of which bit a live test: the systemd user manager
+    # does not necessarily have ~/bin on PATH, and a bare name resolves to
+    # whatever copy is installed rather than the one that launched the job — so
+    # a newer script would hand its work to an older one that may not even
+    # accept the arguments.
     systemd-run --user \
         --unit "$unit" \
         --collect \
         --setenv=GPUDEV_IN_JOB=1 \
-        "$gpudev_bin" job-exec "$unit" "$@" >/dev/null \
+        "$gpudev_bin" job-exec "$unit" "$gpudev_bin" "$@" >/dev/null \
         || fail "Could not start the background job. Is the user systemd manager running?"
 
     printf '%s' "$unit"
@@ -126,6 +137,17 @@ cmd_job_exec() {
     local started out rc=0 summary=""
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     out="$(mktemp)"
+
+    # `gpudev jobs cancel` stops the unit, and systemd sends SIGTERM. Without a
+    # trap the wrapper dies before recording anything, so a cancelled job just
+    # vanishes from `gpudev jobs` — indistinguishable from one that never ran.
+    # Confirmed on a live host, not theorised. SIGKILL still cannot be caught;
+    # that case stays a gap.
+    trap '
+        write_job_result "$unit" 143 "$started" "" "cancelled: $*"
+        rm -f "$out"
+        exit 143
+    ' TERM INT
 
     # errexit + pipefail would abort here the moment the job fails, skipping
     # write_job_result — losing the record for exactly the case an operator
@@ -720,7 +742,7 @@ with ssh-ed25519, ssh-rsa or ecdsa-sha2-nistp*. If you passed a file, use --key-
         echo ""
         echo "The ${variant} image is not built yet, so this will take about 25 minutes."
         detach_job add "$name" "about 25 minutes" \
-            gpudev client add "$name" --variant "$variant" --key "$ssh_key" --wait
+            client add "$name" --variant "$variant" --key "$ssh_key" --wait
         echo "It will finish provisioning ${name} on its own, and 'gpudev status'"
         echo "will show the %gpudev line to send back."
         return 0
@@ -851,7 +873,7 @@ cmd_image() {
                     # --detach is honoured here before anything starts.
                     if should_detach "$want_detach"; then
                         detach_job build "$variant" "about 25 minutes, several GB" \
-                            gpudev image build "$variant" --wait
+                            image build "$variant" --wait
                         return 0
                     fi
                     echo "Building the cuda-dev image. This is several GB and takes a while."
@@ -864,7 +886,7 @@ cmd_image() {
                     # here — this is the command its closing note names.
                     if should_detach "$want_detach"; then
                         detach_job build base "about 13 minutes" \
-                            gpudev image build base --wait
+                            image build base --wait
                         return 0
                     fi
                     echo "Building the base image. This takes around 13 minutes."
@@ -1311,7 +1333,7 @@ cmd_client_rebuild() {
         local -a fwd=(client rebuild "$target" --wait)
         [ "$reset" = "1" ] && fwd+=(--reset-venv)
         [ -z "$want_variant" ] || fwd+=(--variant "$want_variant")
-        detach_job rebuild "${target#--}" "$eta" gpudev "${fwd[@]}"
+        detach_job rebuild "${target#--}" "$eta" "${fwd[@]}"
         return 0
     fi
 

@@ -279,10 +279,38 @@ class DetachDecisionTests(JobsTestCase):
         # with it — including a key that arrived by prompt or --key-file.
         self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test")
         launched = self.launched()[0]
+        # It must re-run THIS script by absolute path. A bare `gpudev` resolves
+        # through PATH — which the systemd user manager need not have ~/bin on,
+        # and which picks whatever copy is installed rather than the one that
+        # launched the job. On a live host that handed the work to an older
+        # gpudev, which rejected the arguments and exited 1.
+        self.assertIn(str(GPUDEV), launched)
+        self.assertNotRegex(launched, r"job-exec \S+ gpudev ")
         self.assertIn("client add bob", launched)
         self.assertIn("--variant cuda-dev", launched)
         self.assertIn("--key ssh-ed25519 AAAA test", launched)
         self.assertIn("--wait", launched)
+
+    def test_the_job_runs_this_script_not_the_installed_copy(self):
+        # run_detached copied the power scheduler's binary lookup, which
+        # prefers ~/bin/gpudev. That is right for a timer firing hours later —
+        # it should run whatever is current then — and wrong for a job, which
+        # is a continuation of THIS invocation. On a live host it handed a
+        # newer script's work to an older installed copy that rejected the
+        # arguments and exited 1, twice, before the cause was found.
+        #
+        # Earlier versions of this test missed it because HOME was a temp dir
+        # with no ~/bin/gpudev, so the fallback masked the bug. The installed
+        # copy has to exist for the test to mean anything.
+        installed = self.home / "bin" / "gpudev"
+        installed.parent.mkdir(exist_ok=True)
+        installed.write_text("#!/usr/bin/env bash\necho 'the OLD installed copy'\n")
+        installed.chmod(0o755)
+
+        self.add("bob", "--variant", "cuda-dev", "--key", "ssh-ed25519 AAAA test")
+        launched = self.launched()[0]
+        self.assertNotIn(str(installed), launched)
+        self.assertIn(str(GPUDEV), launched)
 
     def test_wait_beats_the_automatic_decision(self):
         # --wait once lost to auto-detect, so an operator who asked to watch
